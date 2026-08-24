@@ -1,0 +1,44 @@
+2026-08-24 22:19:33 [INFO] SYSTEM:提权:开始:尝试内置TrustedInstaller提权
+2026-08-24 22:19:33 [INFO] TI提权:步骤:已打开服务控制管理器
+2026-08-24 22:19:33 [INFO] TI提权:步骤:已打开TrustedInstaller服务
+2026-08-24 22:19:33 [INFO] TI提权:步骤:QueryServiceStatusEx失败,错误码:5,内置方法放弃,将使用NSudo
+2026-08-24 22:19:33 [INFO] SYSTEM:提权:备用:内置方法失败,尝试NSudo提权
+2026-08-24 22:19:33 [INFO] NSudo:调用:尝试模式=T:C:\Users\TXZDM\Desktop\OPST\runtime\NSudoLG.exe -U:T -P:E -ShowWindowMode:Show C:\Users\TXZDM\Desktop\OPST\OPSTcontroller.exe
+2026-08-24 22:19:34 [INFO] NSudo:输出:返回码=0:(无输出)
+2026-08-24 22:19:34 [INFO] SYSTEM:提权:跳过:NSudo启动的进程,跳过再次提权,已启用0项特权
+2026-08-24 22:19:34 [INFO] SYSTEM:HKCU重映射:成功:用户=TXZDMM, SID=S-1-5-21-2482818302-1446379007-2612904212-1001, HKCU\Classes扩展名数=1182, UserChoice项数=486
+2026-08-24 22:19:35 [INFO] NSudo:验证:目标进程已启动
+2026-08-24 22:19:35 [INFO] NSudo:成功:已通过NSudo(TrustedInstaller)发起提权
+2026-08-24 22:19:35 [INFO] SYSTEM:提权:成功:NSudo已发起TrustedInstaller重启
+2026-08-24 22:19:37 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
+2026-08-24 22:19:42 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
+2026-08-24 22:19:45 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
+2026-08-24 22:19:46 [INFO] 监控线程启动
+2026-08-24 22:20:12 [INFO] .jpg:更改:检测到:UserChoice ProgId(None->AppX43hnxtbyyps62jhe9sqpdzxn1790zetc); UserChoice Hash(None->5azIXdnM/sQ=)
+2026-08-24 22:20:14 [INFO] .jpg:恢复:重试1:1.5s后仍有2项不一致
+2026-08-24 22:20:19 [INFO] .jpg:恢复:成功:默认保护基准(已验证)
+2026-08-24 22:20:20 [INFO] .jpg:更新基准:成功:用户单次同意
+2026-08-24 22:20:20 [INFO] .jpg:更改:已同意:用户单次同意
+2026-08-24 22:20:32 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
+2026-08-24 22:20:37 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
+2026-08-24 22:20:52 [INFO] .jpg:更改:检测到:UserChoice ProgId(None->BaiduNetdiskImageViewerAssociations); UserChoice Hash(None->VacBAqAAsfQ=)
+2026-08-24 22:20:57 [INFO] .jpg:恢复:成功:默认保护基准(已验证)
+2026-08-24 22:20:57 [INFO] .nef:更改:检测到:UserChoice ProgId(None->BaiduNetdiskImageViewerAssociations); UserChoice Hash(None->mf3TOU3hcjE=)
+2026-08-24 22:21:02 [INFO] .nef:恢复:成功:默认保护基准(已验证)
+2026-08-24 22:21:02 [INFO] .nrw:更改:检测到:UserChoice ProgId(None->BaiduNetdiskImageViewerAssociations); UserChoice Hash(None->pxS//1jY8jk=)
+2026-08-24 22:21:08 [INFO] .nrw:恢复:成功:默认保护基准(已验证)
+2026-08-24 22:21:08 [INFO] .orf:更改:检测到:UserChoice ProgId(None->BaiduNetdiskImageViewerAssociations); UserChoice Hash(None->0mxlSWYAJgE=)
+2026-08-24 22:21:12 [INFO] .orf:恢复:成功:默认保护基准(已验证)
+2026-08-24 22:21:12 [INFO] ALL:批量篡改:检测到:ProgId=BaiduNetdiskImageViewerAssociations, 保护强度1
+2026-08-24 22:21:12 [INFO] PROCESS:终止:成功:BaiduNetdiskImageViewer.exe(ProgId关联(baidunetdisk))
+2026-08-24 22:21:13 [INFO] .pef:锁定:成功:批量篡改触发, 保护强度1, 已锁定(SYSTEM/TI保留权限)
+2026-08-24 22:21:21 [INFO] .pef:恢复:成功:持续模式静默恢复(已验证)
+2026-08-24 22:21:21 [INFO] SYSTEM:锁定巡检:继续:剩余1个锁定中
+2026-08-24 22:21:22 [INFO] SYSTEM:防护状态:统计:locked=1, highfreq=0, checked=1278
+2026-08-24 22:21:27 [INFO] SYSTEM:锁定巡检:继续:剩余1个锁定中
+2026-08-24 22:21:32 [INFO] SYSTEM:防护状态:统计:locked=1, highfreq=0, checked=1278
+2026-08-24 22:21:32 [INFO] SYSTEM:锁定巡检:继续:剩余1个锁定中
+2026-08-24 22:21:37 [INFO] SYSTEM:锁定巡检:继续:剩余1个锁定中
+2026-08-24 22:21:43 [INFO] SYSTEM:自动解锁:开始:1个: .pef
+2026-08-24 22:21:44 [INFO] .pef:解锁:自动:成功
+2026-08-24 22:22:30 [INFO] ALL:创建基准:成功:模式=current, 扩展名数=1279, 错误=0
