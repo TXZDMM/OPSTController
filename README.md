@@ -1,3 +1,5 @@
+
+
 # OPSTcontroller / 扩展名保护卫士
 
 **阻止第三方软件私自篡改文件扩展名默认打开方式**
@@ -33,6 +35,12 @@
 - **Complete logging**
 
 ---
+
+## 日志 / Log
+
+(大版本，小版本，bug) / ((major version, minor version, bug)
+v0.1.0(第一版) / (First edition)
+v0.2.0(更新了频繁篡改的防护措施和输出，减少了频繁防护的桌面图标闪烁) / (Updated the protection measures and outputs that were frequently tampered with, reducing the flickering of desktop icons from frequent protection.)
 
 ## 目录结构 / Directory Structure
 
