@@ -25,6 +25,24 @@ import ctypes
 import shutil
 import subprocess
 from ctypes import wintypes
+
+# 隐藏窗口的subprocess.run封装（避免弹cmd/powershell黑窗）
+_HIDDEN_SI = subprocess.STARTUPINFO()
+_HIDDEN_SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+_HIDDEN_SI.wShowWindow = 0  # SW_HIDE
+_CREATE_NO_WINDOW = 0x08000000
+
+def _run(cmd, **kwargs):
+    """运行外部命令，完全隐藏窗口"""
+    kwargs.setdefault('startupinfo', _HIDDEN_SI)
+    kwargs.setdefault('creationflags', _CREATE_NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
+
+def _popen(cmd, **kwargs):
+    """Popen封装，隐藏窗口"""
+    kwargs.setdefault('startupinfo', _HIDDEN_SI)
+    kwargs.setdefault('creationflags', _CREATE_NO_WINDOW)
+    return subprocess.Popen(cmd, **kwargs)
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -542,6 +560,83 @@ def get_prog_id(ext):
     return None
 
 
+# 已知ProgId模式 → 软件名称映射
+_KNOWN_PROGID_MAP = [
+    ("BaiduNetdisk", "百度网盘"),
+    ("PotPlayer", "PotPlayer"),
+    ("WMP11", "Windows Media Player"),
+    ("QuickTime", "QuickTime"),
+    ("MuMu", "MuMu模拟器"),
+    ("VLC", "VLC媒体播放器"),
+    ("mpc", "MPC-HC"),
+    ("foobar", "foobar2000"),
+    ("AIMP", "AIMP"),
+    ("Winamp", "Winamp"),
+    ("iTunes", "iTunes"),
+    ("RealPlayer", "RealPlayer"),
+    ("KMPlayer", "KMPlayer"),
+    ("GOM", "GOM Player"),
+    ("Sublime", "Sublime Text"),
+    ("VSCode", "VS Code"),
+    ("Code.", "VS Code"),
+    ("Notepad", "记事本"),
+    ("Chrome", "Chrome浏览器"),
+    ("Firefox", "火狐浏览器"),
+    ("MSEdge", "Edge浏览器"),
+    ("Opera", "Opera浏览器"),
+    ("Brave", "Brave浏览器"),
+    ("7-Zip", "7-Zip"),
+    ("WinRAR", "WinRAR"),
+    ("HaoZip", "好压"),
+    ("Bandizip", "Bandizip"),
+    ("Photoshop", "Photoshop"),
+    ("ACDSee", "ACDSee"),
+    ("XnView", "XnView"),
+    ("IrfanView", "IrfanView"),
+    ("Honeyview", "Honeyview"),
+    ("FastStone", "FastStone"),
+]
+
+def identify_tamperer(prog_id):
+    """根据ProgId识别疑似篡改者/关联软件。
+    AppX类型从注册表查应用名，已知软件直接匹配。
+    返回 (名称, 可信度: 'high'/'medium'/'low')"""
+    if not prog_id:
+        return None, "low"
+    pid_lower = prog_id.lower()
+    # AppX类型（Windows商店应用）
+    if pid_lower.startswith("appx"):
+        try:
+            # 从注册表查应用名
+            for root, base in [(HKCR, prog_id), (HKCU, f"Software\\Classes\\{prog_id}")]:
+                app_name, _ = reg_read_value(root, f"{base}\\Application", "ApplicationName")
+                if app_name:
+                    # ApplicationName可能是@{PackageFamilyName!Resource}格式，尝试提取
+                    import re
+                    m = re.search(r"//(.+?)$", app_name)
+                    if m:
+                        return m.group(1), "high"
+                    return app_name, "high"
+                aumid, _ = reg_read_value(root, f"{base}\\Application", "AppUserModelID")
+                if aumid:
+                    return f"商店应用({aumid.split('!')[0]})", "medium"
+            return "Windows商店应用", "low"
+        except Exception:
+            return "Windows商店应用", "low"
+    # 已知软件匹配
+    for keyword, name in _KNOWN_PROGID_MAP:
+        if keyword.lower() in pid_lower:
+            return name, "high"
+    # 从注册表查ProgId的友好名称
+    try:
+        friendly, _ = reg_read_value(HKCR, prog_id, "")
+        if friendly and len(friendly) < 60:
+            return friendly, "medium"
+    except Exception:
+        pass
+    return prog_id, "low"
+
+
 def get_extension_paths(ext, prog_id=None):
     """
     获取扩展名对应的7个保护项路径定义。
@@ -581,15 +676,17 @@ def snapshot_extension(ext):
             "type": typ,
             "prog_id": prog_id if key in ("hkcr_command", "hkcu_command") else None,
         }
-    # 确保始终有7项：无prog_id时补充command项（值为None，路径占位）
+    # 确保始终有7项：无prog_id时补充command项（值为None，路径留空由check_extension动态检测）
     if "hkcr_command" not in snap:
+        default_prog = f"{ext.lstrip('.')}file"
         snap["hkcr_command"] = {
-            "root": "HKCR", "path": f"__no_progid__/{ext}", "name": "",
+            "root": "HKCR", "path": f"{default_prog}\\shell\\open\\command", "name": "",
             "value": None, "type": None, "prog_id": None,
         }
     if "hkcu_command" not in snap:
+        default_prog = f"{ext.lstrip('.')}file"
         snap["hkcu_command"] = {
-            "root": "HKCU", "path": f"Software\\Classes\\__no_progid__/{ext}", "name": "",
+            "root": "HKCU", "path": f"Software\\Classes\\{default_prog}\\shell\\open\\command", "name": "",
             "value": None, "type": None, "prog_id": None,
         }
     return snap
@@ -939,6 +1036,21 @@ class BaselineManager:
         log_event(ext, "更新基准", "成功", "用户单次同意")
         return True
 
+    def update_selected_extensions(self, ext_list):
+        """批量更新选中扩展名的基准（对比选择后调用）"""
+        self._push_history()
+        count = 0
+        with self._lock:
+            for ext in ext_list:
+                try:
+                    self.baseline[ext] = snapshot_extension(ext)
+                    count += 1
+                except Exception:
+                    pass
+        self.save()
+        log_event("SYSTEM", "批量更新基准", "成功", f"更新{count}/{len(ext_list)}个扩展名")
+        return count
+
     def clear_userchoice(self, ext):
         """
         将基准中该扩展名的 UserChoice 项设为 None。
@@ -969,6 +1081,65 @@ class BaselineManager:
 
 
 # ============================================================
+# 更改历史记录管理器
+# ============================================================
+class ChangeHistoryManager:
+    """记录所有扩展名关联更改，支持回看和当前状态检测"""
+    MAX_RECORDS = 500
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.history_file = os.path.join(data_dir, "change_history.json")
+        self.records = []
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, "r", encoding="utf-8") as f:
+                    self.records = json.load(f)
+        except Exception:
+            self.records = []
+
+    def _save(self):
+        try:
+            if len(self.records) > self.MAX_RECORDS:
+                self.records = self.records[-self.MAX_RECORDS:]
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add_record(self, ext, tamperer, changes, action, result):
+        """添加一条更改记录
+        action: auto_blocked / user_consent / detected_only
+        result: success / fail / partial
+        """
+        record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ext": ext,
+            "tamperer": tamperer or "未知",
+            "changes": changes,
+            "action": action,
+            "result": result
+        }
+        self.records.append(record)
+        self._save()
+
+    def get_records(self, ext=None, limit=100):
+        """获取更改记录，可按扩展名筛选"""
+        if ext:
+            filtered = [r for r in self.records if r["ext"] == ext]
+        else:
+            filtered = self.records
+        return filtered[-limit:]
+
+    def clear(self):
+        self.records = []
+        self._save()
+
+
+# ============================================================
 # 更改检测与恢复引擎
 # ============================================================
 class ProtectionEngine:
@@ -982,6 +1153,57 @@ class ProtectionEngine:
         "hkcu_command": "HKCU打开命令",
         "new_progid_command": "新ProgId植入命令",
     }
+
+    # 关联扩展名映射：更改一个时可能同时更改其他（共享同一文件类型）
+    RELATED_EXTS = {
+        ".jpg": [".jpeg", ".jpe", ".jfif"],
+        ".jpeg": [".jpg", ".jpe", ".jfif"],
+        ".jpe": [".jpg", ".jpeg", ".jfif"],
+        ".jfif": [".jpg", ".jpeg", ".jpe"],
+        ".htm": [".html"],
+        ".html": [".htm"],
+        ".mpg": [".mpeg", ".mpe"],
+        ".mpeg": [".mpg", ".mpe"],
+        ".mpe": [".mpg", ".mpeg"],
+        ".tif": [".tiff"],
+        ".tiff": [".tif"],
+        ".3gp": [".3g2", ".3gpp", ".3gp2"],
+        ".3g2": [".3gp", ".3gpp", ".3gp2"],
+        ".3gpp": [".3gp", ".3g2", ".3gp2"],
+        ".3gp2": [".3gp", ".3g2", ".3gpp"],
+        ".m4a": [".m4b", ".m4p", ".m4r"],
+        ".m4b": [".m4a", ".m4p", ".m4r"],
+        ".m4p": [".m4a", ".m4b", ".m4r"],
+        ".ogg": [".oga", ".ogv", ".ogx", ".ogm"],
+        ".oga": [".ogg", ".ogv", ".ogx", ".ogm"],
+        ".ogv": [".ogg", ".oga", ".ogx", ".ogm"],
+        ".ts": [".m2ts", ".m2t", ".mts", ".tts"],
+        ".m2ts": [".ts", ".m2t", ".mts", ".tts"],
+        ".m2t": [".ts", ".m2ts", ".mts", ".tts"],
+        ".mts": [".ts", ".m2ts", ".m2t", ".tts"],
+        ".avi": [".divx"],
+        ".divx": [".avi"],
+        ".flv": [".f4v"],
+        ".f4v": [".flv"],
+        ".svg": [".svgz"],
+        ".svgz": [".svg"],
+        ".wav": [".wave"],
+        ".wave": [".wav"],
+        ".mov": [".movie"],
+        ".movie": [".mov"],
+        ".bmp": [".dib"],
+        ".dib": [".bmp"],
+        ".txt": [".text"],
+        ".text": [".txt"],
+    }
+
+    @classmethod
+    def get_related_exts(cls, ext):
+        """获取关联扩展名列表（含自身）"""
+        ext = ext.lower()
+        related = set(cls.RELATED_EXTS.get(ext, []))
+        related.add(ext)
+        return related
 
     def __init__(self, baseline_mgr):
         self.baseline = baseline_mgr
@@ -1062,16 +1284,29 @@ class ProtectionEngine:
 
         # 获取 HKCR 系统默认 ProgId（用于判断 Windows 自动重建的系统默认）
         hkcr_default = reg_read_value(HKCR, ext, "")[0]
-        cur_uc_progid = reg_read_value(HKCU, f"{USERCHOICE_BASE}\\{ext}\\UserChoice", "ProgId")[0]
+        uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
+        cur_uc_progid = reg_read_value(HKCU, uc_path, "ProgId")[0]
+        cur_uc_hash = reg_read_value(HKCU, uc_path, "Hash")[0]
         # 如果基准 UserChoice=None 且当前 UserChoice=HKCR系统默认，视为正常
         uc_is_system_default = (uc_baseline_none and cur_uc_progid is not None
                                  and hkcr_default is not None
                                  and cur_uc_progid == hkcr_default)
 
         mismatches = []
+        # 先读取当前UserChoice ProgId，用于判断Hash是否应忽略
+        # Hash是Windows根据SID+扩展名+ProgId计算的安全值，程序写入的Hash不被认可，
+        # Windows会重新计算。如果ProgId与基准一致，Hash变化不视为篡改。
+        cur_uc_progid_for_hash = reg_read_value(HKCU, uc_path, "ProgId")[0]
+        bl_uc_progid_val = bl.get("userchoice_progid", {}).get("value")
+        uc_progid_matches = (cur_uc_progid_for_hash == bl_uc_progid_val)
+
         for key, bl_item in bl.items():
             # UserChoice 系统默认豁免：基准 None + 当前=HKCR默认 → 不视为不一致
             if uc_is_system_default and key in ("userchoice_progid", "userchoice_hash"):
+                continue
+
+            # Hash豁免：ProgId与基准一致时，Hash变化是Windows重新计算导致，不视为篡改
+            if key == "userchoice_hash" and uc_progid_matches and bl_uc_progid_val is not None:
                 continue
 
             # 始终使用基准中记录的路径读取（command 项含基准 ProgId）
@@ -1084,6 +1319,14 @@ class ProtectionEngine:
             name = bl_item["name"]
             cur_val, cur_type = reg_read_value(root, path, name)
 
+            # 兜底：UserChoice项如果循环中读取失败，用开头已读取的值
+            if key == "userchoice_progid" and cur_val is None and cur_uc_progid is not None:
+                cur_val = cur_uc_progid
+                cur_type = 1
+            elif key == "userchoice_hash" and cur_val is None and cur_uc_hash is not None:
+                cur_val = cur_uc_hash
+                cur_type = 1
+
             bl_val = bl_item.get("value")
             bl_type = bl_item.get("type")
 
@@ -1091,9 +1334,9 @@ class ProtectionEngine:
             if not self._values_equal(bl_val, cur_val, bl_type, cur_type):
                 mismatches.append((key, bl_val, cur_val, cur_type))
 
-        # 额外检测：如果当前 ProgId 与基准不同，检查新 ProgId 的 command 是否被植入
-        # 优先级必须与 get_prog_id 一致：UserChoice > HKCU > HKCR > HKLM
-        # （HKCR是合并视图，可能返回HKLM系统默认值而非用户设置）
+        # 额外检测：当前生效ProgId与基准不同时，检查当前ProgId的HKCU+HKCR command
+        # （基准中command路径固化了创建时的ProgId，用户改默认程序后ProgId变了，
+        # 篡改软件写新ProgId的command，程序还在查旧路径会漏检）
         bl_prog_id = None
         for k in ("userchoice_progid", "hkcu_ext", "hkcr_ext", "hklm_ext"):
             item = bl.get(k)
@@ -1102,11 +1345,16 @@ class ProtectionEngine:
                 break
         cur_prog_id = get_prog_id(ext)
         if cur_prog_id and bl_prog_id and cur_prog_id != bl_prog_id:
-            # 新 ProgId 的 open command 存在即视为篡改证据
-            new_cmd, _ = reg_read_value(HKCR, f"{cur_prog_id}\\shell\\open\\command", "")
-            if new_cmd is not None:
+            # 当前生效ProgId变了，检查其HKCU command（篡改软件最常写的位置）
+            hkcu_cmd, _ = reg_read_value(HKCU, f"Software\\Classes\\{cur_prog_id}\\shell\\open\\command", "")
+            if hkcu_cmd is not None:
                 mismatches.append(("new_progid_command", f"(基准:{bl_prog_id})",
-                                   f"{cur_prog_id} -> {new_cmd}", None))
+                                   f"HKCU {cur_prog_id} -> {hkcu_cmd}", None))
+            # 检查HKCR command
+            hkcr_cmd, _ = reg_read_value(HKCR, f"{cur_prog_id}\\shell\\open\\command", "")
+            if hkcr_cmd is not None:
+                mismatches.append(("new_progid_command", f"(基准:{bl_prog_id})",
+                                   f"HKCR {cur_prog_id} -> {hkcr_cmd}", None))
 
         return mismatches
 
@@ -1169,22 +1417,18 @@ class ProtectionEngine:
                         # 1. 删除旧键（10种方法强制删除）
                         del_ok, del_method = force_delete_userchoice(ext)
                         if not del_ok:
+                            uc_parts.append(f"删除失败({del_method}),尝试直接写入")
+                        # 2. 重建并写入ProgId（不写Hash，Hash由Windows计算，程序写入不被认可）
+                        try:
+                            kh = winreg.CreateKeyEx(HKCU, uc_path, 0, KEY_ALL_ACCESS_64)
+                            if has_progid:
+                                winreg.SetValueEx(kh, "ProgId", 0, bl_progid["type"], bl_progid["value"])
+                                uc_parts.append("ProgId已恢复")
+                            # Hash不写入，Windows会在用户打开文件时自动计算
+                            winreg.CloseKey(kh)
+                        except OSError as e:
                             uc_ok = False
-                            uc_parts.append(f"删除失败({del_method})")
-                        else:
-                            # 2. 重建并写入基准值
-                            try:
-                                kh = winreg.CreateKeyEx(HKCU, uc_path, 0, KEY_ALL_ACCESS_64)
-                                if has_progid:
-                                    winreg.SetValueEx(kh, "ProgId", 0, bl_progid["type"], bl_progid["value"])
-                                    uc_parts.append("ProgId已恢复")
-                                if has_hash:
-                                    winreg.SetValueEx(kh, "Hash", 0, bl_hash["type"], bl_hash["value"])
-                                    uc_parts.append("Hash已恢复")
-                                winreg.CloseKey(kh)
-                            except OSError as e:
-                                uc_ok = False
-                                uc_parts.append(f"重建失败:{e}")
+                            uc_parts.append(f"写入失败:{e}")
 
                         if uc_ok:
                             success += 2
@@ -1276,11 +1520,11 @@ class ProtectionEngine:
 class NotificationToast:
     """右下角滑出通知，非模态，5秒后自动关闭默认阻止"""
     TOAST_WIDTH = 360
-    TOAST_HEIGHT = 160
-    MARGIN = 15
+    TOAST_HEIGHT = 200
+    MARGIN = 50  # 离屏幕底部距离，调高让弹窗位置更高
     GAP = 10
 
-    def __init__(self, parent, ext, mismatches, recover_result, on_consent, on_close, on_show_main, y_offset=0, x_offset=0, timeout=None):
+    def __init__(self, parent, ext, mismatches, recover_result, on_consent, on_close, on_show_main, y_offset=0, x_offset=0, timeout=None, tamperer_name=None):
         self.ext = ext
         self.mismatches = mismatches
         self.recover_result = recover_result
@@ -1292,6 +1536,8 @@ class NotificationToast:
         self.timeout = timeout if timeout and timeout > 0 else NOTIFY_TIMEOUT
         self.remaining = self.timeout
         self._closed = False
+        self.close_reason = None  # "consent" / "timeout"
+        self.tamperer_name = tamperer_name
         self._build_ui(parent)
 
     def _build_ui(self, parent):
@@ -1317,36 +1563,46 @@ class NotificationToast:
         content = tk.Frame(self.win, bg="#2c3e50")
         content.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
-        # 标题行
+        # 标题行：谁改了什么
         title_frame = tk.Frame(content, bg="#2c3e50")
         title_frame.pack(fill="x")
-        tk.Label(title_frame, text=f"⚠ {self.ext} 被更改",
+        if self.tamperer_name:
+            title_text = f"[{self.tamperer_name}] 更改了 {self.ext}"
+        else:
+            title_text = f"{self.ext} 被更改"
+        tk.Label(title_frame, text=title_text,
                  font=("微软雅黑", 11, "bold"), fg="#e74c3c",
                  bg="#2c3e50").pack(side="left")
+        self.timer_label = tk.Label(title_frame, text=f"{self.remaining}秒后默认阻止",
+                                     font=("微软雅黑", 8), fg="#95a5a6", bg="#2c3e50")
+        self.timer_label.pack(side="right")
 
-        # 更改详情
+        # 更改详情：具体改了什么（最多2项，避免按钮被挤出）
         detail_parts = []
-        for key, bl_val, cur_val, _ in self.mismatches[:3]:
+        for key, bl_val, cur_val, _ in self.mismatches[:2]:
             label = ProtectionEngine.ITEM_LABELS.get(key, key)
-            detail_parts.append(label)
-        detail_text = "、".join(detail_parts)
-        if len(self.mismatches) > 3:
+            detail_parts.append(f"{label}: {bl_val}→{cur_val}")
+        detail_text = "；".join(detail_parts)
+        if len(self.mismatches) > 2:
             detail_text += f" 等{len(self.mismatches)}项"
-        tk.Label(content, text=f"更改项：{detail_text}",
-                 font=("微软雅黑", 9), fg="#bdc3c7", bg="#2c3e50",
-                 anchor="w").pack(fill="x", pady=(2, 0))
+        tk.Label(content, text=detail_text,
+                 font=("微软雅黑", 8), fg="#bdc3c7", bg="#2c3e50",
+                 anchor="w", wraplength=330, justify="left").pack(fill="x", pady=(4, 0))
 
-        # 恢复状态
+        # 操作 + 结果
         success, fail, details = self.recover_result
         if fail == 0:
-            status_text = "✓ 已恢复到基准"
-            status_color = "#2ecc71"
+            result_text = "成功"
+            result_color = "#2ecc71"
         else:
-            status_text = f"✗ 恢复失败(成功{success}/失败{fail})"
-            status_color = "#e67e22"
-        tk.Label(content, text=status_text,
-                 font=("微软雅黑", 10, "bold"), fg=status_color,
-                 bg="#2c3e50", anchor="w").pack(fill="x", pady=(2, 0))
+            result_text = f"失败({success}成功/{fail}失败)"
+            result_color = "#e67e22"
+        result_frame = tk.Frame(content, bg="#2c3e50")
+        result_frame.pack(fill="x", pady=(6, 0))
+        tk.Label(result_frame, text="操作：恢复",
+                 font=("微软雅黑", 9), fg="#ecf0f1", bg="#2c3e50").pack(side="left")
+        tk.Label(result_frame, text=f"  结果：{result_text}",
+                 font=("微软雅黑", 10, "bold"), fg=result_color, bg="#2c3e50").pack(side="left")
 
         # 按钮 + 倒计时
         bottom = tk.Frame(content, bg="#2c3e50")
@@ -1356,20 +1612,28 @@ class NotificationToast:
         btn_group.pack(side="left")
 
         self.consent_btn = tk.Button(btn_group, text="单次同意",
-                                      font=("微软雅黑", 8),
-                                      command=self._on_consent, width=8, relief="flat",
-                                      padx=4, pady=1)
-        self.consent_btn.pack(side="left", padx=(0, 4))
+                                      font=("微软雅黑", 9, "bold"),
+                                      command=self._on_consent, width=8, relief="raised",
+                                      bg="#27ae60", fg="white", activebackground="#2ecc71",
+                                      activeforeground="white", cursor="hand2",
+                                      padx=6, pady=3)
+        self.consent_btn.pack(side="left", padx=(0, 6))
 
         self.show_main_btn = tk.Button(btn_group, text="打开主程序",
-                                        font=("微软雅黑", 8),
-                                        command=self._on_show_main, width=8, relief="flat",
-                                        padx=4, pady=1)
-        self.show_main_btn.pack(side="left")
+                                        font=("微软雅黑", 9),
+                                        command=self._on_show_main, width=8, relief="raised",
+                                        bg="#3498db", fg="white", activebackground="#5dade2",
+                                        activeforeground="white", cursor="hand2",
+                                        padx=6, pady=3)
+        self.show_main_btn.pack(side="left", padx=(0, 6))
 
-        self.timer_label = tk.Label(bottom, text=f"{self.remaining}秒后默认阻止",
-                                     font=("微软雅黑", 8), fg="#95a5a6", bg="#2c3e50")
-        self.timer_label.pack(side="right")
+        self.close_btn = tk.Button(btn_group, text="关闭弹窗",
+                                    font=("微软雅黑", 9),
+                                    command=self._on_close_btn, width=8, relief="raised",
+                                    bg="#7f8c8d", fg="white", activebackground="#95a5a6",
+                                    activeforeground="white", cursor="hand2",
+                                    padx=6, pady=3)
+        self.close_btn.pack(side="left")
 
         # 倒计时进度条
         self.progress = tk.Frame(self.win, bg="#3498db", height=3)
@@ -1378,8 +1642,13 @@ class NotificationToast:
 
         # 滑入动画
         self._slide_in()
-        # 启动倒计时
-        self._tick()
+        # 确保窗口完全渲染后再启动倒计时
+        try:
+            self.win.update()
+        except Exception:
+            pass
+        # 延迟启动倒计时，确保窗口已显示
+        self.win.after(100, self._tick)
 
     def _slide_in(self):
         """从下方滑入到目标位置"""
@@ -1391,39 +1660,65 @@ class NotificationToast:
                 x = geo.split("+")[1]
                 self.win.geometry(f"{self.TOAST_WIDTH}x{self.TOAST_HEIGHT}+{x}+{new_y}")
                 self.win.after(10, self._slide_in)
+            else:
+                # 滑入完成后设置焦点，确保按钮可点击
+                try:
+                    self.win.focus_force()
+                    self.consent_btn.focus_set()
+                except Exception:
+                    pass
         except tk.TclError:
             pass
 
     def _tick(self):
         if self._closed:
             return
-        if self.remaining <= 0:
-            self._on_timeout()
-            return
-        self.timer_label.config(text=f"{self.remaining}秒后默认阻止")
-        # 更新进度条宽度
-        ratio = self.remaining / self.timeout
-        new_w = max(1, int(self.TOAST_WIDTH * ratio))
-        self.progress.config(width=new_w)
-        self.remaining -= 1
+        try:
+            if self.remaining <= 0:
+                self._on_timeout()
+                return
+            self.timer_label.config(text=f"{self.remaining}秒后默认阻止")
+            # 更新进度条宽度
+            ratio = self.remaining / self.timeout
+            new_w = max(1, int(self.TOAST_WIDTH * ratio))
+            self.progress.config(width=new_w)
+            self.remaining -= 1
+        except Exception:
+            pass
         self.win.after(1000, self._tick)
 
     def _on_consent(self):
         if self._closed:
             return
         self._closed = True
-        self.on_consent(self.ext)
+        self.close_reason = "consent"
+        try:
+            self.on_consent(self.ext)
+        except Exception:
+            pass
         self._close()
 
     def _on_show_main(self):
         """点击打开主程序：显示主窗口，不关闭通知"""
-        if self.on_show_main:
-            self.on_show_main()
+        try:
+            if self.on_show_main:
+                self.on_show_main()
+        except Exception:
+            pass
 
     def _on_timeout(self):
         if self._closed:
             return
         self._closed = True
+        self.close_reason = "timeout"
+        self._close()
+
+    def _on_close_btn(self):
+        """用户点击关闭弹窗：等同超时自动阻止"""
+        if self._closed:
+            return
+        self._closed = True
+        self.close_reason = "timeout"
         self._close()
 
     def _close(self):
@@ -1511,7 +1806,7 @@ class SetupDialog:
             url = "https://wwbmw.lanzouq.com/b0139yjgze"
             try:
                 import subprocess
-                subprocess.Popen(['explorer.exe', url], creationflags=0x08000000)
+                _popen(['explorer.exe', url], creationflags=0x08000000)
             except Exception:
                 try:
                     ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 1)
@@ -1589,12 +1884,13 @@ class DefaultOptionDialog:
 class MonitorThread(threading.Thread):
     GRACE_PERIOD_SECONDS = 10  # 启动后宽限期：只检测不恢复，给用户备份机会
 
-    def __init__(self, engine, baseline_mgr, popup_callback, log_callback):
+    def __init__(self, engine, baseline_mgr, popup_callback, log_callback, root=None):
         super().__init__(daemon=True)
         self.engine = engine
         self.baseline = baseline_mgr
         self.popup_callback = popup_callback
         self.log_callback = log_callback
+        self.root = root
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._last_deep_scan = time.time()
@@ -1602,6 +1898,7 @@ class MonitorThread(threading.Thread):
         self._grace_until = time.time() + self.GRACE_PERIOD_SECONDS
         self._grace_logged = False
         self._grace_logged_exts = set()  # 宽限期已报过的扩展名，避免每2秒重复刷屏
+        self._handling_exts = set()  # 正在处理的扩展名（关联检测防递归）
         # 持续篡改追踪 + 进程打击
         self.persistent_tracker = PersistentTracker()
         blacklist_path = os.path.join(USERDATA_DIR, "process_blacklist.json")
@@ -1763,10 +2060,11 @@ class MonitorThread(threading.Thread):
         for ext in exts:
             if self._stop_event.is_set():
                 return
-            # 锁定中的扩展名：ACL已拒绝写入，跳过检测（每5秒由_auto_unlock_check统一巡检）
-            if self.persistent_tracker.is_locked(ext):
+            # 锁定中的扩展名：仍需检测（锁定可能不完全成功，如UserChoice键没锁住）
+            # 检测到更改则静默恢复，不弹窗
+            is_locked = self.persistent_tracker.is_locked(ext)
+            if is_locked:
                 locked_count += 1
-                continue
             checked_count += 1
             mismatches = self.engine.check_extension(ext)
             if mismatches:
@@ -1775,10 +2073,25 @@ class MonitorThread(threading.Thread):
                     if ext not in self._grace_logged_exts:
                         self._grace_logged_exts.add(ext)
                         detail_parts = []
+                        new_progid = None
                         for key, bl_val, cur_val, _ in mismatches[:3]:
                             label = ProtectionEngine.ITEM_LABELS.get(key, key)
                             detail_parts.append(f"{label}({bl_val}->{cur_val})")
-                        self.log_callback(f"[宽限期] {ext} 检测到不一致: {'; '.join(detail_parts)}（未恢复）")
+                            if key in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext") and cur_val:
+                                new_progid = cur_val
+                        tamperer = ""
+                        if new_progid:
+                            name, _ = identify_tamperer(new_progid)
+                            if name:
+                                tamperer = f" [{name}]"
+                        self.log_callback(f"[宽限期] {ext} 检测到不一致: {'; '.join(detail_parts)}{tamperer}（未恢复）")
+                elif is_locked:
+                    # 锁定中检测到更改：说明锁定不完全生效，静默恢复
+                    s, f, dets, verified = self._recover_with_verify(ext, mismatches, max_retries=3)
+                    if verified:
+                        log_event(ext, "恢复", "成功", "锁定中静默恢复(已验证)")
+                    else:
+                        log_event(ext, "恢复", "失败", f"锁定中恢复未通过: {';'.join(dets) if dets else '未知'}")
                 else:
                     self._handle_change(ext, mismatches)
 
@@ -1857,6 +2170,20 @@ class MonitorThread(threading.Thread):
         if ext in self.engine.allowed_this_cycle:
             return
 
+        # 关联检测：更改一个扩展名时，检查关联扩展名（如jpg↔jpeg）是否也被更改
+        if ext not in self._handling_exts:
+            self._handling_exts.add(ext)
+            try:
+                related_exts = ProtectionEngine.get_related_exts(ext)
+                for rel_ext in related_exts:
+                    if rel_ext != ext and rel_ext not in self._handling_exts and rel_ext not in self.engine.allowed_this_cycle:
+                        rel_mismatches = self.engine.check_extension(rel_ext)
+                        if rel_mismatches:
+                            self.log_callback(f"[关联检测] {rel_ext} 也被更改，同步处理", "info")
+                            self._handle_change(rel_ext, rel_mismatches)
+            finally:
+                self._handling_exts.discard(ext)
+
         # === 持续篡改严格判定 ===
         # 先记录之前是否已在持续模式（区分"刚判定"和"已持续"）
         was_persistent = self.persistent_tracker.is_persistent(ext)
@@ -1898,8 +2225,14 @@ class MonitorThread(threading.Thread):
                     batch_label = "扩展名关联被批量删除"
                 elif cur_progid.startswith("__"):
                     batch_label = "批量篡改(无ProgId)"
-                self.log_callback(f"⚠ 批量篡改: {batch_label} 涉及{len(batch_exts)}个扩展名，BH{level}", "warn")
-                log_event("ALL", "批量篡改", "检测到", f"分组={cur_progid}, 扩展名数={len(batch_exts)}, BH{level}")
+                tamperer = ""
+                name = None
+                if not cur_progid.startswith("__"):
+                    name, _ = identify_tamperer(cur_progid)
+                    if name:
+                        tamperer = f" [{name}]"
+                self.log_callback(f"⚠ 批量篡改: {batch_label} 涉及{len(batch_exts)}个扩展名，BH{level}{tamperer}", "warn")
+                log_event("ALL", "批量篡改", "检测到", f"分组={cur_progid}, 扩展名数={len(batch_exts)}, BH{level}" + (f" 篡改者={name}" if name else ""))
                 # 进程打击：虚拟分组ID不用于匹配进程，只打击黑名单
                 enforce_progid = None if cur_progid.startswith("__") else cur_progid
                 results = self.process_enforcer.enforce(enforce_progid, action="untrusted")
@@ -1919,7 +2252,7 @@ class MonitorThread(threading.Thread):
                     self.persistent_tracker.force_persistent(e)
                     if self.persistent_tracker.should_lock(e):
                         # 获取基准中的ProgId用于锁定command键
-                        bl = self.engine.baseline.get(e, {})
+                        bl = self.engine.baseline.baseline.get(e, {})
                         prog_id = _get_prog_id_from_baseline(bl)
                         ok_cnt, total, dets = lock_all_protected_keys(e, prog_id)
                         if ok_cnt > 0:
@@ -1938,21 +2271,39 @@ class MonitorThread(threading.Thread):
             self._persistent_mode = True
             level = self.persistent_tracker.get_lock_level(ext)
             reason = "高频观察期内再次篡改" if in_high_freq else "持续篡改"
-            self.log_callback(f"⚠ {ext} {reason}，BH{level}", "warn")
-            log_event(ext, "持续篡改", "检测到", f"BH{level}({reason})")
+            tamperer = ""
+            name = None
+            if cur_progid and not cur_progid.startswith("__"):
+                name, _ = identify_tamperer(cur_progid)
+                if name:
+                    tamperer = f" [{name}]"
+            self.log_callback(f"⚠ {ext} {reason}，BH{level}{tamperer}", "warn")
+            log_event(ext, "持续篡改", "检测到", f"BH{level}({reason})" + (f" 篡改者={name}" if name else ""))
             # 先恢复被篡改的值
             s, f, dets, verified = self._recover_with_verify(ext, mismatches, max_retries=3)
             if verified:
                 log_event(ext, "恢复", "成功", "持续篡改恢复(已验证)")
             else:
                 log_event(ext, "恢复", "失败", f"持续篡改恢复未通过: {';'.join(dets) if dets else '未知'}")
-            # 强锁定全部7个位置（ACL+System完整性标签）
+            # 强锁定全部7个位置（ACL+System完整性标签）+ 关联扩展名
             bl = self.engine.baseline.baseline.get(ext, {})
             prog_id = _get_prog_id_from_baseline(bl)
             ok_cnt, total, dets = lock_all_protected_keys(ext, prog_id)
+            # 关联锁定：jpg↔jpeg等
+            related_exts = ProtectionEngine.get_related_exts(ext)
+            rel_locked = []
+            for rel_ext in related_exts:
+                if rel_ext != ext and rel_ext in self.engine.baseline.baseline:
+                    rel_bl = self.engine.baseline.baseline.get(rel_ext, {})
+                    rel_prog = _get_prog_id_from_baseline(rel_bl)
+                    r_ok, r_total, _ = lock_all_protected_keys(rel_ext, rel_prog)
+                    if r_ok > 0:
+                        self.persistent_tracker.mark_locked(rel_ext)
+                        rel_locked.append(f"{rel_ext}({r_ok}/{r_total})")
             lock_status = f"{ok_cnt}/{total}位置" if ok_cnt > 0 else f"失败({dets})"
-            self.log_callback(f"  {ext} 全位置强锁定{lock_status}", "info")
-            log_event(ext, "全位置强锁定", lock_status, dets)
+            rel_info = f" 关联锁定: {', '.join(rel_locked)}" if rel_locked else ""
+            self.log_callback(f"  {ext} 全位置强锁定{lock_status}{rel_info}", "info")
+            log_event(ext, "全位置强锁定", lock_status + rel_info, dets)
             self.persistent_tracker.mark_locked(ext)
             # 进程打击：Untrusted降权（虚拟分组ID不用于匹配进程）
             enforce_progid = None if (cur_progid and cur_progid.startswith("__")) else cur_progid
@@ -1983,12 +2334,22 @@ class MonitorThread(threading.Thread):
 
         # 记录更改细节
         detail_parts = []
+        new_progid = None
         for key, bl_val, cur_val, _ in mismatches:
             label = ProtectionEngine.ITEM_LABELS.get(key, key)
             detail_parts.append(f"{label}({bl_val}->{cur_val})")
+            if key in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext") and cur_val:
+                new_progid = cur_val
         detail_str = "; ".join(detail_parts)
-        log_event(ext, "更改", "检测到", detail_str)
-        self.log_callback(f"检测到 {ext} 被更改: {detail_str}")
+        # 篡改者识别
+        tamperer = ""
+        name = None
+        if new_progid:
+            name, conf = identify_tamperer(new_progid)
+            if name:
+                tamperer = f" [{name}]"
+        log_event(ext, "更改", "检测到", detail_str + (f" 篡改者={name}" if name else ""))
+        self.log_callback(f"检测到 {ext} 被更改: {detail_str}{tamperer}")
 
         # 执行恢复+验证（最多3次重试）
         s, f, dets, verified = self._recover_with_verify(ext, mismatches)
@@ -2014,11 +2375,14 @@ class MonitorThread(threading.Thread):
             log_event(ext, "恢复", "失败", f"成功{s}/失败{f}:{';'.join(dets)}")
             self.log_callback(f"{ext} 恢复部分失败: {'; '.join(dets)}")
 
-        # 右下角通知（在主线程中执行）
+        # 右下角通知（必须在主线程中执行，Tkinter非线程安全）
         extra = self._notify_extra_seconds
         if extra > 0:
             self._notify_extra_seconds = 0  # 消费一次
-        self.popup_callback(ext, mismatches, recover_result, extra)
+        if self.root:
+            self.root.after(0, lambda: self.popup_callback(ext, mismatches, recover_result, extra))
+        else:
+            self.popup_callback(ext, mismatches, recover_result, extra)
 
 
 # ============================================================
@@ -2046,6 +2410,12 @@ def force_delete_userchoice(ext):
     """强制删除UserChoice键，尝试10种方法。返回 (success, method)"""
     uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
     reg_path = _get_uc_registry_path(ext)
+    # 先检查键是否存在，不存在则无需删除，直接成功
+    try:
+        kh = winreg.OpenKey(HKCU, uc_path, 0, KEY_READ_64)
+        winreg.CloseKey(kh)
+    except OSError:
+        return True, "键已不存在(无需删除)"
     # 方法1: winreg DeleteKey
     try:
         winreg.DeleteKey(HKCU, uc_path)
@@ -2062,7 +2432,7 @@ def force_delete_userchoice(ext):
         pass
     # 方法3: PowerShell Remove-Item
     try:
-        r = subprocess.run(['powershell', '-NoProfile', '-Command',
+        r = _run(['powershell', '-NoProfile', '-Command',
                            f'Remove-Item -Path "{reg_path}" -Recurse -Force -ErrorAction Stop; Write-Output "OK"'],
                            capture_output=True, text=True, timeout=8)
         if "OK" in r.stdout:
@@ -2072,7 +2442,7 @@ def force_delete_userchoice(ext):
     # 方法4: reg.exe delete
     try:
         full_path = f"HKEY_USERS\\{getattr(remap_hkcu_to_interactive_user, '_last_sid', '')}\\{uc_path}" if HKCU_REMAPPED else f"HKCU\\{uc_path}"
-        r = subprocess.run(['reg', 'delete', full_path, '/f'],
+        r = _run(['reg', 'delete', full_path, '/f'],
                            capture_output=True, text=True, timeout=8)
         if r.returncode == 0:
             return True, "reg.exe delete"
@@ -2090,7 +2460,7 @@ if (Test-Path $path) {{
     Write-Output "OK"
 }}
 '''
-        r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+        r = _run(['powershell', '-NoProfile', '-Command', ps],
                            capture_output=True, text=True, timeout=8)
         if "OK" in r.stdout:
             return True, "重置ACL+Remove"
@@ -2107,7 +2477,7 @@ if (Test-Path $path) {{
     Write-Output "OK"
 }}
 '''
-        r = subprocess.run(['powershell', '-NoProfile', '-Command', ps2],
+        r = _run(['powershell', '-NoProfile', '-Command', ps2],
                            capture_output=True, text=True, timeout=10)
         if "OK" in r.stdout:
             return True, "takeown+icacls+del"
@@ -2138,7 +2508,7 @@ if (Test-Path $path) {{
 $key = [Microsoft.Win32.Registry]::Users.OpenSubKey("{sid}\\{uc_path}", $true)
 if ($key) {{ $key.DeleteSubKeyTree("UserChoice", $true); $key.Close(); Write-Output "OK" }}
 '''
-        r = subprocess.run(['powershell', '-NoProfile', '-Command', ps3],
+        r = _run(['powershell', '-NoProfile', '-Command', ps3],
                            capture_output=True, text=True, timeout=8)
         if "OK" in r.stdout:
             return True, ".NET Registry.DeleteSubKeyTree"
@@ -2161,7 +2531,7 @@ if (Test-Path $path) {{
     Write-Output "OK"
 }}
 '''
-        r = subprocess.run(['powershell', '-NoProfile', '-Command', ps4],
+        r = _run(['powershell', '-NoProfile', '-Command', ps4],
                            capture_output=True, text=True, timeout=8)
         if "OK" in r.stdout:
             return True, "清空值(未删键)"
@@ -2204,7 +2574,7 @@ if (Test-Path $path) {{
     Write-Output "NOT_FOUND"
 }}
 '''
-        result = subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd],
+        result = _run(['powershell', '-NoProfile', '-Command', ps_cmd],
                                 capture_output=True, text=True, timeout=10)
         output = result.stdout.strip()
         if "OK" in output:
@@ -2246,7 +2616,7 @@ if (Test-Path $path) {{
     Write-Output "NOT_FOUND"
 }}
 '''
-        result = subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd],
+        result = _run(['powershell', '-NoProfile', '-Command', ps_cmd],
                                 capture_output=True, text=True, timeout=10)
         if "OK" in result.stdout:
             return True, "PowerShell解锁"
@@ -2264,7 +2634,7 @@ if (Test-Path $path) {{
     Write-Output "OK2"
 }}
 '''
-        result2 = subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd2],
+        result2 = _run(['powershell', '-NoProfile', '-Command', ps_cmd2],
                                  capture_output=True, text=True, timeout=10)
         if "OK2" in result2.stdout:
             return True, "重置继承解锁"
@@ -2410,7 +2780,7 @@ if (Test-Path $path) {{
 }}
 '''
     try:
-        result = subprocess.run(['powershell', '-NoProfile', '-Command', ps_cmd],
+        result = _run(['powershell', '-NoProfile', '-Command', ps_cmd],
                                 capture_output=True, text=True, timeout=10)
         if "OK" in result.stdout:
             return True, f"完整性标签已设为{level}"
@@ -2570,7 +2940,7 @@ class PersistentTracker:
     SINGLE_WINDOW = 20      # 单扩展名判定窗口(秒)
     SINGLE_THRESHOLD = 2    # 单扩展名阈值（2次触发持续篡改）
     BATCH_WINDOW = 60       # 批量篡改判定窗口(秒)
-    BATCH_THRESHOLD = 2     # 批量篡改扩展名数阈值（2个即触发）
+    BATCH_THRESHOLD = 8     # 批量篡改扩展名数阈值（8个即触发）
     LOCK_DURATION_1 = 60    # 第1-2次锁定时长(秒)，延长避免频繁解锁
     LOCK_DURATION_2 = 300   # 第3次及以后锁定时长(秒)，5分钟
     HIGH_FREQ_DURATION = 20  # 解锁后高频观察期(秒)，延长
@@ -2646,6 +3016,17 @@ class PersistentTracker:
 
     def is_persistent(self, ext):
         return ext in self._persistent_exts
+
+    def clear_ext_history(self, ext):
+        """用户同意后清除该扩展名的篡改历史，避免同意后立即触发持续篡改"""
+        if ext in self._ext_history:
+            del self._ext_history[ext]
+        self._persistent_exts.discard(ext)
+        # 同时从_progid_history中移除该扩展名的记录
+        for progid, records in list(self._progid_history.items()):
+            self._progid_history[progid] = [(t, e) for t, e in records if e != ext]
+            if not self._progid_history[progid]:
+                del self._progid_history[progid]
 
     def force_persistent(self, ext):
         """强制标记为持续篡改（批量篡改时使用，无需积累3次）"""
@@ -2972,7 +3353,7 @@ class ProcessEnforcer:
                 return True, "TerminateProcess"
         # 方法2: taskkill /F /PID
         try:
-            subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'],
+            _run(['taskkill', '/F', '/PID', str(pid), '/T'],
                            capture_output=True, timeout=5)
             time.sleep(0.3)
             if not self._is_process_alive(pid):
@@ -2981,7 +3362,7 @@ class ProcessEnforcer:
             pass
         # 方法3: wmic process delete
         try:
-            subprocess.run(['wmic', 'process', 'where', f'ProcessId={pid}', 'delete'],
+            _run(['wmic', 'process', 'where', f'ProcessId={pid}', 'delete'],
                            capture_output=True, timeout=5)
             time.sleep(0.3)
             if not self._is_process_alive(pid):
@@ -2990,7 +3371,7 @@ class ProcessEnforcer:
             pass
         # 方法4: PowerShell Stop-Process
         try:
-            subprocess.run(['powershell', '-NoProfile', '-Command',
+            _run(['powershell', '-NoProfile', '-Command',
                            f'Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue'],
                            capture_output=True, timeout=5)
             time.sleep(0.3)
@@ -3094,9 +3475,13 @@ class MainWindow:
         self.root.minsize(700, 500)
 
         self.baseline_mgr = BaselineManager()
+        self.change_history = ChangeHistoryManager(USERDATA_DIR)
         self.engine = ProtectionEngine(self.baseline_mgr)
         self.monitor = None
         self.active_toasts = []  # 当前活动的通知列表
+        self._popup_queue = []   # 单个模式下的弹窗队列：[(ext, mismatches, recover_result, extra_timeout), ...]
+        self._popup_queue_active = False  # 队列是否正在处理（有弹窗显示中）
+        self._popup_last_reason = None    # 上一个弹窗关闭原因："consent"/"timeout"
         self.ti_elevated = ti_elevated  # TrustedInstaller 提权状态
         self.ti_status = ti_status
         self.exit_event = create_exit_event()  # 跨进程退出信号事件
@@ -3190,6 +3575,7 @@ class MainWindow:
 
         # 启动提示
         self._append_log("按钮说明：启动保护=开启实时监控 | 停止保护=暂停监控 | 备份当前=以当前状态保存基准 | 深层扫描=全量校验 | 历史版本=恢复旧基准 | 设置=配置选项", "info")
+        self._append_log("更改记录可在 设置→更改记录 中查看，支持检测当前状态", "info")
         if is_autostart_set():
             self._append_log("已添加到开机自启", "success")
         else:
@@ -3333,7 +3719,8 @@ class MainWindow:
         self.monitor = MonitorThread(
             self.engine, self.baseline_mgr,
             popup_callback=self._show_notification,
-            log_callback=self._append_log
+            log_callback=self._append_log,
+            root=self.root
         )
         self.monitor.start()
         self.engine.paused = False
@@ -3409,33 +3796,121 @@ class MainWindow:
         except Exception:
             pass
         self._append_log("程序已退出。", "info")
-        self.root.after(300, self.root.destroy)
+        # 销毁主窗口后强制退出进程，确保后台线程也终止
+        def _force_exit():
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            import os
+            os._exit(0)
+        self.root.after(300, _force_exit)
 
     def _backup_current(self):
-        """以当前所有扩展名状态备份为新基准（后台线程执行，避免UI卡死）"""
+        """以当前状态备份为新基准，支持对比选择部分更新"""
         if not self.baseline_mgr.is_initialized():
             messagebox.showwarning(APP_NAME, "请先创建基准！")
             return
-        if not messagebox.askyesno(APP_NAME, "确定要以当前状态备份为新基准吗？\n将覆盖现有基准并保存历史版本。"):
+        # 先扫描差异
+        self._append_log("正在扫描当前状态与基准的差异...", "info")
+        inconsistencies, new_exts = self.engine.deep_scan()
+        if not inconsistencies and not new_exts:
+            messagebox.showinfo(APP_NAME, "当前状态与基准完全一致，无需更新。")
             return
-        # 暂停监控线程
-        was_running = self.monitor and self.monitor.is_alive()
-        if was_running:
-            self.monitor.pause()
-            time.sleep(0.5)
-        self._append_log("正在备份当前状态为新基准（后台执行，请稍候）...", "info")
+        # 弹出对比选择窗口
+        self._show_backup_selector(inconsistencies, new_exts)
 
-        def progress_cb(done, total):
-            self.root.after(0, lambda: self._append_log(f"备份进度: {done}/{total}", "info"))
+    def _show_backup_selector(self, inconsistencies, new_exts):
+        """基准对比选择窗口：用户勾选要更新的扩展名"""
+        win = tk.Toplevel(self.root)
+        win.title("基准对比 - 选择更新项")
+        win.geometry("680x560")
+        win.transient(self.root)
+        win.grab_set()
 
-        def do_backup():
-            try:
-                count = self.baseline_mgr.create_baseline("current", progress_cb=progress_cb)
-                self.root.after(0, lambda: self._on_backup_done(count, was_running))
-            except Exception as e:
-                self.root.after(0, lambda: self._on_backup_failed(str(e), was_running))
+        tk.Label(win, text=f"发现 {len(inconsistencies)} 个扩展名有差异，{len(new_exts)} 个新扩展名。勾选要更新的项：",
+                 font=("微软雅黑", 9), wraplength=640, justify="left").pack(anchor="w", padx=10, pady=8)
 
-        threading.Thread(target=do_backup, daemon=True).start()
+        # 全选/取消全选
+        btn_bar = tk.Frame(win)
+        btn_bar.pack(fill="x", padx=10)
+        check_vars = {}
+
+        def select_all():
+            for v in check_vars.values():
+                v.set(True)
+
+        def deselect_all():
+            for v in check_vars.values():
+                v.set(False)
+
+        tk.Button(btn_bar, text="全选", command=select_all, font=("微软雅黑", 9), width=8).pack(side="left", padx=2)
+        tk.Button(btn_bar, text="取消全选", command=deselect_all, font=("微软雅黑", 9), width=8).pack(side="left", padx=2)
+
+        # 差异列表（带滚动条）
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=8)
+        canvas = tk.Canvas(list_frame)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas)
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 显示差异扩展名
+        row = 0
+        for ext, mismatches in inconsistencies.items():
+            var = tk.BooleanVar(value=True)
+            check_vars[ext] = var
+            detail_parts = []
+            for key, bl_val, cur_val, _ in mismatches[:3]:
+                label = ProtectionEngine.ITEM_LABELS.get(key, key)
+                detail_parts.append(f"{label}:{bl_val}→{cur_val}")
+            detail = "; ".join(detail_parts)
+            if len(mismatches) > 3:
+                detail += f" 等{len(mismatches)}项"
+            tk.Checkbutton(scroll_frame, text=f"{ext}  {detail}", variable=var,
+                           font=("微软雅黑", 8), wraplength=600, justify="left").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+            row += 1
+        # 新扩展名
+        for ext in new_exts:
+            var = tk.BooleanVar(value=True)
+            check_vars[ext] = var
+            tk.Checkbutton(scroll_frame, text=f"{ext}  [新扩展名，基准中不存在]", variable=var,
+                           font=("微软雅黑", 8), fg="#27ae60").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+            row += 1
+
+        # 底部按钮
+        bottom = tk.Frame(win)
+        bottom.pack(fill="x", padx=10, pady=8)
+
+        def confirm_backup():
+            selected = [ext for ext, v in check_vars.items() if v.get()]
+            if not selected:
+                messagebox.showwarning(APP_NAME, "请至少选择一个扩展名！")
+                return
+            win.destroy()
+            # 暂停监控
+            was_running = self.monitor and self.monitor.is_alive()
+            if was_running:
+                self.monitor.pause()
+                time.sleep(0.5)
+            self._append_log(f"正在更新 {len(selected)} 个扩展名的基准...", "info")
+
+            def do_partial_backup():
+                try:
+                    count = self.baseline_mgr.update_selected_extensions(selected)
+                    self.root.after(0, lambda: self._on_backup_done(count, was_running))
+                except Exception as e:
+                    self.root.after(0, lambda: self._on_backup_failed(str(e), was_running))
+
+            threading.Thread(target=do_partial_backup, daemon=True).start()
+
+        tk.Button(bottom, text="确认更新选中项", command=confirm_backup, font=("微软雅黑", 10, "bold"),
+                  bg="#27ae60", fg="white", width=15).pack(side="right", padx=5)
+        tk.Button(bottom, text="取消", command=win.destroy, font=("微软雅黑", 10), width=8).pack(side="right", padx=5)
 
     def _on_backup_done(self, count, was_running):
         self._refresh_status()
@@ -3627,18 +4102,31 @@ class MainWindow:
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # === 页1：通用 ===
+        # === 页1：提醒 ===
         tab1 = tk.Frame(nb)
-        nb.add(tab1, text="通用")
+        nb.add(tab1, text="提醒")
         r = 0
         autostart_var = tk.BooleanVar(value=cfg.get("autostart", True))
         tk.Checkbutton(tab1, text="开机自启", variable=autostart_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
         popup_var = tk.BooleanVar(value=cfg.get("show_popup", True))
         tk.Checkbutton(tab1, text="检测到更改时弹窗通知（取消则静默阻止）", variable=popup_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
         tk.Label(tab1, text="弹窗等待时间(秒):", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
-        block_var = tk.IntVar(value=cfg.get("block_timeout", NOTIFY_TIMEOUT))
-        tk.Spinbox(tab1, from_=1, to=60, textvariable=block_var, width=8).grid(row=r, column=1, sticky="w", pady=6); r+=1
-        tk.Label(tab1, text="关闭弹窗时此值强制为1秒", font=("微软雅黑", 8), fg="#999").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=2); r+=1
+        _loaded_timeout = cfg.get("block_timeout", NOTIFY_TIMEOUT)
+        if _loaded_timeout < 1: _loaded_timeout = 1
+        elif _loaded_timeout > 180: _loaded_timeout = 180
+        block_var = tk.IntVar(value=_loaded_timeout)
+        tk.Spinbox(tab1, from_=1, to=180, textvariable=block_var, width=8).grid(row=r, column=1, sticky="w", pady=6); r+=1
+        tk.Label(tab1, text="范围1-180秒，关闭弹窗时此值强制为1秒", font=("微软雅黑", 8), fg="#999").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=2); r+=1
+        # 批量弹窗模式
+        tk.Label(tab1, text="批量弹窗模式:", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
+        batch_popup_var = tk.StringVar(value=cfg.get("batch_popup_mode", "single"))
+        batch_frame = tk.Frame(tab1)
+        batch_frame.grid(row=r, column=1, sticky="w", pady=6)
+        tk.Radiobutton(batch_frame, text="单个(队列)", variable=batch_popup_var, value="single", font=("微软雅黑", 9)).pack(side="left", padx=5)
+        tk.Radiobutton(batch_frame, text="同时(堆叠)", variable=batch_popup_var, value="simultaneous", font=("微软雅黑", 9)).pack(side="left", padx=5)
+        r+=1
+        tk.Label(tab1, text="单个：一次弹一个，超时自动阻止后下一个缩短为2秒；用户同意后下一个恢复正常时间\n同时：所有弹窗同时弹出，各自独立计时",
+                 font=("微软雅黑", 8), fg="#666", justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=20, pady=(0,6)); r+=1
         clearlog_var = tk.BooleanVar(value=cfg.get("clear_log_on_start", False))
         tk.Checkbutton(tab1, text="每次启动清空日志", variable=clearlog_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
         nokill_var = tk.BooleanVar(value=cfg.get("persistent_no_kill", False))
@@ -3686,9 +4174,153 @@ class MainWindow:
             "红名单：进程永久拒绝扩展名相关注册表操作"
         )
         tk.Label(tab4, text=protect_info, font=("微软雅黑", 8), justify="left", fg="#333").grid(row=r, column=0, columnspan=2, sticky="w", padx=20, pady=4); r+=1
+
         tk.Label(tab4, text=f"\n{APP_NAME} v{APP_VERSION}\n阻止第三方软件私自篡改文件扩展名默认打开方式\n保护7项注册表位置，支持基准校准与自动恢复",
                  font=("微软雅黑", 8), justify="left", fg="#666").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
         tk.Label(tab4, text="GitHub: https://github.com/TXZDMM/OPSTController", font=("微软雅黑", 8), fg="#3498db").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=2)
+
+        # === 页5：更改记录 ===
+        tab5 = tk.Frame(nb)
+        nb.add(tab5, text="更改记录")
+        # 记录列表
+        list_frame = tk.Frame(tab5)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(list_frame, text="更改历史（最近100条）", font=("微软雅黑", 9, "bold")).pack(anchor="w")
+        history_listbox = tk.Listbox(list_frame, font=("微软雅黑", 8), height=12)
+        history_listbox.pack(fill="both", expand=True, pady=5)
+        # 详情显示
+        detail_text = tk.Text(list_frame, font=("微软雅黑", 8), height=6, wrap="word")
+        detail_text.pack(fill="x", pady=5)
+        detail_text.configure(state="normal")  # 确保可编辑，用于输入EXIT-TXZ退出命令
+        # 按钮
+        btn_frame = tk.Frame(tab5)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        def refresh_history():
+            history_listbox.delete(0, tk.END)
+            records = self.change_history.get_records(limit=100)
+            for rec in reversed(records):
+                action_text = {"user_consent": "用户同意", "auto_blocked": "自动阻止", "detected_only": "仅检测"}.get(rec["action"], rec["action"])
+                history_listbox.insert(tk.END, f"{rec['timestamp']}  {rec['ext']}  [{rec['tamperer']}]  {action_text}  {rec['result']}")
+
+        def show_history_detail(evt):
+            sel = history_listbox.curselection()
+            if not sel:
+                return
+            records = self.change_history.get_records(limit=100)
+            idx = len(records) - 1 - sel[0]
+            if idx < 0 or idx >= len(records):
+                return
+            rec = records[idx]
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, f"时间: {rec['timestamp']}\n")
+            detail_text.insert(tk.END, f"扩展名: {rec['ext']}\n")
+            detail_text.insert(tk.END, f"篡改者: {rec['tamperer']}\n")
+            detail_text.insert(tk.END, f"操作: {rec['action']}  结果: {rec['result']}\n")
+            detail_text.insert(tk.END, "更改详情:\n")
+            for ch in rec.get("changes", []):
+                detail_text.insert(tk.END, f"  {ch['item']}: {ch['old']} → {ch['new']}\n")
+
+        def check_current_status():
+            sel = history_listbox.curselection()
+            if not sel:
+                return
+            records = self.change_history.get_records(limit=100)
+            idx = len(records) - 1 - sel[0]
+            if idx < 0 or idx >= len(records):
+                return
+            ext = records[idx]["ext"]
+            # 检测当前7项状态：全部展示，标注差异
+            bl = self.baseline_mgr.baseline.baseline.get(ext, {})
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, f"=== {ext} 当前7项状态 ===\n\n")
+            item_order = ["userchoice_progid", "userchoice_hash", "hkcr_ext", "hkcu_ext", "hklm_ext", "hkcr_command", "hkcu_command"]
+            mismatch_count = 0
+            for key in item_order:
+                bl_item = bl.get(key, {})
+                label = ProtectionEngine.ITEM_LABELS.get(key, key)
+                bl_val = bl_item.get("value")
+                # 读取当前值
+                cur_val = None
+                if bl_item:
+                    root_name = bl_item.get("root", "?")
+                    root = ROOT_MAP.get(root_name)
+                    path = bl_item.get("path", "")
+                    name = bl_item.get("name", "")
+                    if root and path:
+                        try:
+                            cur_val, _ = reg_read_value(root, path, name)
+                        except Exception:
+                            cur_val = None
+                # UserChoice兜底读取
+                if key in ("userchoice_progid", "userchoice_hash") and cur_val is None:
+                    uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
+                    val_name = "ProgId" if key == "userchoice_progid" else "Hash"
+                    try:
+                        cur_val, _ = reg_read_value(HKCU, uc_path, val_name)
+                    except Exception:
+                        pass
+                # 比较并显示
+                is_diff = (bl_val != cur_val) and not (bl_val is None and cur_val is None)
+                if is_diff:
+                    mismatch_count += 1
+                    status = "✗ 异常"
+                    color_tag = "diff"
+                else:
+                    status = "✓ 正常"
+                    color_tag = "same"
+                detail_text.insert(tk.END, f"[{status}] {label}\n", color_tag)
+                detail_text.insert(tk.END, f"    基准: {repr(bl_val)}\n")
+                detail_text.insert(tk.END, f"    当前: {repr(cur_val)}\n\n")
+            # 汇总
+            if mismatch_count == 0:
+                detail_text.insert(tk.END, "结论: 全部正常（与基准一致）\n", "same")
+            else:
+                detail_text.insert(tk.END, f"结论: 发现 {mismatch_count} 项异常\n", "diff")
+            # 设置颜色
+            detail_text.tag_config("same", foreground="#27ae60")
+            detail_text.tag_config("diff", foreground="#e74c3c")
+            # 检测当前打开方式
+            try:
+                progid = get_prog_id(ext)
+                if progid:
+                    name, _ = identify_tamperer(progid)
+                    detail_text.insert(tk.END, f"\n当前默认打开方式: {progid}" + (f" ({name})" if name else ""))
+                else:
+                    detail_text.insert(tk.END, f"\n当前默认打开方式: 系统默认（无UserChoice）")
+            except Exception as e:
+                detail_text.insert(tk.END, f"\n获取打开方式失败: {e}")
+
+        def clear_history():
+            if messagebox.askyesno("确认", "确定清空所有更改记录？"):
+                self.change_history.clear()
+                refresh_history()
+                detail_text.delete("1.0", tk.END)
+
+        history_listbox.bind("<<ListboxSelect>>", show_history_detail)
+        # 隐藏退出密码：在详情框输入EXIT-TXZ按Enter退出程序
+        def _check_exit_code(evt):
+            content = detail_text.get("1.0", tk.END).strip()
+            if "EXIT-TXZ" in content:
+                # 强制退出：先尝试优雅退出，1秒后强制终止
+                try:
+                    self.baseline_mgr.save()
+                except Exception:
+                    pass
+                try:
+                    if self.monitor and self.monitor.running:
+                        self.monitor.stop()
+                except Exception:
+                    pass
+                # 立即强制退出进程
+                import os
+                os._exit(0)
+                return "break"
+        detail_text.bind("<KeyRelease-Return>", _check_exit_code)
+        tk.Button(btn_frame, text="刷新", command=refresh_history, font=("微软雅黑", 9), width=8).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="检测当前状态", command=check_current_status, font=("微软雅黑", 9), width=12).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="清空记录", command=clear_history, font=("微软雅黑", 9), width=8).pack(side="left", padx=5)
+        refresh_history()
 
         # 底部按钮
         bottom_frame = tk.Frame(win)
@@ -3700,9 +4332,13 @@ class MainWindow:
             cfg["default_permission"] = perm_var.get()
             cfg["autostart"] = autostart_var.get()
             cfg["show_popup"] = popup_var.get()
-            cfg["block_timeout"] = 1 if not popup_var.get() else block_var.get()
+            _save_timeout = block_var.get()
+            if _save_timeout < 1: _save_timeout = 1
+            elif _save_timeout > 180: _save_timeout = 180
+            cfg["block_timeout"] = 1 if not popup_var.get() else _save_timeout
             cfg["clear_log_on_start"] = clearlog_var.get()
             cfg["persistent_no_kill"] = nokill_var.get()
+            cfg["batch_popup_mode"] = batch_popup_var.get()
             self.baseline_mgr.save_config()
             if autostart_var.get():
                 if not is_autostart_set(): add_to_autostart()
@@ -3724,7 +4360,7 @@ class MainWindow:
         # 方法1：用explorer.exe打开（TI下最可靠，利用用户态已运行的explorer）
         try:
             import subprocess
-            subprocess.Popen(['explorer.exe', url], creationflags=0x08000000)
+            _popen(['explorer.exe', url], creationflags=0x08000000)
             opened = True
         except Exception:
             pass
@@ -3793,51 +4429,115 @@ class MainWindow:
         parent_win.destroy()
 
     def _show_notification(self, ext, mismatches, recover_result, extra_timeout=0):
-        """监控线程调用：在主线程显示右下角通知"""
+        """监控线程调用：在主线程显示右下角通知。
+        支持两种批量弹窗模式：
+        - simultaneous（同时）：所有弹窗同时弹出，各自独立计时
+        - single（单个，默认）：队列式，一次只显示最上面一个，只有它计时；
+          上一个超时自动阻止→下一个缩短为2秒；上一个用户同意→下一个恢复正常超时"""
         if threading.current_thread() is not threading.main_thread():
             self.root.after(0, self._show_notification, ext, mismatches, recover_result, extra_timeout)
             return
 
-        def on_consent(extension):
-            """用户单次同意：更新基准，清除冷却"""
-            self.baseline_mgr.update_extension(extension)
-            self.engine.clear_cooldown(extension)
-            self.engine.allowed_this_cycle.add(extension)
-            self._append_log(f"用户同意 {extension} 的更改，已更新基准。", "warn")
-            log_event(extension, "更改", "已同意", "用户单次同意")
-            # 10秒后从同意列表移除
-            self.root.after(10000, lambda: self.engine.allowed_this_cycle.discard(extension))
-
-        def on_close(toast):
-            """通知关闭：从活动列表移除，其余通知对角线上移"""
-            if toast in self.active_toasts:
-                idx = self.active_toasts.index(toast)
-                self.active_toasts.remove(toast)
-                # 上方的通知对角线上移（上+左）
-                delta_y = NotificationToast.TOAST_HEIGHT + NotificationToast.GAP
-                delta_x = 18  # 每个向左偏移18像素
-                for t in self.active_toasts[idx:]:
-                    t.move_up(delta_y, delta_x)
-            self._append_log(f"{ext} 通知已关闭，保持恢复状态。", "info")
-
         # 检查是否弹窗
         show_popup = self.baseline_mgr.config.get("show_popup", True)
         if not show_popup:
-            # 静默模式：不弹窗，直接记录并保持恢复
             self._append_log(f"{ext} 检测到更改，静默阻止（弹窗已关闭）", "warn")
             return
 
-        # 计算堆叠偏移：每个向上堆叠，同时向左偏移18px
-        stack_count = len(self.active_toasts)
-        y_offset = stack_count * (NotificationToast.TOAST_HEIGHT + NotificationToast.GAP)
-        x_offset = stack_count * 18
-        timeout = self.baseline_mgr.config.get("block_timeout", NOTIFY_TIMEOUT) + extra_timeout
-        if extra_timeout > 0:
-            self._append_log(f"批量篡改防护生效，本次弹窗自动阻止时间+{extra_timeout}秒", "info")
+        popup_mode = self.baseline_mgr.config.get("batch_popup_mode", "single")
+
+        # 构造更改详情列表（用于历史记录）
+        changes_for_history = []
+        for key, bl_val, cur_val, _ in mismatches:
+            label = ProtectionEngine.ITEM_LABELS.get(key, key)
+            changes_for_history.append({"item": label, "old": str(bl_val), "new": str(cur_val)})
+
+        def on_consent(extension):
+            self.baseline_mgr.update_extension(extension)
+            self.engine.clear_cooldown(extension)
+            self.engine.allowed_this_cycle.add(extension)
+            self.engine.persistent_tracker.clear_ext_history(extension)
+            self.change_history.add_record(extension, tamperer_name, changes_for_history, "user_consent", "success")
+            self._append_log(f"用户同意 {extension} 的更改，已更新基准并重置篡改计数。", "warn")
+            log_event(extension, "更改", "已同意", "用户单次同意")
+            self._popup_last_reason = "consent"  # 用户同意→下一个弹窗恢复正常超时
+            self.root.after(10000, lambda: self.engine.allowed_this_cycle.discard(extension))
+
+        def on_close(toast):
+            if toast in self.active_toasts:
+                idx = self.active_toasts.index(toast)
+                self.active_toasts.remove(toast)
+                if popup_mode == "simultaneous":
+                    delta_y = NotificationToast.TOAST_HEIGHT + NotificationToast.GAP
+                    delta_x = 18
+                    for t in self.active_toasts[idx:]:
+                        t.move_up(delta_y, delta_x)
+            self._append_log(f"{toast.ext} 通知已关闭，保持恢复状态。", "info")
+            # 记录更改历史：超时自动阻止
+            if toast.close_reason == "timeout":
+                s, f, _ = recover_result
+                result = "success" if f == 0 else ("partial" if s > 0 else "fail")
+                self.change_history.add_record(toast.ext, toast.tamperer_name, changes_for_history, "auto_blocked", result)
+            # 单个模式：记录关闭原因，处理队列中下一个
+            if popup_mode == "single":
+                self._popup_last_reason = toast.close_reason
+                if self._popup_queue:
+                    self.root.after(300, self._process_popup_queue)
+                else:
+                    self._popup_queue_active = False
+                    # 不重置_popup_last_reason，保留到下一个弹窗使用
+                    # （避免恢复中的扩展名还没入队，导致超时缩短失效）
+
+        # 单个模式：如果当前有活动弹窗，加入队列不立即显示
+        if popup_mode == "single" and self.active_toasts:
+            self._popup_queue.append((ext, mismatches, recover_result, extra_timeout))
+            self._append_log(f"{ext} 已加入弹窗队列（当前{len(self._popup_queue)}个等待）", "info")
+            return
+
+        # 识别篡改者
+        tamperer_name = None
+        for key, bl_val, cur_val, _ in mismatches:
+            if key in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext") and cur_val:
+                tamperer_name, _ = identify_tamperer(cur_val)
+                break
+
+        # 计算超时时间
+        if popup_mode == "single" and self._popup_last_reason == "timeout":
+            timeout = 2  # 上一个超时自动阻止 → 下一个缩短为2秒
+            self._append_log(f"上一个弹窗超时自动阻止，本次弹窗超时缩短为2秒", "info")
+        else:
+            _cfg_timeout = self.baseline_mgr.config.get("block_timeout", NOTIFY_TIMEOUT)
+            if _cfg_timeout < 1: _cfg_timeout = 1
+            elif _cfg_timeout > 180: _cfg_timeout = 180
+            timeout = _cfg_timeout + extra_timeout
+            if extra_timeout > 0:
+                self._append_log(f"批量篡改防护生效，本次弹窗自动阻止时间+{extra_timeout}秒", "info")
+
+        # 同时模式：堆叠偏移；单个模式：固定位置
+        if popup_mode == "simultaneous":
+            stack_count = len(self.active_toasts)
+            y_offset = stack_count * (NotificationToast.TOAST_HEIGHT + NotificationToast.GAP)
+            x_offset = stack_count * 18
+        else:
+            y_offset = 0
+            x_offset = 0
+
         toast = NotificationToast(self.root, ext, mismatches, recover_result,
                                   on_consent, on_close, self._show_main_window,
-                                  y_offset=y_offset, x_offset=x_offset, timeout=timeout)
+                                  y_offset=y_offset, x_offset=x_offset, timeout=timeout,
+                                  tamperer_name=tamperer_name)
         self.active_toasts.append(toast)
+        self._popup_queue_active = True
+
+    def _process_popup_queue(self):
+        """单个模式：从队列取出下一个弹窗显示"""
+        if not self._popup_queue:
+            self._popup_queue_active = False
+            # 不重置_popup_last_reason，保留到下一个弹窗使用
+            return
+        ext, mismatches, recover_result, extra_timeout = self._popup_queue.pop(0)
+        # 递归调用_show_notification，此时active_toasts为空，会直接显示
+        self._show_notification(ext, mismatches, recover_result, extra_timeout)
 
     def _append_log(self, msg, level="info"):
         # 线程安全：非主线程调用时通过 after 调度到主线程
@@ -4175,7 +4875,7 @@ def run_as_trustedinstaller():
                 _log(f"StartServiceW返回失败,错误码:{start_err},尝试sc.exe方式...")
                 try:
                     import subprocess
-                    subprocess.run(['sc.exe', 'start', 'TrustedInstaller'], capture_output=True, timeout=10)
+                    _run(['sc.exe', 'start', 'TrustedInstaller'], capture_output=True, timeout=10)
                 except Exception as e2:
                     _log(f"sc.exe启动异常:{e2}")
             elif start_err == 1056:
@@ -4357,7 +5057,7 @@ def elevate_via_nsudo():
             args = [nsudo_exe, f"-U:{user_mode}", "-P:E", "-ShowWindowMode:Show", target]
             log_event("NSudo", "调用", f"尝试模式={user_mode}", " ".join(args))
             try:
-                proc = subprocess.run(
+                proc = _run(
                     args, cwd=RUNTIME_DIR, env=env,
                     capture_output=True, text=True, timeout=15
                 )
@@ -4423,7 +5123,7 @@ def elevate_via_nsudo_system_only():
         env = os.environ.copy()
         args = [nsudo_exe, "-U:S", "-P:E", "-ShowWindowMode:Show", target]
         log_event("NSudo", "调用", "尝试模式=S(SYSTEM)", " ".join(args))
-        proc = subprocess.run(args, cwd=RUNTIME_DIR, env=env, capture_output=True, text=True, timeout=15)
+        proc = _run(args, cwd=RUNTIME_DIR, env=env, capture_output=True, text=True, timeout=15)
         if proc.returncode == 0:
             time.sleep(1)
             found = any('OPSTcontroller.exe' in line for line in os.popen('tasklist /FI "IMAGENAME eq OPSTcontroller.exe" /NH').read().splitlines())
@@ -4498,14 +5198,14 @@ def main():
             import subprocess
             for _ in range(10):
                 time.sleep(0.5)
-                r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe'],
+                r = _run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe'],
                                    capture_output=True, text=True)
                 if 'OPSTcontroller.exe' not in r.stdout:
                     print("OPSTcontroller 已成功退出。")
                     sys.exit(0)
             # 进程仍在运行，尝试 taskkill
             print("信号方式未生效，尝试强制终止...")
-            subprocess.run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
+            _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
                           capture_output=True)
             time.sleep(1)
             print("已发送强制终止命令。")
@@ -4513,11 +5213,11 @@ def main():
             print("未找到运行中的 OPSTcontroller 实例（命名事件不存在）。")
             # 尝试 taskkill 兜底
             import subprocess
-            r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe'],
+            r = _run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe'],
                                capture_output=True, text=True)
             if 'OPSTcontroller.exe' in r.stdout:
                 print("检测到进程，尝试强制终止...")
-                subprocess.run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
+                _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
                               capture_output=True)
                 print("已发送强制终止命令。")
         sys.exit(0)
@@ -4530,13 +5230,17 @@ def main():
             return  # 已激活已有实例，退出
         # 找不到已有窗口（可能残留互斥体），继续正常启动
 
-    # 读取默认权限配置
+    # 读取默认权限配置（空值或无效值强制用TrustedInstaller）
     default_perm = "t"
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 _cfg = json.load(f)
-                default_perm = _cfg.get("default_permission", "t")
+                _loaded_perm = _cfg.get("default_permission", "t")
+                if _loaded_perm in ("t", "system", "administrator", "user"):
+                    default_perm = _loaded_perm
+                else:
+                    default_perm = "t"  # 空值或无效值 → TI
     except Exception:
         pass
 
