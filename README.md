@@ -3,7 +3,7 @@
 **阻止第三方软件私自篡改文件扩展名默认打开方式**
 **Prevent third-party software from hijacking file extension default associations**
 
-> **开发说明**：本项目由 AI 辅助完成。源码逻辑与实现由作者完成，AI 提供知识与代码片段，并参与代码整理、修错与注释（本说明为如实披露，非免责）。
+> **开发说明**：本项目由 AI 辅助完成。源码逻辑与实现由作者完成，AI 提供知识与代码片段，并参与代码整理、修错与注释。
 
 ---
 
@@ -22,7 +22,6 @@
 - **右下角通知**：非模态滑入通知，含"单次同意"和"打开主程序"按钮，超时默认阻止
 - **基准管理**：支持"以目前方式为基准"/"以默认方式为基准"（可导入 .json），默认保留 5 个历史版本
 - **TI/SYSTEM 权限**：内置 NSudo 提权，可选 user / administrator / system / TI 四档
-- **开机自启 + 后台常驻 + 看门狗自恢复**
 - **完整日志与审计**：所有操作写入 `userdata/protector.log`，可导出审计记录（进程名/路径/命令行/数字签名/注册表变更）
 
 - One-click protection for all file extensions
