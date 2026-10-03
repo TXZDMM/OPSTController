@@ -1,0 +1,27 @@
+# ============ OPSTcontroller 根目录 .gitignore ============
+
+# 第三方 NSudo 完整源码仓库副本：不随本仓库分发（二进制与许可见 Win32/）
+M2Team-NSudo-1010516/
+
+# 本地测试用篡改模拟器（无许可/无签名二进制，不推送；说明见 test/README.md）
+test/LHA_Tamper.exe
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 构建产物（源码目录下另有 .gitignore，此处双保险）
+OPSTController_root/.venv/
+OPSTController_root/venv/
+OPSTController_root/build/
+OPSTController_root/dist/
+OPSTController_root/*.spec
+
+# 运行时用户数据（首次运行自动生成，不推送）
+OPSTController_root/userdata/
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
