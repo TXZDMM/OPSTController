@@ -5,7 +5,7 @@ set "ROOT=%~dp0"
 set "OUTDIR=%USERPROFILE%\Desktop\OPSTcontroller_Release"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 echo Building OPSTcontroller...
-.\.venv\Scripts\python.exe -m PyInstaller --onefile --windowed --noconfirm --clean --name "OPSTcontroller" --distpath "%OUTDIR%" --version-file version_info.txt extension_protector.py
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --distpath "%OUTDIR%" OPSTcontroller.spec
 if errorlevel 1 goto :fail
 echo.
 echo Assembling release package...

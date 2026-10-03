@@ -15,7 +15,6 @@ OPSTController_root/.venv/
 OPSTController_root/venv/
 OPSTController_root/build/
 OPSTController_root/dist/
-OPSTController_root/*.spec
 
 # 运行时用户数据（首次运行自动生成，不推送）
 OPSTController_root/userdata/

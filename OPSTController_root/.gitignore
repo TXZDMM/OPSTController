@@ -7,6 +7,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!OPSTcontroller.spec
 *.exe
 *.log
 .idea/
