@@ -194,21 +194,25 @@ _LocalFree.argtypes = [ctypes.c_void_p]
 _TI_SID = "S-1-5-80-956008885-3418522649-1831038040-1699080151-2041879083"
 
 def _enable_privilege(priv_name):
-    """启用当前进程的指定特权"""
+    """启用当前进程的指定特权。
+    返回 True 仅当特权实际启用成功；AdjustTokenPrivileges 返回 TRUE 但
+    GetLastError 为 ERROR_NOT_ALL_ASSIGNED（令牌中特权被移除）时视为失败。"""
     try:
         hToken = HANDLE()
         if not _OpenProcessToken(kernel32.GetCurrentProcess(), _TOKEN_ADJUST_PRIVILEGES | _TOKEN_QUERY, ctypes.byref(hToken)):
             return False
         luid = _LUID()
         if not _LookupPrivilegeValueW(None, priv_name, ctypes.byref(luid)):
+            kernel32.CloseHandle(hToken)
             return False
         tp = _TOKEN_PRIVILEGES()
         tp.PrivilegeCount = 1
         tp.Privileges[0].Luid = luid
         tp.Privileges[0].Attributes = _SE_PRIVILEGE_ENABLED
         result = _AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), 0, None, None)
+        err = ctypes.get_last_error()
         kernel32.CloseHandle(hToken)
-        return result != 0
+        return result != 0 and err == 0
     except Exception:
         return False
 
@@ -258,28 +262,51 @@ def set_registry_acl_ctypes(root, sub_key, lock=True):
 def protect_self_process():
     """设置当前进程ACL，防止被任务管理器/普通进程终止。
     仅SYSTEM/TI可终止，拒绝Users/Administrators的终止和挂起权限。
-    需要TI/SYSTEM权限才能成功设置。
+
+    分级策略（自我保护失效修复，2026-10-04）：
+      - 完整模式：SeSecurityPrivilege 可用 → DACL+SACL（含 System 完整性标签）
+      - 降级模式：特权被移除/不可用（如 NSudo 受限令牌）→ 仅写 DACL，
+        不依赖任何特权，仍拒绝 Users/管理员 的终止/挂起（0x00000A01）。
     返回 (success, message)"""
     try:
-        _enable_privilege("SeSecurityPrivilege")
+        sec_enabled = _enable_privilege("SeSecurityPrivilege")
         _enable_privilege("SeDebugPrivilege")
         # 获取当前进程伪句柄
         hProcess = kernel32.GetCurrentProcess()
-        # SDDL: 允许SYSTEM和TI完全控制，拒绝Users/BA终止和挂起，System完整性标签
+        # 完整SDDL: 允许SYSTEM和TI完全控制，拒绝Users/BA终止和挂起，System完整性标签
         # PROCESS_TERMINATE=0x1, PROCESS_SUSPEND_RESUME=0x800, PROCESS_SET_INFORMATION=0x200
-        sddl = ("D:(A;;KA;;;SY)(A;;KA;;;" + _TI_SID + ")"
-                "(D;;0x00000A01;;;BU)(D;;0x00000A01;;;BA)"
-                "S:(ML;;NW;;;S-1-16-16384)")
+        full_sddl = ("D:(A;;KA;;;SY)(A;;KA;;;" + _TI_SID + ")"
+                     "(D;;0x00000A01;;;BU)(D;;0x00000A01;;;BA)"
+                     "S:(ML;;NW;;;S-1-16-16384)")
+        # 降级SDDL: 仅DACL，不写SACL（写SACL需要SeSecurityPrivilege）
+        dacl_sddl = ("D:(A;;KA;;;SY)(A;;KA;;;" + _TI_SID + ")"
+                     "(D;;0x00000A01;;;BU)(D;;0x00000A01;;;BA)")
+        sddl = full_sddl
+        sec_info = _DACL_SECURITY_INFORMATION | _SACL_SECURITY_INFORMATION
+        mode = "完整保护（DACL+SACL+完整性标签）"
+        if not sec_enabled:
+            sddl = dacl_sddl
+            sec_info = _DACL_SECURITY_INFORMATION
+            mode = "降级保护（仅DACL，特权不可用）"
         pSD = ctypes.c_void_p()
         sdLen = ctypes.c_ulong()
         if not _ConvertStringSDToSD(sddl, 1, ctypes.byref(pSD), ctypes.byref(sdLen)):
             return False, "SDDL转换失败"
         try:
-            sec_info = _DACL_SECURITY_INFORMATION | _SACL_SECURITY_INFORMATION
             if not _SetKernelObjectSecurity(hProcess, sec_info, pSD):
                 err = ctypes.get_last_error()
+                # 完整模式失败时自动再试纯DACL（防止SACL写入失败导致整体不生效）
+                if sec_info & _SACL_SECURITY_INFORMATION:
+                    _LocalFree(pSD)
+                    pSD = ctypes.c_void_p()
+                    if not _ConvertStringSDToSD(dacl_sddl, 1, ctypes.byref(pSD), ctypes.byref(sdLen)):
+                        return False, "SDDL转换失败"
+                    if not _SetKernelObjectSecurity(hProcess, _DACL_SECURITY_INFORMATION, pSD):
+                        err2 = ctypes.get_last_error()
+                        return False, f"SetSecurity失败(err={err2})"
+                    return True, "进程保护已启用（降级：DACL拒绝终止，SACL不可用）"
                 return False, f"SetSecurity失败(err={err})"
-            return True, "进程保护已启用（仅SYSTEM/TI可终止）"
+            return True, f"进程保护已启用（{mode}）"
         finally:
             _LocalFree(pSD)
     except Exception as e:
@@ -4121,6 +4148,7 @@ class MainWindow:
         self._batch_timer = None
         self._batch_popup_active = False
         self._popup_paused_until = 0  # 暂停弹窗直到的时间戳
+        self._global_lock_mode = False  # 全局锁定模式
         self._build_ui()
         # 关闭按钮改为后台常驻，不退出
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_background)
@@ -4129,90 +4157,849 @@ class MainWindow:
         self._check_exit_event()
 
     def _build_ui(self):
-        # 顶部状态栏
-        status_bar = tk.Frame(self.root, bg="#2c3e50", height=45)
-        status_bar.pack(fill="x")
+        """主窗口 UI：Win11 设置深色风格（顶部标题栏 + 左侧导航 + 右侧内容页）"""
+        # ===== 深色主题（Win11 设置深色近似）=====
+        self.C = {
+            "bg": "#202020",           # 窗口/页面背景
+            "nav": "#1B1B1B",          # 左侧导航背景
+            "nav_sel": "#323232",      # 导航选中项背景
+            "nav_hover": "#2A2A2A",    # 导航悬停背景
+            "card": "#2B2B2B",         # 卡片背景
+            "card_border": "#3A3A3A",  # 卡片边框
+            "btn": "#454545",          # 按钮背景
+            "btn_hover": "#4F4F4F",    # 按钮悬停
+            "text": "#FFFFFF",         # 主文字
+            "text2": "#B8B8B8",        # 次级文字
+            "text3": "#7A7A7A",        # 弱文字
+            "accent": "#4CC2FF",       # 强调色
+            "accent_hover": "#6ECEFF",
+            "success": "#6CCB5F",
+            "warn": "#FCE100",
+            "error": "#FF99A4",
+            "info": "#4CC2FF",
+            "line": "#2E2E2E",         # 分隔线
+        }
+        self._setup_ttk_style()
+        self.root.configure(bg=self.C["bg"])
+        self.root.geometry("960x640")
+        self.root.minsize(840, 560)
+
+        # ===== 顶部标题栏 =====
+        header = tk.Frame(self.root, bg=self.C["bg"], height=52)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Frame(header, bg=self.C["line"], height=1).pack(side="bottom", fill="x")
+        tk.Label(header, text=f"{APP_NAME}  v{APP_VERSION}",
+                 font=("微软雅黑", 13, "bold"), fg=self.C["text"],
+                 bg=self.C["bg"]).pack(side="left", padx=20)
+        self.priv_label = tk.Label(header, text=f"权限：{self.ti_status if self.ti_status else '未知'}",
+                                   font=("微软雅黑", 9),
+                                   fg=self.C["warn"], bg=self.C["bg"])
+        self.priv_label.pack(side="right", padx=20)
+
+        # ===== 主体：左侧导航 + 右侧内容 =====
+        main = tk.Frame(self.root, bg=self.C["bg"])
+        main.pack(fill="both", expand=True)
+
+        # --- 左侧导航 ---
+        nav = tk.Frame(main, bg=self.C["nav"], width=212)
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        tk.Frame(nav, bg=self.C["line"], width=1).pack(side="right", fill="y")
+
+        self._nav_buttons = {}
+        self._nav_sel = None
+        for key, text in [("home", "状态"), ("exts", "扩展名"),
+                          ("tools", "工具"), ("log", "日志"),
+                          ("settings", "设置")]:
+            item = self._make_nav_item(nav, key, text)
+            item.pack(fill="x", padx=8, pady=2)
+
+        nav_bottom = tk.Frame(nav, bg=self.C["nav"])
+        nav_bottom.pack(side="bottom", fill="x", pady=14)
+        tk.Label(nav_bottom, text="关闭窗口 = 后台常驻",
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["nav"],
+                 anchor="w", padx=16).pack(fill="x")
+        tk.Label(nav_bottom, text="完全退出：--stop",
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["nav"],
+                 anchor="w", padx=16).pack(fill="x")
+
+        # --- 右侧页面容器 ---
+        content = tk.Frame(main, bg=self.C["bg"])
+        content.pack(side="left", fill="both", expand=True)
+        self._pages = {}
+        self._build_page_home(content)
+        self._build_page_exts(content)
+        self._build_page_tools(content)
+        self._build_page_log(content)
+        self._build_page_settings(content)
+        # 页面切换：仅 pack 选中页（多个 expand 会纵向均分而非叠层，tkraise 无法独占内容区）
+        self._select_nav("home")
+
+        # ===== 底部状态栏 =====
+        statusbar = tk.Frame(self.root, bg=self.C["nav"], height=32)
+        statusbar.pack(fill="x")
+        statusbar.pack_propagate(False)
+        tk.Frame(statusbar, bg=self.C["line"], height=1).pack(side="top", fill="x")
+        self.bottom_label = tk.Label(statusbar, text="基准模式: - | 基准时间: -",
+                                     font=("微软雅黑", 9), fg=self.C["text3"],
+                                     bg=self.C["nav"], anchor="w")
+        self.bottom_label.pack(side="left", padx=16)
+        self.ext_count_label = tk.Label(statusbar, text="保护扩展名：0",
+                                        font=("微软雅黑", 9), fg=self.C["text2"],
+                                        bg=self.C["nav"])
+        self.ext_count_label.pack(side="right", padx=16)
+
+    # ---------- UI 基础组件 ----------
+    def _setup_ttk_style(self):
+        """配置 ttk 深色风格（滚动条等）"""
+        try:
+            style = ttk.Style(self.root)
+            style.theme_use("clam")
+            style.configure("Vertical.TScrollbar", background=self.C["btn"],
+                            troughcolor=self.C["bg"], bordercolor=self.C["bg"],
+                            arrowcolor=self.C["text2"], lightcolor=self.C["btn"],
+                            darkcolor=self.C["btn"])
+        except Exception:
+            pass
+
+    def _make_nav_item(self, parent, key, text):
+        """创建左侧导航项（悬停/选中态 + 左侧强调条）"""
+        frame = tk.Frame(parent, bg=self.C["nav"], height=40, cursor="hand2")
+        frame.pack_propagate(False)
+        accent = tk.Frame(frame, bg=self.C["nav"], width=3)
+        accent.pack(side="left", fill="y")
+        label = tk.Label(frame, text=text, font=("微软雅黑", 10),
+                         fg=self.C["text2"], bg=self.C["nav"], anchor="w")
+        label.pack(side="left", fill="x", expand=True, padx=(12, 8))
+
+        def _on_enter(_e):
+            if self._nav_sel != key:
+                for w in (frame, label):
+                    w.configure(bg=self.C["nav_hover"])
+        def _on_leave(_e):
+            if self._nav_sel != key:
+                for w in (frame, label):
+                    w.configure(bg=self.C["nav"])
+        def _on_click(_e):
+            self._select_nav(key)
+        frame.bind("<Button-1>", _on_click)
+        label.bind("<Button-1>", _on_click)
+        frame.bind("<Enter>", _on_enter)
+        frame.bind("<Leave>", _on_leave)
+        label.bind("<Enter>", _on_enter)
+        label.bind("<Leave>", _on_leave)
+        self._nav_buttons[key] = (frame, accent, label)
+        return frame
+
+    def _select_nav(self, key):
+        """切换导航页"""
+        if key not in self._pages:
+            return
+        self._nav_sel = key
+        for k, (frame, accent, label) in self._nav_buttons.items():
+            sel = (k == key)
+            frame.configure(bg=self.C["nav_sel"] if sel else self.C["nav"])
+            accent.configure(bg=self.C["accent"] if sel else self.C["nav"])
+            label.configure(bg=self.C["nav_sel"] if sel else self.C["nav"],
+                            fg=self.C["text"] if sel else self.C["text2"],
+                            font=("微软雅黑", 10, "bold") if sel else ("微软雅黑", 10))
+        for name, page in self._pages.items():
+            if name == key:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+        if key == "exts":
+            self._refresh_ext_page()
+
+    def _set_selfprotect_label(self, ok, msg):
+        """更新状态页的进程自我保护显示"""
+        try:
+            color = self.C["success"] if ok else self.C["error"]
+            prefix = "进程自我保护：已启用" if ok else "进程自我保护：未生效"
+            self._selfprotect_label.config(text=f"{prefix}\n{msg}", fg=color)
+        except Exception:
+            pass
+
+    def _mk_card(self, parent, title=None, desc=None):
+        """创建深色卡片，返回 (card_frame, body_frame)"""
+        card = tk.Frame(parent, bg=self.C["card"],
+                        highlightbackground=self.C["card_border"],
+                        highlightthickness=1, bd=0)
+        if title:
+            tk.Label(card, text=title, font=("微软雅黑", 11, "bold"),
+                     fg=self.C["text"], bg=self.C["card"], anchor="w"
+                     ).pack(fill="x", padx=16, pady=(12, 2))
+        if desc:
+            tk.Label(card, text=desc, font=("微软雅黑", 9), fg=self.C["text3"],
+                     bg=self.C["card"], anchor="w", justify="left"
+                     ).pack(fill="x", padx=16, pady=(0, 4))
+        body = tk.Frame(card, bg=self.C["card"])
+        body.pack(fill="x", padx=16, pady=(2, 14))
+        card.pack(fill="x", pady=(0, 12))  # 卡片必须 pack 进父容器，否则内容不可见
+        return card, body
+
+    def _mk_button(self, parent, text, command, kind="default", width=None, height=1):
+        """创建 Win11 风格按钮（悬停变色）"""
+        if kind == "primary":
+            bg, hover, fg = self.C["accent"], self.C["accent_hover"], "#0B2B44"
+        elif kind == "danger":
+            bg, hover, fg = "#C42B1C", "#D84A3B", "#FFFFFF"
+        elif kind == "success":
+            bg, hover, fg = "#3C8A3F", "#4CA34F", "#FFFFFF"
+        else:
+            bg, hover, fg = self.C["btn"], self.C["btn_hover"], self.C["text"]
+        btn = tk.Button(parent, text=text, command=command, font=("微软雅黑", 9),
+                        bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+                        relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                        width=width, height=height, padx=14, pady=5)
+        btn.bind("<Enter>", lambda _e: btn.configure(bg=hover))
+        btn.bind("<Leave>", lambda _e: btn.configure(bg=bg))
+        return btn
+
+    def _mk_page_header(self, page, title, subtitle=None):
+        """创建页面标题区"""
+        tk.Label(page, text=title, font=("微软雅黑", 20, "bold"),
+                 fg=self.C["text"], bg=self.C["bg"], anchor="w"
+                 ).pack(fill="x", padx=24, pady=(20, 2))
+        if subtitle:
+            tk.Label(page, text=subtitle, font=("微软雅黑", 9), fg=self.C["text3"],
+                     bg=self.C["bg"], anchor="w").pack(fill="x", padx=24)
+
+    def _mk_scroll_container(self, page):
+        """创建可滚动内容容器，返回 content_frame（页面内滚动区）"""
+        canvas = tk.Canvas(page, bg=self.C["bg"], highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True, padx=(24, 8), pady=8)
+        content = tk.Frame(canvas, bg=self.C["bg"])
+        cw = canvas.create_window((0, 0), window=content, anchor="nw")
+        def _sync_scroll(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        content.bind("<Configure>", _sync_scroll)
+        def _sync_width(_e):
+            canvas.itemconfig(cw, width=_e.width)
+        canvas.bind("<Configure>", _sync_width)
+        def _on_mousewheel(_e):
+            canvas.yview_scroll(int(-_e.delta / 120), "units")
+        page.bind("<MouseWheel>", _on_mousewheel)
+        return content
+
+    # ---------- 页面：状态 ----------
+    def _build_page_home(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["home"] = page
+        self._mk_page_header(page, "状态", "扩展名保护卫士 · 实时监控文件关联注册表")
+        body = tk.Frame(page, bg=self.C["bg"])
+        body.pack(fill="both", expand=True, padx=24, pady=16)
+
+        # 卡片1：保护状态（状态行 + 启动/停止）
+        card, cb = self._mk_card(body, "保护状态", "实时监控 7 项注册表位置，阻止第三方软件篡改默认打开方式")
+        self.status_label = tk.Label(cb, text="● 状态：未初始化",
+                                     font=("微软雅黑", 14, "bold"),
+                                     fg=self.C["text2"], bg=self.C["card"], anchor="w")
+        self.status_label.pack(fill="x", pady=(4, 10))
+        btn_row = tk.Frame(cb, bg=self.C["card"])
+        btn_row.pack(fill="x")
+        self.btn_start = self._mk_button(btn_row, "启动保护", self._start_protection,
+                                         kind="success", width=12)
+        self.btn_start.pack(side="left", padx=(0, 8))
+        self.btn_stop = self._mk_button(btn_row, "停止保护", self._stop_protection,
+                                        kind="danger", width=12, )
+        self.btn_stop.configure(state="disabled")
+        self.btn_stop.pack(side="left")
+
+        # 卡片2：主界面输出窗口（原版风格，实时输出保护事件与状态）
+        out_card = tk.Frame(body, bg=self.C["card"],
+                            highlightbackground=self.C["card_border"],
+                            highlightthickness=1, bd=0)
+        out_card.pack(fill="both", expand=True, pady=(0, 12))
+        tk.Label(out_card, text="保护输出", font=("微软雅黑", 11, "bold"),
+                 fg=self.C["text"], bg=self.C["card"], anchor="w"
+                 ).pack(fill="x", padx=16, pady=(12, 4))
+        self.status_output = scrolledtext.ScrolledText(out_card, font=("Consolas", 9),
+                                                       wrap="word", state="disabled",
+                                                       bg="#1A1A1A", fg="#D4D4D4",
+                                                       insertbackground="#D4D4D4",
+                                                       relief="flat", bd=0, height=10,
+                                                       highlightbackground=self.C["card_border"],
+                                                       highlightthickness=1)
+        self.status_output.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        for tag, color in (("info", "#D4D4D4"), ("warn", "#FCE100"),
+                           ("error", "#FF99A4"), ("success", "#6CCB5F")):
+            self.status_output.tag_config(tag, foreground=color)
+
+        # 底部信息栏：权限与自我保护摘要 + 常用操作（一行，避免挤出可视区）
+        bar = tk.Frame(body, bg=self.C["card"],
+                       highlightbackground=self.C["card_border"],
+                       highlightthickness=1, bd=0)
+        bar.pack(fill="x")
+        info_col = tk.Frame(bar, bg=self.C["card"])
+        info_col.pack(side="left", fill="x", expand=True, padx=16, pady=10)
+        self._selfprotect_label = tk.Label(info_col, text="进程自我保护：—",
+                                           font=("微软雅黑", 10),
+                                           fg=self.C["text2"], bg=self.C["card"], anchor="w")
+        self._selfprotect_label.pack(fill="x", pady=1)
+        self._perm_detail_label = tk.Label(info_col, text="权限：—",
+                                           font=("微软雅黑", 9),
+                                           fg=self.C["text3"], bg=self.C["card"], anchor="w")
+        self._perm_detail_label.pack(fill="x", pady=1)
+        op_col = tk.Frame(bar, bg=self.C["card"])
+        op_col.pack(side="right", padx=16, pady=10)
+        for text, cmd, kind in [
+            ("备份当前基准", self._backup_current, "default"),
+            ("深层扫描", self._manual_deep_scan, "default"),
+            ("全局锁定 / 解除锁定", self._toggle_global_lock, "default"),
+            ("历史版本管理", self._show_history, "default"),
+        ]:
+            self._mk_button(op_col, text, cmd, kind=kind, width=15).pack(side="left", padx=(0, 6))
+
+    # ---------- 页面：扩展名 ----------
+    def _build_page_exts(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["exts"] = page
+        self._mk_page_header(page, "扩展名", "保护范围与基准信息")
+        body = tk.Frame(page, bg=self.C["bg"])
+        body.pack(fill="both", expand=True, padx=24, pady=16)
+
+        card, cb = self._mk_card(body, "统计信息")
+        self._ext_info_var = tk.StringVar(value="保护扩展名：—\n基准模式：—\n基准时间：—")
+        tk.Label(cb, textvariable=self._ext_info_var, font=("微软雅黑", 10),
+                 fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left"
+                 ).pack(fill="x", pady=2)
+
+        card2, cb2 = self._mk_card(body, "基准操作")
+        for text, cmd in [
+            ("备份当前基准", self._backup_current),
+            ("深层扫描", self._manual_deep_scan),
+            ("历史版本管理", self._show_history),
+            ("从文件加载基准", lambda: self._load_baseline_from_file(self.root)),
+            ("查看基准说明", self._open_baseline_download),
+        ]:
+            self._mk_button(cb2, text, cmd, width=20).pack(side="left", padx=(0, 8), pady=2)
+
+        card3, cb3 = self._mk_card(body, "保护级说明")
+        protect_info = (
+            "BH0：仅检测，不阻止（宽限期内）\n"
+            "BH1：自动恢复基准值，验证后生效\n"
+            "BH2：ACL锁定UserChoice键（仅SYSTEM/TI可写）\n"
+            "BH3：ACL锁定 + System完整性标签（Medium进程无法写入）\n"
+            "BH4：强锁定 + 进程降为Untrusted完整性\n"
+            "BH5：强锁定 + Untrusted降权 + NtSuspendProcess全冻结\n"
+            "红名单：进程永久拒绝扩展名相关注册表操作"
+        )
+        tk.Label(cb3, text=protect_info, font=("微软雅黑", 9), fg=self.C["text2"],
+                 bg=self.C["card"], anchor="w", justify="left").pack(fill="x")
+
+    def _refresh_ext_page(self):
+        """切换到扩展名页时刷新统计"""
+        try:
+            count = len(self.baseline_mgr.get_protected_extensions())
+            mode = self.baseline_mgr.config.get("baseline_mode", "-")
+            mode_text = "目前方式" if mode == "current" else "默认方式" if mode == "default" else "-"
+            btime = self.baseline_mgr.config.get("baseline_time", "-")
+            self._ext_info_var.set(f"保护扩展名：{count}\n基准模式：{mode_text}\n基准时间：{btime}")
+        except Exception:
+            pass
+
+    # ---------- 页面：工具（异常修复） ----------
+    def _build_page_tools(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["tools"] = page
+        self._mk_page_header(page, "工具", "异常修复面板 · 19 项独立修复 + 辅助工具")
+        content = self._mk_scroll_container(page)
+
+        self._repair_status_var = tk.StringVar(value="就绪 · 点击任意按钮执行对应修复")
+        status_bar = tk.Frame(content, bg=self.C["card"], height=34)
+        status_bar.pack(fill="x", pady=(4, 8))
         status_bar.pack_propagate(False)
+        tk.Label(status_bar, textvariable=self._repair_status_var, font=("微软雅黑", 9),
+                 fg=self.C["text2"], bg=self.C["card"], anchor="w").pack(fill="x", padx=12)
 
-        self.status_label = tk.Label(status_bar, text="● 状态：未初始化",
-                                     font=("微软雅黑", 11, "bold"), fg="white", bg="#2c3e50")
-        self.status_label.pack(side="left", padx=15)
+        def make_button(parent_w, text, command, color, height=1):
+            return tk.Button(parent_w, text=text, command=command,
+                             font=("微软雅黑", 9, "bold"),
+                             bg=color, fg="white",
+                             activebackground=self._lighten(color), activeforeground="white",
+                             relief="flat", cursor="hand2", bd=0,
+                             highlightthickness=0, height=height,
+                             padx=8, pady=6)
 
-        self.ext_count_label = tk.Label(status_bar, text="保护扩展名：0",
-                                        font=("微软雅黑", 10), fg="#bdc3c7", bg="#2c3e50")
-        self.ext_count_label.pack(side="left", padx=10)
+        def add_section(title):
+            sec = tk.LabelFrame(content, text="", bg=self.C["card"], bd=0,
+                                highlightbackground=self.C["card_border"], highlightthickness=1)
+            sec.pack(fill="x", pady=(6, 2))
+            head = tk.Frame(sec, bg=self.C["card"])
+            head.pack(fill="x", padx=12, pady=(8, 2))
+            tk.Label(head, text=title, font=("微软雅黑", 10, "bold"),
+                     fg=self.C["text"], bg=self.C["card"]).pack(side="left")
+            grid = tk.Frame(sec, bg=self.C["card"])
+            grid.pack(fill="x", padx=12, pady=(2, 10))
+            return grid
 
-        self.priv_label = tk.Label(status_bar, text="权限：未知",
-                                    font=("微软雅黑", 9), fg="#f39c12", bg="#2c3e50")
-        self.priv_label.pack(side="right", padx=15)
+        def place_buttons(grid, buttons):
+            grid.columnconfigure(0, weight=1, uniform="btn")
+            grid.columnconfigure(1, weight=1, uniform="btn")
+            for i, (text, command, bg) in enumerate(buttons):
+                r, c = divmod(i, 2)
+                make_button(grid, text, command, bg).grid(row=r, column=c, sticky="ew", padx=3, pady=3)
 
-        # 工具栏
-        toolbar = tk.Frame(self.root, height=45, bg="#ecf0f1")
-        toolbar.pack(fill="x")
-        toolbar.pack_propagate(False)
+        place_buttons(add_section("一、解除注册表锁定（最核心）"), [
+            ("① 解除所有注册表锁定", lambda: self._repair_unlock_registry(), "#C0392B"),
+            ("② 清除锁定计数", self._repair_clear_lock_count, "#E67E22"),
+        ])
+        place_buttons(add_section("二、重置持续篡改追踪状态"), [
+            ("③ 清除单扩展名篡改历史", self._repair_clear_ext_history, "#2980B9"),
+            ("④ 清除批量篡改历史", self._repair_clear_progid_history, "#2980B9"),
+            ("⑤ 清除持续篡改标记", self._repair_clear_persistent_exts, "#2980B9"),
+            ("⑥ 清除批量篡改标记", self._repair_clear_batch_progids, "#2980B9"),
+            ("⑦ 退出持续篡改模式", self._repair_exit_persistent_mode, "#2980B9"),
+            ("⑧ 清除高频观察期", self._repair_clear_unlocked_exts, "#2980B9"),
+        ])
+        place_buttons(add_section("三、重置防护引擎状态"), [
+            ("⑨ 清除冷却期", self._repair_clear_cooldown, "#16A085"),
+            ("⑩ 清除本周期同意记录", self._repair_clear_allowed_cycle, "#16A085"),
+            ("⑪ 清除 UserChoice 失败计数", self._repair_clear_uc_fail, "#16A085"),
+            ("⑫ 清除处理中集合", self._repair_clear_handling_exts, "#16A085"),
+        ])
+        place_buttons(add_section("四、清除弹窗 / 通知状态"), [
+            ("⑬ 关闭所有活动弹窗", self._repair_close_toasts, "#8E44AD"),
+            ("⑭ 清空弹窗队列", self._repair_clear_popup_queue, "#8E44AD"),
+            ("⑮ 清空批量弹窗队列", self._repair_clear_batch_queue, "#8E44AD"),
+            ("⑯ 取消批量计时器", self._repair_cancel_batch_timer, "#8E44AD"),
+            ("⑰ 解除弹窗暂停", self._repair_clear_popup_pause, "#8E44AD"),
+        ])
+        place_buttons(add_section("五、进程打击状态"), [
+            ("⑱ 清除进程黑名单", self._repair_clear_blacklist, "#96281B"),
+            ("⑲ 清除打击历史", self._repair_clear_strike_history, "#96281B"),
+        ])
+        place_buttons(add_section("六、其他 / 辅助工具"), [
+            ("历史版本管理", self._show_history, "#34495E"),
+            ("锁定模式 / 解除锁定", self._repair_global_lock, "#34495E"),
+            ("重置启动宽限期", self._repair_reset_grace, "#34495E"),
+        ])
 
-        self.btn_start = tk.Button(toolbar, text="启动保护", font=("微软雅黑", 9, "bold"),
-                                   width=10, command=self._start_protection,
-                                   bg="#27ae60", fg="white", activebackground="#2ecc71",
-                                   activeforeground="white", relief="flat", cursor="hand2",
-                                   padx=8, pady=4)
-        self.btn_start.pack(side="left", padx=5, pady=5)
+        bottom = tk.Frame(content, bg=self.C["bg"])
+        bottom.pack(fill="x", pady=(8, 4))
+        make_button(bottom, "一键全部修复（20 项全部执行）", lambda: self._repair_all(), "#27AE60", height=2).pack(fill="x", pady=2)
 
-        self.btn_stop = tk.Button(toolbar, text="停止保护", font=("微软雅黑", 9, "bold"),
-                                  width=10,
-                                  command=self._stop_protection, state="disabled",
-                                  bg="#bdc3c7", fg="white", activebackground="#95a5a6",
-                                  activeforeground="white", relief="flat", cursor="hand2",
-                                  padx=8, pady=4)
-        self.btn_stop.pack(side="left", padx=5, pady=5)
+    def _lighten(self, hex_color, amount=0.18):
+        try:
+            h = hex_color.lstrip('#')
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            r = min(255, int(r + (255 - r) * amount))
+            g = min(255, int(g + (255 - g) * amount))
+            b = min(255, int(b + (255 - b) * amount))
+            return f'#{r:02x}{g:02x}{b:02x}'
+        except Exception:
+            return hex_color
 
-        tk.Button(toolbar, text="备份当前", font=("微软雅黑", 9),
-                  width=10,
-                  command=self._backup_current,
-                  bg="#3498db", fg="white", activebackground="#5dade2",
-                  activeforeground="white", relief="flat", cursor="hand2",
-                  padx=8, pady=4).pack(side="left", padx=5, pady=5)
-
-        tk.Button(toolbar, text="深层扫描", font=("微软雅黑", 9),
-                  width=10,
-                  command=self._manual_deep_scan,
-                  bg="#9b59b6", fg="white", activebackground="#af7ac5",
-                  activeforeground="white", relief="flat", cursor="hand2",
-                  padx=8, pady=4).pack(side="left", padx=5, pady=5)
-
-        tk.Button(toolbar, text="历史版本", font=("微软雅黑", 9),
-                  width=10,
-                  command=self._show_history,
-                  bg="#1abc9c", fg="white", activebackground="#48c9b0",
-                  activeforeground="white", relief="flat", cursor="hand2",
-                  padx=8, pady=4).pack(side="left", padx=5, pady=5)
-
-        tk.Button(toolbar, text="设置", font=("微软雅黑", 9),
-                  width=10,
-                  command=self._show_settings,
-                  bg="#7f8c8d", fg="white", activebackground="#95a5a6",
-                  activeforeground="white", relief="flat", cursor="hand2",
-                  padx=8, pady=4).pack(side="right", padx=5, pady=5)
-
-        # 日志区
-        log_frame = tk.LabelFrame(self.root, text=" 运行日志 ", font=("微软雅黑", 10))
-        log_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, font=("Consolas", 9),
+    # ---------- 页面：日志 ----------
+    def _build_page_log(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["log"] = page
+        self._mk_page_header(page, "日志", "运行日志 · 实时保护事件记录")
+        log_wrap = tk.Frame(page, bg=self.C["bg"])
+        log_wrap.pack(fill="both", expand=True, padx=24, pady=16)
+        self.log_text = scrolledtext.ScrolledText(log_wrap, font=("Consolas", 9),
                                                   wrap="word", state="disabled",
-                                                  bg="#1e1e1e", fg="#d4d4d4")
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
-        self.log_text.tag_config("info", foreground="#d4d4d4")
-        self.log_text.tag_config("warn", foreground="#f39c12")
-        self.log_text.tag_config("error", foreground="#e74c3c")
-        self.log_text.tag_config("success", foreground="#2ecc71")
+                                                  bg="#1A1A1A", fg="#D4D4D4",
+                                                  insertbackground="#D4D4D4",
+                                                  relief="flat", bd=0,
+                                                  highlightbackground=self.C["card_border"],
+                                                  highlightthickness=1)
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.tag_config("info", foreground="#D4D4D4")
+        self.log_text.tag_config("warn", foreground="#FCE100")
+        self.log_text.tag_config("error", foreground="#FF99A4")
+        self.log_text.tag_config("success", foreground="#6CCB5F")
 
-        # 底部
-        bottom = tk.Frame(self.root)
-        bottom.pack(fill="x", padx=10, pady=(0, 5))
-        self.bottom_label = tk.Label(bottom, text=f"基准模式: - | 基准时间: -",
-                                     font=("微软雅黑", 8), fg="#999", anchor="w")
-        self.bottom_label.pack(side="left")
+    # ---------- 页面：设置 ----------
+    def _build_page_settings(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["settings"] = page
+        self._mk_page_header(page, "设置", "配置保护行为与运行选项")
+        content = self._mk_scroll_container(page)
+
+        cfg = self.baseline_mgr.config
+        dark = self.C
+
+        # ===== 节1：提醒 =====
+        sec, body = self._mk_card(content, "提醒")
+        autostart_var = tk.BooleanVar(value=cfg.get("autostart", True))
+        popup_var = tk.BooleanVar(value=cfg.get("show_popup", True))
+        clearlog_var = tk.BooleanVar(value=cfg.get("clear_log_on_start", False))
+        nokill_var = tk.BooleanVar(value=cfg.get("persistent_no_kill", False))
+        batch_popup_var = tk.StringVar(value=cfg.get("batch_popup_mode", "single"))
+        mode_var = tk.StringVar(value=cfg.get("operation_mode", "normal"))
+        _loaded_timeout = cfg.get("block_timeout", NOTIFY_TIMEOUT)
+        if _loaded_timeout < 1: _loaded_timeout = 1
+        elif _loaded_timeout > 180: _loaded_timeout = 180
+        block_var = tk.IntVar(value=_loaded_timeout)
+
+        def _row(parent_w, text, widget):
+            row = tk.Frame(parent_w, bg=dark["card"])
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=text, font=("微软雅黑", 9), fg=dark["text2"],
+                     bg=dark["card"], anchor="w").pack(side="left")
+            widget.pack(side="right")
+            return row
+
+        def _check(parent_w, text, var):
+            chk = tk.Checkbutton(parent_w, text=text, variable=var,
+                                 font=("微软雅黑", 9), bg=dark["card"], fg=dark["text2"],
+                                 selectcolor=dark["card"], activebackground=dark["card"],
+                                 activeforeground=dark["text"], highlightthickness=0, bd=0)
+            chk.pack(fill="x", pady=3, anchor="w")
+            return chk
+
+        _check(body, "开机自启", autostart_var)
+        _check(body, "检测到更改时弹窗通知（取消则静默阻止）", popup_var)
+        _row(body, "弹窗等待时间（秒）:", tk.Spinbox(body, from_=1, to=180,
+             textvariable=block_var, width=6, bg=dark["btn"], fg=dark["text"],
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
+        tk.Label(body, text="范围 1-180 秒；关闭弹窗时此值强制为 1 秒",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
+        _row(body, "批量弹窗模式:", self._mk_radio_row(body, batch_popup_var,
+             [("single", "单个(队列)"), ("simultaneous", "同时(堆叠)")]))
+        tk.Label(body, text="单个：一次弹一个，超时自动阻止后下一个缩短为2秒；同时：所有弹窗同时弹出",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
+        _row(body, "运行模式:", self._mk_radio_row(body, mode_var,
+             [("normal", "正常"), ("quiet", "临时免打扰"), ("game", "游戏模式"),
+              ("demo", "演示模式"), ("silent", "静默模式"), ("paused", "临时暂停")]))
+        tk.Label(body, text="正常：默认弹窗；免打扰/游戏/演示/静默：关闭或压制提醒；暂停：短时停用检测",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
+        _check(body, "每次启动清空日志", clearlog_var)
+        _check(body, "持续/批量篡改时不终止进程（仅锁定注册表）", nokill_var)
+
+        # ===== 节2：基准 =====
+        sec2, body2 = self._mk_card(content, "基准")
+        hist_var = tk.IntVar(value=cfg.get("history_versions", MAX_HISTORY_VERSIONS))
+        _row(body2, "基准保留版本数:", tk.Spinbox(body2, from_=1, to=20,
+             textvariable=hist_var, width=6, bg=dark["btn"], fg=dark["text"],
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
+        b_ops = tk.Frame(body2, bg=dark["card"])
+        b_ops.pack(fill="x", pady=6)
+        self._mk_button(b_ops, "查看基准说明", self._open_baseline_download).pack(side="left", padx=(0, 8))
+        self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root)).pack(side="left")
+
+        # ===== 节3：权限 =====
+        sec3, body3 = self._mk_card(content, "权限")
+        perm_var = tk.StringVar(value=cfg.get("default_permission", "t"))
+        audit_level_var = tk.StringVar(value=cfg.get("audit_level", "normal"))
+        _row(body3, "默认权限级别:", self._mk_radio_row(body3, perm_var,
+             [("user", "普通用户"), ("administrator", "管理员"), ("system", "SYSTEM"), ("t", "TI(推荐)")]))
+        tk.Label(body3, text="低于 TI 权限可能导致 UserChoice 恢复失败，保护不生效",
+                 font=("微软雅黑", 8), fg=dark["error"], bg=dark["card"], anchor="w").pack(fill="x")
+        _row(body3, "记录级别:", self._mk_radio_row(body3, audit_level_var,
+             [("minimal", "极简"), ("normal", "普通"), ("detailed", "详细"), ("full", "完整")]))
+        a_ops = tk.Frame(body3, bg=dark["card"])
+        a_ops.pack(fill="x", pady=6)
+        self._mk_button(a_ops, "导出审计日志", self._export_audit_log).pack(side="left")
+        tk.Label(body3, text="审计日志记录：进程名/路径/命令行/数字签名/父进程/时间/注册表路径/旧值/新值",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
+
+        # ===== 节4：白名单 =====
+        sec4, body4 = self._mk_card(content, "白名单")
+        tk.Label(body4, text="白名单扩展名（任意程序对该扩展名的操作自动允许）",
+                 font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x")
+        ext_list_frame = tk.Frame(body4, bg=dark["card"])
+        ext_list_frame.pack(fill="x", pady=4)
+        ext_listbox = tk.Listbox(ext_list_frame, font=("微软雅黑", 9), height=5,
+                                 bg=dark["btn"], fg=dark["text"],
+                                 selectbackground=dark["nav_sel"], relief="flat", highlightthickness=0)
+        ext_listbox.pack(side="left", fill="x", expand=True)
+        tk.Scrollbar(ext_list_frame, orient="vertical", command=ext_listbox.yview).pack(side="right", fill="y")
+        ext_listbox.config(yscrollcommand=lambda *a: None)
+        for e in cfg.get("whitelist_exts", []):
+            ext_listbox.insert(tk.END, e)
+        ext_entry = tk.Entry(body4, font=("微软雅黑", 9), bg=dark["btn"], fg=dark["text"],
+                             relief="flat", highlightthickness=0, insertbackground=dark["text"])
+        ext_entry.pack(fill="x", pady=4)
+        def add_whitelist_ext():
+            val = ext_entry.get().strip().lower()
+            if val and val not in [ext_listbox.get(i).lower() for i in range(ext_listbox.size())]:
+                ext_listbox.insert(tk.END, val)
+                ext_entry.delete(0, tk.END)
+        def del_whitelist_ext():
+            sel = ext_listbox.curselection()
+            if sel:
+                ext_listbox.delete(sel[0])
+        ext_ops = tk.Frame(body4, bg=dark["card"])
+        ext_ops.pack(fill="x")
+        self._mk_button(ext_ops, "添加", add_whitelist_ext, width=8).pack(side="left", padx=(0, 8))
+        self._mk_button(ext_ops, "删除选中", del_whitelist_ext, width=10).pack(side="left")
+
+        tk.Label(body4, text="白名单程序（程序对任意扩展名的操作自动同意）",
+                 font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x", pady=(12, 0))
+        prog_list_frame = tk.Frame(body4, bg=dark["card"])
+        prog_list_frame.pack(fill="x", pady=4)
+        prog_listbox = tk.Listbox(prog_list_frame, font=("微软雅黑", 9), height=5,
+                                  bg=dark["btn"], fg=dark["text"],
+                                  selectbackground=dark["nav_sel"], relief="flat", highlightthickness=0)
+        prog_listbox.pack(side="left", fill="x", expand=True)
+        tk.Scrollbar(prog_list_frame, orient="vertical", command=prog_listbox.yview).pack(side="right", fill="y")
+        prog_listbox.config(yscrollcommand=lambda *a: None)
+        for p in cfg.get("whitelist_programs", []):
+            prog_listbox.insert(tk.END, p)
+        prog_entry = tk.Entry(body4, font=("微软雅黑", 9), bg=dark["btn"], fg=dark["text"],
+                              relief="flat", highlightthickness=0, insertbackground=dark["text"])
+        prog_entry.pack(fill="x", pady=4)
+        def add_whitelist_prog():
+            val = prog_entry.get().strip()
+            if val and val not in [prog_listbox.get(i) for i in range(prog_listbox.size())]:
+                prog_listbox.insert(tk.END, val)
+                prog_entry.delete(0, tk.END)
+        def del_whitelist_prog():
+            sel = prog_listbox.curselection()
+            if sel:
+                prog_listbox.delete(sel[0])
+        prog_ops = tk.Frame(body4, bg=dark["card"])
+        prog_ops.pack(fill="x")
+        self._mk_button(prog_ops, "添加", add_whitelist_prog, width=8).pack(side="left", padx=(0, 8))
+        self._mk_button(prog_ops, "删除选中", del_whitelist_prog, width=10).pack(side="left")
+
+        # ===== 节5：更改记录 =====
+        sec5, body5 = self._mk_card(content, "更改记录")
+        list_frame = tk.Frame(body5, bg=dark["card"])
+        list_frame.pack(fill="x")
+        history_listbox = tk.Listbox(list_frame, font=("微软雅黑", 8), height=8,
+                                     bg=dark["btn"], fg=dark["text"],
+                                     selectbackground=dark["nav_sel"], relief="flat", highlightthickness=0)
+        history_listbox.pack(fill="x")
+        detail_text = tk.Text(body5, font=("微软雅黑", 8), height=6, wrap="word",
+                              bg=dark["btn"], fg=dark["text"], relief="flat", highlightthickness=0)
+        detail_text.pack(fill="x", pady=(6, 0))
+        detail_text.configure(state="normal")
+        h_ops = tk.Frame(body5, bg=dark["card"])
+        h_ops.pack(fill="x", pady=6)
+
+        def refresh_history():
+            history_listbox.delete(0, tk.END)
+            records = self.change_history.get_records(limit=100)
+            for rec in reversed(records):
+                action_text = {"user_consent": "用户同意", "auto_blocked": "自动阻止", "detected_only": "仅检测"}.get(rec["action"], rec["action"])
+                history_listbox.insert(tk.END, f"{rec['timestamp']}  {rec['ext']}  [{rec['tamperer']}]  {action_text}  {rec['result']}")
+
+        def show_history_detail(evt):
+            sel = history_listbox.curselection()
+            if not sel:
+                return
+            records = self.change_history.get_records(limit=100)
+            idx = len(records) - 1 - sel[0]
+            if idx < 0 or idx >= len(records):
+                return
+            rec = records[idx]
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, f"时间: {rec['timestamp']}\n")
+            detail_text.insert(tk.END, f"扩展名: {rec['ext']}\n")
+            detail_text.insert(tk.END, f"篡改者: {rec['tamperer']}\n")
+            detail_text.insert(tk.END, f"操作: {rec['action']}  结果: {rec['result']}\n")
+            detail_text.insert(tk.END, "更改详情:\n")
+            for ch in rec.get("changes", []):
+                detail_text.insert(tk.END, f"  {ch['item']}: {ch['old']} → {ch['new']}\n")
+
+        def check_current_status():
+            sel = history_listbox.curselection()
+            if not sel:
+                return
+            records = self.change_history.get_records(limit=100)
+            idx = len(records) - 1 - sel[0]
+            if idx < 0 or idx >= len(records):
+                return
+            ext = records[idx]["ext"]
+            bl = self.baseline_mgr.baseline.get(ext, {})
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, f"=== {ext} 当前7项状态 ===\n\n")
+            item_order = ["userchoice_progid", "userchoice_hash", "hkcr_ext", "hkcu_ext", "hklm_ext", "hkcr_command", "hkcu_command"]
+            mismatch_count = 0
+            for key in item_order:
+                bl_item = bl.get(key, {})
+                label = ProtectionEngine.ITEM_LABELS.get(key, key)
+                bl_val = bl_item.get("value")
+                cur_val = None
+                if bl_item:
+                    root_name = bl_item.get("root")
+                    if root_name is None:
+                        continue
+                    root = ROOT_MAP.get(str(root_name))
+                    path = bl_item.get("path", "")
+                    name = bl_item.get("name", "")
+                    if root and path:
+                        try:
+                            cur_val, _ = reg_read_value(root, path, name)
+                        except Exception:
+                            cur_val = None
+                if key in ("userchoice_progid", "userchoice_hash") and cur_val is None:
+                    uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
+                    val_name = "ProgId" if key == "userchoice_progid" else "Hash"
+                    try:
+                        cur_val, _ = reg_read_value(HKCU, uc_path, val_name)
+                    except Exception:
+                        pass
+                is_diff = (bl_val != cur_val) and not (bl_val is None and cur_val is None)
+                if is_diff:
+                    mismatch_count += 1
+                    status = "✗ 异常"
+                    color_tag = "diff"
+                else:
+                    status = "✓ 正常"
+                    color_tag = "same"
+                detail_text.insert(tk.END, f"[{status}] {label}\n", color_tag)
+                detail_text.insert(tk.END, f"    基准: {repr(bl_val)}\n")
+                detail_text.insert(tk.END, f"    当前: {repr(cur_val)}\n\n")
+            if mismatch_count == 0:
+                detail_text.insert(tk.END, "结论: 全部正常（与基准一致）\n", "same")
+            else:
+                detail_text.insert(tk.END, f"结论: 发现 {mismatch_count} 项异常\n", "diff")
+            detail_text.tag_config("same", foreground="#6CCB5F")
+            detail_text.tag_config("diff", foreground="#FF99A4")
+            try:
+                progid = get_prog_id(ext)
+                if progid:
+                    name, _ = identify_tamperer(progid)
+                    detail_text.insert(tk.END, f"\n当前默认打开方式: {progid}" + (f" ({name})" if name else ""))
+                else:
+                    detail_text.insert(tk.END, f"\n当前默认打开方式: 系统默认（无UserChoice）")
+            except Exception as e:
+                detail_text.insert(tk.END, f"\n获取打开方式失败: {e}")
+
+        def clear_history():
+            if messagebox.askyesno("确认", "确定清空所有更改记录？"):
+                self.change_history.clear()
+                refresh_history()
+                detail_text.delete("1.0", tk.END)
+
+        history_listbox.bind("<<ListboxSelect>>", show_history_detail)
+        # 隐藏命令：EXIT-TXZ(强制退出) / LOG(打开日志文件) / TEST WINDOWS-TOOMUCH(弹窗压力测试)
+        def _check_exit_code(evt):
+            content = detail_text.get("1.0", tk.END).strip().upper()
+            if "EXIT-TXZ" in content:
+                try:
+                    self.baseline_mgr.save()
+                except Exception:
+                    pass
+                try:
+                    if self.monitor:
+                        self.monitor.stop()
+                except Exception:
+                    pass
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                os._exit(0)
+                return "break"
+            elif content == "LOG" or content.startswith("LOG"):
+                try:
+                    import subprocess
+                    if os.path.exists(LOG_FILE):
+                        subprocess.Popen(['notepad.exe', LOG_FILE])
+                    else:
+                        messagebox.showinfo(APP_NAME, "日志文件不存在")
+                except Exception as e:
+                    messagebox.showerror(APP_NAME, f"打开日志失败: {e}")
+                return "break"
+            elif "TEST WINDOWS-TOOMUCH" in content or "TEST WINDOWS TOOMUCH" in content:
+                self._append_log("=== 弹窗压力测试开始 ===", "warn")
+                def make_mock(ext, progid):
+                    return [("userchoice_progid", "AppX43hnxtbyyps62jhe9sqpdzxn1790zetc", progid, None)]
+                mock_result = (3, 0, [])
+                items1 = [(e, make_mock(e, "BaiduNetdiskImageViewerAssociations"), mock_result)
+                          for e in [".png", ".jpg", ".jpeg", ".bmp", ".gif"]]
+                self._show_batch_popup("百度网盘", items1)
+                self._append_log("  [模拟] 批量弹窗1: 百度网盘篡改5个图片格式", "info")
+                items2 = [(e, make_mock(e, "WPS.Document"), mock_result)
+                          for e in [".doc", ".docx", ".xls", ".xlsx"]]
+                self.root.after(200, lambda: self._show_batch_popup("WPS Office", items2))
+                self._append_log("  [模拟] 批量弹窗2: WPS篡改4个办公格式", "info")
+                self.root.after(400, lambda: self._append_log("  [模拟] 持续篡改提示: .pdf 被持续篡改（已静默阻止）", "warn"))
+                self.root.after(600, lambda: self._show_single_notification(".pdf", make_mock(".pdf", "Acrobat.Document"), mock_result))
+                self.root.after(800, lambda: self._show_single_notification(".mp4", make_mock(".mp4", "PotPlayer"), mock_result))
+                self.root.after(1000, lambda: self._show_single_notification(".mp3", make_mock(".mp3", "QQMusic"), mock_result))
+                self._append_log("  [模拟] 正常弹窗队列: .pdf .mp4 .mp3", "info")
+                self._append_log("=== 弹窗压力测试已触发 ===", "success")
+                return "break"
+        detail_text.bind("<KeyRelease-Return>", _check_exit_code)
+        self._mk_button(h_ops, "刷新", refresh_history, width=8).pack(side="left", padx=(0, 8))
+        self._mk_button(h_ops, "检测当前状态", check_current_status, width=12).pack(side="left", padx=(0, 8))
+        self._mk_button(h_ops, "清空记录", clear_history, width=8).pack(side="left")
+        refresh_history()
+
+        # ===== 节6：关于 =====
+        sec6, body6 = self._mk_card(content, "关于")
+        tk.Label(body6, text=f"{APP_NAME} v{APP_VERSION}\n阻止第三方软件私自篡改文件扩展名默认打开方式\n保护7项注册表位置，支持基准校准与自动恢复",
+                 font=("微软雅黑", 9), fg=dark["text2"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
+        tk.Label(body6, text="GitHub: https://github.com/TXZDMM/OPSTController",
+                 font=("微软雅黑", 9), fg=dark["info"], bg=dark["card"], anchor="w").pack(fill="x", pady=(4, 0))
+
+        # ===== 底部保存 =====
+        save_row = tk.Frame(content, bg=dark["bg"])
+        save_row.pack(fill="x", pady=10)
+
+        def save_settings():
+            old_perm = cfg.get("default_permission", "t")
+            new_perm = perm_var.get()
+            cfg["history_versions"] = hist_var.get()
+            cfg["default_permission"] = new_perm
+            cfg["autostart"] = autostart_var.get()
+            cfg["show_popup"] = popup_var.get()
+            cfg["operation_mode"] = mode_var.get() if mode_var.get() in OPERATION_MODES else "normal"
+            cfg["audit_level"] = audit_level_var.get() if audit_level_var.get() in AUDIT_LEVELS else "normal"
+            self.change_history.set_audit_level(cfg["audit_level"])
+            _save_timeout = block_var.get()
+            if _save_timeout < 1: _save_timeout = 1
+            elif _save_timeout > 180: _save_timeout = 180
+            cfg["block_timeout"] = 1 if not popup_var.get() else _save_timeout
+            cfg["clear_log_on_start"] = clearlog_var.get()
+            cfg["persistent_no_kill"] = nokill_var.get()
+            cfg["batch_popup_mode"] = batch_popup_var.get()
+            cfg["whitelist_exts"] = [ext_listbox.get(i) for i in range(ext_listbox.size())]
+            cfg["whitelist_programs"] = [prog_listbox.get(i) for i in range(prog_listbox.size())]
+            self.baseline_mgr.save_config()
+            if autostart_var.get():
+                if not is_autostart_set(): add_to_autostart()
+            else:
+                remove_from_autostart()
+            self._append_log("设置已保存", "success")
+            messagebox.showinfo(APP_NAME, "设置已保存")
+            if new_perm != old_perm:
+                perm_labels = {"user": "普通用户", "administrator": "管理员", "system": "SYSTEM", "t": "TI"}
+                new_label = perm_labels.get(new_perm, new_perm)
+                if messagebox.askyesno(APP_NAME, f"运行权限已更改为【{new_label}】。\n\n是否立即重启程序使设置生效？"):
+                    self._restart_app()
+
+        def _restart_app():
+            try:
+                if self.monitor is not None:
+                    self.monitor.stop()
+                try:
+                    self.baseline_mgr.save()
+                except Exception:
+                    pass
+                import subprocess
+                exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+                subprocess.Popen(['cmd.exe', '/c', 'start', '', exe_path, '--restart'], shell=False)
+                os._exit(0)
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"重启失败: {e}\n请手动重启程序。")
+
+        self._mk_button(save_row, "保存设置", save_settings, kind="primary", width=14).pack(side="left")
+        self._mk_button(save_row, "放弃修改", lambda: self._select_nav("home"), width=14).pack(side="left", padx=8)
+        tk.Label(save_row, text="* 运行权限更改需重启生效", font=("微软雅黑", 8),
+                 fg=dark["text3"], bg=dark["bg"]).pack(side="right")
+
+    def _mk_radio_row(self, parent, var, options):
+        """创建横向单选按钮组，返回容器 frame"""
+        frame = tk.Frame(parent, bg=self.C["card"])
+        for val, label in options:
+            rb = tk.Radiobutton(frame, text=label, variable=var, value=val,
+                                font=("微软雅黑", 8), bg=self.C["card"], fg=self.C["text2"],
+                                selectcolor=self.C["card"], activebackground=self.C["card"],
+                                activeforeground=self.C["text"], highlightthickness=0, bd=0)
+            rb.pack(side="left", padx=4)
+        return frame
 
     def _init_app(self):
         # 右上角绝对真实权限状态：基于进程令牌SID + 完整性级别双重验证
@@ -4231,13 +5018,17 @@ class MainWindow:
         self.ti_status = status_text
         display_text = "权限：" + status_text + " [" + actual_integrity + "]"
         self.priv_label.config(text=display_text, fg=fg)
+        try:
+            self._perm_detail_label.config(text=f"{display_text}\nSID: {actual_sid}")
+        except Exception:
+            pass
         self._append_log("当前真实权限：" + status_text + "，完整性级别：" + actual_integrity + "，SID：" + actual_sid, level)
         if self.privilege_failure_detail:
             self._append_log("提权失败原因：" + self.privilege_failure_detail, "error")
             self._append_log("提示：当前进程未真实取得 TrustedInstaller/SYSTEM token，程序仅保留当前真实 token。", "warn")
 
         # 启动提示
-        self._append_log("按钮说明：启动保护=开启实时监控 | 停止保护=暂停监控 | 备份当前=以当前状态保存基准 | 深层扫描=全量校验 | 历史版本=恢复旧基准 | 设置=配置选项", "info")
+        self._append_log("按钮说明：启动保护=开启实时监控 | 停止保护=暂停监控 | 备份当前=以当前状态保存基准 | 深层扫描=全量校验 | 异常修复=工具面板(历史基准/解除锁定/重置状态) | 设置=配置选项", "info")
         self._append_log("更改记录可在 设置→更改记录 中查看，支持检测当前状态", "info")
         if is_autostart_set():
             self._append_log("已添加到开机自启", "success")
@@ -4262,14 +5053,20 @@ class MainWindow:
             self._refresh_status()
             self._append_log("程序已启动，基准已加载。", "info")
             self._append_log(f"保护扩展名数量: {len(self.baseline_mgr.get_protected_extensions())}", "info")
-        # 进程自我保护（仅TI/SYSTEM权限下生效）
+        # 进程自我保护（仅TI/SYSTEM权限下生效；失败时已自动降级仅写DACL）
         if self.ti_elevated:
             ok, msg = protect_self_process()
             if ok:
                 self._process_protected = True
                 self._append_log("进程自我保护已启用：普通任务管理器无法终止本进程", "success")
+                self._set_selfprotect_label(True, msg)
             else:
+                self._process_protected = False
                 self._append_log(f"进程自我保护启用失败: {msg}", "warn")
+                self._set_selfprotect_label(False, msg)
+        else:
+            self._append_log("当前未提权，进程自我保护不可用。", "warn")
+            self._set_selfprotect_label(False, "未提权，不可用")
         # 启动无响应监测看门狗
         self._start_watchdog()
         # 启动心跳（每2秒更新一次）
@@ -5003,435 +5800,317 @@ class MainWindow:
         tk.Button(btn_frame, text="关闭", font=("微软雅黑", 9),
                   command=win.destroy).pack(side="left", padx=5)
 
+    def _update_status(self, text, color="#2ecc71"):
+        """更新状态栏显示"""
+        try:
+            self.status_label.config(text=f"● 状态：{text}", fg=color)
+        except Exception:
+            pass
+
+    def _toggle_global_lock(self):
+        """切换全局锁定模式"""
+        if self._global_lock_mode:
+            # 已锁定 → 请求解锁（需要确认）
+            if not messagebox.askyesno(APP_NAME,
+                "【解锁确认】\n\n"
+                "当前处于全局锁定模式，所有扩展名注册表键均被ACL保护。\n"
+                "解锁后，任何程序都可以修改文件关联。\n\n"
+                "确定要解除全局锁定吗？"):
+                return
+            self._unlock_all_extensions()
+            self._global_lock_mode = False
+            self._append_log("全局锁定已解除", "success")
+            self._update_status("正常监控中")
+        else:
+            # 未锁定 → 进入锁定模式
+            if not messagebox.askyesno(APP_NAME,
+                "【锁定确认】\n\n"
+                "全局锁定将对所有已备份扩展名的注册表键设置ACL保护，\n"
+                "仅允许SYSTEM/TI写入，阻止普通程序和管理员修改文件关联。\n\n"
+                "锁定后如需安装新软件或修改默认打开方式，请先解锁。\n\n"
+                "确定要启用全局锁定吗？"):
+                return
+            locked_count = self._lock_all_extensions()
+            self._global_lock_mode = True
+            self._append_log(f"全局锁定已启用，共锁定 {locked_count} 个扩展名", "success")
+            self._update_status("全局锁定中")
+
+    def _lock_all_extensions(self):
+        """锁定所有基准中的扩展名注册表键，返回锁定数量"""
+        exts = list(self.baseline_mgr.baseline.keys())
+        locked = 0
+        for ext in exts:
+            try:
+                prog_id = None
+                snap = self.baseline_mgr.baseline.get(ext, {})
+                if isinstance(snap, dict):
+                    prog_id = snap.get("userchoice_progid") or snap.get("hkcr_ext")
+                lock_all_protected_keys(ext, prog_id)
+                locked += 1
+            except Exception as e:
+                logger.error(f"锁定 {ext} 失败: {e}")
+        return locked
+
+    def _unlock_all_extensions(self):
+        """解锁所有扩展名注册表键"""
+        exts = list(self.baseline_mgr.baseline.keys())
+        unlocked = 0
+        for ext in exts:
+            try:
+                prog_id = None
+                snap = self.baseline_mgr.baseline.get(ext, {})
+                if isinstance(snap, dict):
+                    prog_id = snap.get("userchoice_progid") or snap.get("hkcr_ext")
+                unlock_all_protected_keys(ext, prog_id)
+                unlocked += 1
+            except Exception as e:
+                logger.error(f"解锁 {ext} 失败: {e}")
+        self._append_log(f"已解除 {unlocked} 个扩展名的注册表锁定", "info")
+        return unlocked
+
+    def _show_emergency_panel(self):
+        """异常修复面板（兼容旧调用）：直接切换到主窗口「工具」页"""
+        self._select_nav("tools")
+
+    def _repair_set_status(self, msg):
+        """更新修复面板状态"""
+        try:
+            self._repair_status_var.set(msg)
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def _repair_apply(self, title, fn):
+        """执行单个修复动作，统一日志与状态反馈"""
+        try:
+            fn()
+            self._repair_set_status(f"{title} · 已完成")
+            self._append_log(f"[异常修复] {title} 已完成", "success")
+        except Exception as e:
+            logger.error(f"{title} 失败: {e}")
+            self._repair_set_status(f"{title} · 失败")
+            self._append_log(f"[异常修复] {title} 失败: {e}", "error")
+
+    def _repair_pt(self):
+        """返回持续篡改追踪器（可能为 None）"""
+        return self.monitor.persistent_tracker if self.monitor else None
+
+    # ============ 一、解除注册表锁定 ============
+    def _repair_unlock_registry(self, win=None, confirm=True):
+        """① 解除所有扩展名的注册表锁定（清除 Deny ACL 恢复可写）"""
+        if confirm and not messagebox.askyesno(APP_NAME, "确定要解除所有扩展名的注册表锁定吗？\n\n将清除所有被锁定扩展名在 UserChoice 等键上的 Deny ACL，恢复可写状态。"):
+            return
+        count = 0
+        for ext in list(self.baseline_mgr.baseline.keys()):
+            try:
+                prog_id = None
+                snap = self.baseline_mgr.baseline.get(ext, {})
+                if isinstance(snap, dict):
+                    prog_id = snap.get("userchoice_progid") or snap.get("hkcr_ext")
+                unlock_all_protected_keys(ext, prog_id)
+                count += 1
+            except Exception as e:
+                logger.error(f"解锁 {ext} 失败: {e}")
+        pt = self._repair_pt()
+        if pt:
+            pt._locked_exts.clear()
+        if self._global_lock_mode:
+            self._global_lock_mode = False
+        self._repair_set_status(f"已解除 {count} 个扩展名的注册表锁定")
+        self._append_log(f"[异常修复] 已解除 {count} 个扩展名的注册表锁定", "success")
+
+    def _repair_clear_lock_count(self):
+        """② 清除锁定计数"""
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._lock_count.clear()
+        self._repair_apply("清除锁定计数", _do)
+
+    # ============ 二、重置持续篡改追踪状态 ============
+    def _repair_clear_ext_history(self):
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._ext_history.clear()
+        self._repair_apply("清除单扩展名篡改历史", _do)
+
+    def _repair_clear_progid_history(self):
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._progid_history.clear()
+        self._repair_apply("清除批量篡改历史", _do)
+
+    def _repair_clear_persistent_exts(self):
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._persistent_exts.clear()
+        self._repair_apply("清除持续篡改标记", _do)
+
+    def _repair_clear_batch_progids(self):
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._batch_progids.clear()
+        self._repair_apply("清除批量篡改标记", _do)
+
+    def _repair_exit_persistent_mode(self):
+        def _do():
+            if self.monitor:
+                self.monitor._persistent_mode = False
+                self.monitor._persistent_cooldown_until = 0
+        self._repair_apply("退出持续篡改模式", _do)
+
+    def _repair_clear_unlocked_exts(self):
+        def _do():
+            pt = self._repair_pt()
+            if pt:
+                pt._unlocked_exts.clear()
+        self._repair_apply("清除高频观察期", _do)
+
+    # ============ 三、重置防护引擎状态 ============
+    def _repair_clear_cooldown(self):
+        self._repair_apply("清除冷却期", self.engine.cooldown.clear)
+
+    def _repair_clear_allowed_cycle(self):
+        self._repair_apply("清除本周期同意记录", self.engine.allowed_this_cycle.clear)
+
+    def _repair_clear_uc_fail(self):
+        self._repair_apply("清除 UserChoice 失败计数", self.engine._uc_fail_count.clear)
+
+    def _repair_clear_handling_exts(self):
+        def _do():
+            if self.monitor:
+                self.monitor._handling_exts.clear()
+        self._repair_apply("清除处理中集合", _do)
+
+    # ============ 四、清除弹窗 / 通知状态 ============
+    def _repair_close_toasts(self):
+        def _do():
+            for toast in self.active_toasts[:]:
+                try:
+                    toast.destroy()
+                except Exception:
+                    pass
+            self.active_toasts.clear()
+        self._repair_apply("关闭所有活动弹窗", _do)
+
+    def _repair_clear_popup_queue(self):
+        def _do():
+            self._popup_queue.clear()
+            self._popup_queue_active = False
+        self._repair_apply("清空弹窗队列", _do)
+
+    def _repair_clear_batch_queue(self):
+        self._repair_apply("清空批量弹窗队列", self._batch_queue.clear)
+
+    def _repair_cancel_batch_timer(self):
+        def _do():
+            if self._batch_timer:
+                try:
+                    self.root.after_cancel(self._batch_timer)
+                except Exception:
+                    pass
+                self._batch_timer = None
+            self._batch_popup_active = False
+        self._repair_apply("取消批量计时器", _do)
+
+    def _repair_clear_popup_pause(self):
+        def _do():
+            self._popup_paused_until = 0
+        self._repair_apply("解除弹窗暂停", _do)
+
+    # ============ 五、进程打击状态 ============
+    def _repair_clear_blacklist(self):
+        """⑱ 清除进程黑名单"""
+        def _do():
+            if self.monitor and self.monitor.process_enforcer:
+                pe = self.monitor.process_enforcer
+                pe._blacklist.clear()
+                pe._redlist.clear()
+                pe._save()
+        self._repair_apply("清除进程黑名单", _do)
+
+    def _repair_clear_strike_history(self):
+        def _do():
+            if self.monitor and self.monitor.process_enforcer:
+                pe = self.monitor.process_enforcer
+                pe._blacklist_history.clear()
+                pe._suspect_count.clear()
+                pe._save()
+        self._repair_apply("清除打击历史", _do)
+
+    # ============ 其他 / 辅助 ============
+    def _repair_global_lock(self, win=None):
+        """锁定模式 / 解除锁定"""
+        self._toggle_global_lock()
+        if self._global_lock_mode:
+            self._repair_set_status("全局锁定已启用")
+        else:
+            self._repair_set_status("全局锁定已解除")
+
+    def _repair_reset_grace(self, win=None):
+        """重置启动宽限期"""
+        if self.monitor:
+            self.monitor._grace_until = time.time() + self.monitor.GRACE_PERIOD_SECONDS
+            self.monitor._grace_logged = False
+            self.monitor._grace_logged_exts.clear()
+        self._repair_set_status("启动宽限期已重置")
+        self._append_log("[异常修复] 启动宽限期已重置", "success")
+
+    # ============ 一键全部修复 ============
+    def _repair_all(self, win=None):
+        """一键全部修复：依次执行全部 19 项 + 宽限期重置"""
+        if not messagebox.askyesno(APP_NAME,
+            "【一键全部修复确认】\n\n"
+            "将依次执行全部 19 项修复：\n"
+            "① 解除注册表锁定（含清除锁定计数）\n"
+            "② 重置持续篡改追踪状态\n"
+            "③ 重置防护引擎状态\n"
+            "④ 清除弹窗 / 通知状态\n"
+            "⑤ 清除进程黑名单与打击历史\n"
+            "⑥ 重置启动宽限期\n\n"
+            "确定执行吗？"):
+            return
+        self._append_log("=== 开始一键全部修复 ===", "warn")
+        steps = [
+            ("解除注册表锁定", lambda: self._repair_unlock_registry(confirm=False)),
+            ("清除锁定计数", self._repair_clear_lock_count),
+            ("清除单扩展名篡改历史", self._repair_clear_ext_history),
+            ("清除批量篡改历史", self._repair_clear_progid_history),
+            ("清除持续篡改标记", self._repair_clear_persistent_exts),
+            ("清除批量篡改标记", self._repair_clear_batch_progids),
+            ("退出持续篡改模式", self._repair_exit_persistent_mode),
+            ("清除高频观察期", self._repair_clear_unlocked_exts),
+            ("清除冷却期", self._repair_clear_cooldown),
+            ("清除本周期同意记录", self._repair_clear_allowed_cycle),
+            ("清除 UserChoice 失败计数", self._repair_clear_uc_fail),
+            ("清除处理中集合", self._repair_clear_handling_exts),
+            ("关闭所有活动弹窗", self._repair_close_toasts),
+            ("清空弹窗队列", self._repair_clear_popup_queue),
+            ("清空批量弹窗队列", self._repair_clear_batch_queue),
+            ("取消批量计时器", self._repair_cancel_batch_timer),
+            ("解除弹窗暂停", self._repair_clear_popup_pause),
+            ("清除进程黑名单", self._repair_clear_blacklist),
+            ("清除打击历史", self._repair_clear_strike_history),
+            ("重置启动宽限期", self._repair_reset_grace),
+        ]
+        for i, (name, fn) in enumerate(steps, 1):
+            self._repair_set_status(f"正在执行 {i}/{len(steps)}：{name}...")
+            try:
+                fn()
+            except Exception as e:
+                logger.error(f"一键修复步骤「{name}」失败: {e}")
+        self._update_status("异常修复完成，正常监控中")
+        self._repair_set_status("全部修复完成！")
+        self._append_log("=== 一键全部修复完成 ===", "success")
+        messagebox.showinfo(APP_NAME, "一键全部修复完成！\n\n全部 19 项状态已重置，保护已恢复正常。")
+
     def _show_settings(self):
-        """设置对话框（分页版）"""
-        cfg = self.baseline_mgr.config
-        win = tk.Toplevel(self.root)
-        win.title("设置")
-        win.geometry("520x520")
-        win.transient(self.root)
-        win.grab_set()
-        win.update_idletasks()
-        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry(f"520x520+{(sw-520)//2}+{(sh-520)//2}")
-
-        nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # === 页1：提醒 ===
-        tab1 = tk.Frame(nb)
-        nb.add(tab1, text="提醒")
-        r = 0
-        autostart_var = tk.BooleanVar(value=cfg.get("autostart", True))
-        tk.Checkbutton(tab1, text="开机自启", variable=autostart_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-        popup_var = tk.BooleanVar(value=cfg.get("show_popup", True))
-        tk.Checkbutton(tab1, text="检测到更改时弹窗通知（取消则静默阻止）", variable=popup_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-        tk.Label(tab1, text="弹窗等待时间(秒):", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
-        _loaded_timeout = cfg.get("block_timeout", NOTIFY_TIMEOUT)
-        if _loaded_timeout < 1: _loaded_timeout = 1
-        elif _loaded_timeout > 180: _loaded_timeout = 180
-        block_var = tk.IntVar(value=_loaded_timeout)
-        tk.Spinbox(tab1, from_=1, to=180, textvariable=block_var, width=8).grid(row=r, column=1, sticky="w", pady=6); r+=1
-        tk.Label(tab1, text="范围1-180秒，关闭弹窗时此值强制为1秒", font=("微软雅黑", 8), fg="#999").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=2); r+=1
-        # 批量弹窗模式
-        tk.Label(tab1, text="批量弹窗模式:", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
-        batch_popup_var = tk.StringVar(value=cfg.get("batch_popup_mode", "single"))
-        batch_frame = tk.Frame(tab1)
-        batch_frame.grid(row=r, column=1, sticky="w", pady=6)
-        tk.Radiobutton(batch_frame, text="单个(队列)", variable=batch_popup_var, value="single", font=("微软雅黑", 9)).pack(side="left", padx=5)
-        tk.Radiobutton(batch_frame, text="同时(堆叠)", variable=batch_popup_var, value="simultaneous", font=("微软雅黑", 9)).pack(side="left", padx=5)
-        r+=1
-        tk.Label(tab1, text="单个：一次弹一个，超时自动阻止后下一个缩短为2秒；用户同意后下一个恢复正常时间\n同时：所有弹窗同时弹出，各自独立计时",
-                 font=("微软雅黑", 8), fg="#666", justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=20, pady=(0,6)); r+=1
-        tk.Label(tab1, text="运行模式:", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
-        mode_var = tk.StringVar(value=cfg.get("operation_mode", "normal"))
-        mode_frame = tk.Frame(tab1)
-        mode_frame.grid(row=r, column=1, sticky="w", pady=6)
-        for val, label in [("normal","正常"),("quiet","临时免打扰"),("game","游戏模式"),("demo","演示模式"),("silent","静默模式"),("paused","临时暂停保护")]:
-            tk.Radiobutton(mode_frame, text=label, variable=mode_var, value=val, font=("微软雅黑", 8)).pack(side="left", padx=2)
-        r+=1
-        tk.Label(tab1, text="正常：默认弹窗；临时免打扰/游戏/演示/静默：关闭或压制提醒；暂停保护：短时停用实时检测",
-                 font=("微软雅黑", 8), fg="#666", justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=20, pady=(0,6)); r+=1
-        clearlog_var = tk.BooleanVar(value=cfg.get("clear_log_on_start", False))
-        tk.Checkbutton(tab1, text="每次启动清空日志", variable=clearlog_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-        nokill_var = tk.BooleanVar(value=cfg.get("persistent_no_kill", False))
-        tk.Checkbutton(tab1, text="持续/批量篡改时不终止进程（仅锁定注册表）", variable=nokill_var, font=("微软雅黑", 9)).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-
-        # === 页2：基准 ===
-        tab2 = tk.Frame(nb)
-        nb.add(tab2, text="基准")
-        r = 0
-        tk.Button(tab2, text="查看基准说明", font=("微软雅黑", 9), width=15,
-                  command=lambda: self._open_baseline_download()).grid(row=r, column=0, padx=15, pady=6, sticky="w")
-        tk.Label(tab2, text="打开项目主页，查看基准生成与导入说明", font=("微软雅黑", 8), fg="#666").grid(row=r, column=1, sticky="w", pady=6); r+=1
-        tk.Button(tab2, text="从文件加载基准", font=("微软雅黑", 9), width=15,
-                  command=lambda: self._load_baseline_from_file(win)).grid(row=r, column=0, padx=15, pady=6, sticky="w"); r+=1
-        tk.Label(tab2, text="基准保留版本数:", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=6)
-        hist_var = tk.IntVar(value=cfg.get("history_versions", MAX_HISTORY_VERSIONS))
-        tk.Spinbox(tab2, from_=1, to=20, textvariable=hist_var, width=8).grid(row=r, column=1, sticky="w", pady=6); r+=1
-
-        # === 页3：权限 ===
-        tab3 = tk.Frame(nb)
-        nb.add(tab3, text="权限")
-        r = 0
-        tk.Label(tab3, text="默认权限级别:", font=("微软雅黑", 9)).grid(row=r, column=0, sticky="w", padx=15, pady=10)
-        perm_var = tk.StringVar(value=cfg.get("default_permission", "t"))
-        perm_frame = tk.Frame(tab3)
-        perm_frame.grid(row=r, column=1, sticky="w", pady=10)
-        for val, label in [("user","普通用户"),("administrator","管理员"),("system","SYSTEM"),("t","TI(推荐)")]:
-            tk.Radiobutton(perm_frame, text=label, variable=perm_var, value=val, font=("微软雅黑", 9)).pack(side="left")
-        r+=1
-        tk.Label(tab3, text="注意：低于TI权限可能导致UserChoice恢复失败，保护不生效",
-                 font=("微软雅黑", 8), fg="#e74c3c").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-        audit_level_var = tk.StringVar(value=cfg.get("audit_level", "normal"))
-        tk.Label(tab3, text="记录级别:", font=("微软雅黑", 9)).grid(row=r+1, column=0, sticky="w", padx=15, pady=6)
-        audit_frame = tk.Frame(tab3)
-        audit_frame.grid(row=r+1, column=1, sticky="w", pady=6)
-        for val, label in [("minimal","极简"),("normal","普通"),("detailed","详细"),("full","完整")]:
-            tk.Radiobutton(audit_frame, text=label, variable=audit_level_var, value=val, font=("微软雅黑", 8)).pack(side="left", padx=3)
-        r += 2
-        tk.Button(tab3, text="导出审计日志", font=("微软雅黑", 9), width=12,
-                  command=lambda: self._export_audit_log()).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6)
-        tk.Label(tab3, text="审计日志记录：进程名/路径/命令行/数字签名/父进程/时间/注册表路径/旧值/新值",
-                 font=("微软雅黑", 8), fg="#666", justify="left").grid(row=r+1, column=0, columnspan=2, sticky="w", padx=15, pady=2)
-
-        # === 页4：其他（保护级说明+关于） ===
-        tab4 = tk.Frame(nb)
-        nb.add(tab4, text="其他")
-        r = 0
-        tk.Label(tab4, text="保护级说明", font=("微软雅黑", 10, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=(10,4)); r+=1
-        protect_info = (
-            "BH0：仅检测，不阻止（宽限期内）\n"
-            "BH1：自动恢复基准值，验证后生效\n"
-            "BH2：ACL锁定UserChoice键（仅SYSTEM/TI可写）\n"
-            "BH3：ACL锁定 + System完整性标签（Medium进程无法写入）\n"
-            "BH4：强锁定 + 进程降为Untrusted完整性\n"
-            "BH5：强锁定 + Untrusted降权 + NtSuspendProcess全冻结\n"
-            "红名单：进程永久拒绝扩展名相关注册表操作"
-        )
-        tk.Label(tab4, text=protect_info, font=("微软雅黑", 8), justify="left", fg="#333").grid(row=r, column=0, columnspan=2, sticky="w", padx=20, pady=4); r+=1
-
-        tk.Label(tab4, text=f"\n{APP_NAME} v{APP_VERSION}\n阻止第三方软件私自篡改文件扩展名默认打开方式\n保护7项注册表位置，支持基准校准与自动恢复",
-                 font=("微软雅黑", 8), justify="left", fg="#666").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6); r+=1
-        tk.Label(tab4, text="GitHub: https://github.com/TXZDMM/OPSTController", font=("微软雅黑", 8), fg="#3498db").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=2)
-
-        # === 页5：更改记录 ===
-        tab5 = tk.Frame(nb)
-        nb.add(tab5, text="更改记录")
-        # 记录列表
-        list_frame = tk.Frame(tab5)
-        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        tk.Label(list_frame, text="更改历史（最近100条）", font=("微软雅黑", 9, "bold")).pack(anchor="w")
-        history_listbox = tk.Listbox(list_frame, font=("微软雅黑", 8), height=12)
-        history_listbox.pack(fill="both", expand=True, pady=5)
-        # 详情显示
-        detail_text = tk.Text(list_frame, font=("微软雅黑", 8), height=6, wrap="word")
-        detail_text.pack(fill="x", pady=5)
-        detail_text.configure(state="normal")  # 确保可编辑，用于输入EXIT-TXZ退出命令
-        # 按钮
-        btn_frame = tk.Frame(tab5)
-        btn_frame.pack(fill="x", padx=10, pady=5)
-
-        def refresh_history():
-            history_listbox.delete(0, tk.END)
-            records = self.change_history.get_records(limit=100)
-            for rec in reversed(records):
-                action_text = {"user_consent": "用户同意", "auto_blocked": "自动阻止", "detected_only": "仅检测"}.get(rec["action"], rec["action"])
-                history_listbox.insert(tk.END, f"{rec['timestamp']}  {rec['ext']}  [{rec['tamperer']}]  {action_text}  {rec['result']}")
-
-        def show_history_detail(evt):
-            sel = history_listbox.curselection()
-            if not sel:
-                return
-            records = self.change_history.get_records(limit=100)
-            idx = len(records) - 1 - sel[0]
-            if idx < 0 or idx >= len(records):
-                return
-            rec = records[idx]
-            detail_text.delete("1.0", tk.END)
-            detail_text.insert(tk.END, f"时间: {rec['timestamp']}\n")
-            detail_text.insert(tk.END, f"扩展名: {rec['ext']}\n")
-            detail_text.insert(tk.END, f"篡改者: {rec['tamperer']}\n")
-            detail_text.insert(tk.END, f"操作: {rec['action']}  结果: {rec['result']}\n")
-            detail_text.insert(tk.END, "更改详情:\n")
-            for ch in rec.get("changes", []):
-                detail_text.insert(tk.END, f"  {ch['item']}: {ch['old']} → {ch['new']}\n")
-
-        def check_current_status():
-            sel = history_listbox.curselection()
-            if not sel:
-                return
-            records = self.change_history.get_records(limit=100)
-            idx = len(records) - 1 - sel[0]
-            if idx < 0 or idx >= len(records):
-                return
-            ext = records[idx]["ext"]
-            # 检测当前7项状态：全部展示，标注差异
-            bl = self.baseline_mgr.baseline.get(ext, {})
-            detail_text.delete("1.0", tk.END)
-            detail_text.insert(tk.END, f"=== {ext} 当前7项状态 ===\n\n")
-            item_order = ["userchoice_progid", "userchoice_hash", "hkcr_ext", "hkcu_ext", "hklm_ext", "hkcr_command", "hkcu_command"]
-            mismatch_count = 0
-            for key in item_order:
-                bl_item = bl.get(key, {})
-                label = ProtectionEngine.ITEM_LABELS.get(key, key)
-                bl_val = bl_item.get("value")
-                # 读取当前值
-                cur_val = None
-                if bl_item:
-                    root_name = bl_item.get("root")
-                    if root_name is None:
-                        continue
-                    root = ROOT_MAP.get(str(root_name))
-                    path = bl_item.get("path", "")
-                    name = bl_item.get("name", "")
-                    if root and path:
-                        try:
-                            cur_val, _ = reg_read_value(root, path, name)
-                        except Exception:
-                            cur_val = None
-                # UserChoice兜底读取
-                if key in ("userchoice_progid", "userchoice_hash") and cur_val is None:
-                    uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
-                    val_name = "ProgId" if key == "userchoice_progid" else "Hash"
-                    try:
-                        cur_val, _ = reg_read_value(HKCU, uc_path, val_name)
-                    except Exception:
-                        pass
-                # 比较并显示
-                is_diff = (bl_val != cur_val) and not (bl_val is None and cur_val is None)
-                if is_diff:
-                    mismatch_count += 1
-                    status = "✗ 异常"
-                    color_tag = "diff"
-                else:
-                    status = "✓ 正常"
-                    color_tag = "same"
-                detail_text.insert(tk.END, f"[{status}] {label}\n", color_tag)
-                detail_text.insert(tk.END, f"    基准: {repr(bl_val)}\n")
-                detail_text.insert(tk.END, f"    当前: {repr(cur_val)}\n\n")
-            # 汇总
-            if mismatch_count == 0:
-                detail_text.insert(tk.END, "结论: 全部正常（与基准一致）\n", "same")
-            else:
-                detail_text.insert(tk.END, f"结论: 发现 {mismatch_count} 项异常\n", "diff")
-            # 设置颜色
-            detail_text.tag_config("same", foreground="#27ae60")
-            detail_text.tag_config("diff", foreground="#e74c3c")
-            # 检测当前打开方式
-            try:
-                progid = get_prog_id(ext)
-                if progid:
-                    name, _ = identify_tamperer(progid)
-                    detail_text.insert(tk.END, f"\n当前默认打开方式: {progid}" + (f" ({name})" if name else ""))
-                else:
-                    detail_text.insert(tk.END, f"\n当前默认打开方式: 系统默认（无UserChoice）")
-            except Exception as e:
-                detail_text.insert(tk.END, f"\n获取打开方式失败: {e}")
-
-        def clear_history():
-            if messagebox.askyesno("确认", "确定清空所有更改记录？"):
-                self.change_history.clear()
-                refresh_history()
-                detail_text.delete("1.0", tk.END)
-
-        history_listbox.bind("<<ListboxSelect>>", show_history_detail)
-        # 隐藏命令：在详情框输入命令按Enter执行
-        # EXIT-TXZ: 强制完全退出程序（用于构建时释放文件锁）
-        # LOG: 打开日志文件
-        # TEST WINDOWS-TOOMUCH: 模拟弹窗压力测试
-        def _check_exit_code(evt):
-            content = detail_text.get("1.0", tk.END).strip().upper()
-            if "EXIT-TXZ" in content:
-                # 强制完全退出：保存基准、停止监控、立即终止进程
-                try:
-                    self.baseline_mgr.save()
-                except Exception:
-                    pass
-                try:
-                    if self.monitor:
-                        self.monitor.stop()
-                except Exception:
-                    pass
-                # 先关闭所有窗口
-                try:
-                    self.root.destroy()
-                except Exception:
-                    pass
-                # 立即强制退出整个进程（包括后台线程）
-                os._exit(0)
-                return "break"
-            elif content == "LOG" or content.startswith("LOG"):
-                # 打开日志文件
-                try:
-                    import subprocess
-                    if os.path.exists(LOG_FILE):
-                        subprocess.Popen(['notepad.exe', LOG_FILE])
-                    else:
-                        messagebox.showinfo(APP_NAME, "日志文件不存在")
-                except Exception as e:
-                    messagebox.showerror(APP_NAME, f"打开日志失败: {e}")
-                return "break"
-            elif "TEST WINDOWS-TOOMUCH" in content or "TEST WINDOWS TOOMUCH" in content:
-                # 弹窗压力测试：2个批量 + 1个持续篡改 + 3个正常队列
-                self._append_log("=== 弹窗压力测试开始 ===", "warn")
-                # 构造模拟数据
-                def make_mock(ext, progid):
-                    return [("userchoice_progid", "AppX43hnxtbyyps62jhe9sqpdzxn1790zetc", progid, None)]
-                mock_result = (3, 0, [])
-                # 批量弹窗1：百度网盘篡改5个
-                items1 = [(e, make_mock(e, "BaiduNetdiskImageViewerAssociations"), mock_result)
-                          for e in [".png", ".jpg", ".jpeg", ".bmp", ".gif"]]
-                self._show_batch_popup("百度网盘", items1)
-                self._append_log("  [模拟] 批量弹窗1: 百度网盘篡改5个图片格式", "info")
-                # 批量弹窗2：WPS篡改4个
-                items2 = [(e, make_mock(e, "WPS.Document"), mock_result)
-                          for e in [".doc", ".docx", ".xls", ".xlsx"]]
-                self.root.after(200, lambda: self._show_batch_popup("WPS Office", items2))
-                self._append_log("  [模拟] 批量弹窗2: WPS篡改4个办公格式", "info")
-                # 持续篡改提示
-                self.root.after(400, lambda: self._append_log("  [模拟] 持续篡改提示: .pdf 被持续篡改（已静默阻止）", "warn"))
-                # 正常弹窗3个（加入队列）
-                self.root.after(600, lambda: self._show_single_notification(".pdf", make_mock(".pdf", "Acrobat.Document"), mock_result))
-                self.root.after(800, lambda: self._show_single_notification(".mp4", make_mock(".mp4", "PotPlayer"), mock_result))
-                self.root.after(1000, lambda: self._show_single_notification(".mp3", make_mock(".mp3", "QQMusic"), mock_result))
-                self._append_log("  [模拟] 正常弹窗队列: .pdf .mp4 .mp3", "info")
-                self._append_log("=== 弹窗压力测试已触发 ===", "success")
-                return "break"
-        detail_text.bind("<KeyRelease-Return>", _check_exit_code)
-        tk.Button(btn_frame, text="刷新", command=refresh_history, font=("微软雅黑", 9), width=8).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="检测当前状态", command=check_current_status, font=("微软雅黑", 9), width=12).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="清空记录", command=clear_history, font=("微软雅黑", 9), width=8).pack(side="left", padx=5)
-        refresh_history()
-
-        # === 页6：白名单 ===
-        tab6 = tk.Frame(nb)
-        nb.add(tab6, text="白名单")
-        r = 0
-        tk.Label(tab6, text="白名单扩展名（任意程序对该扩展名的操作自动允许）",
-                 font=("微软雅黑", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=(10,4)); r+=1
-        whitelist_exts = cfg.get("whitelist_exts", [])
-        ext_list_frame = tk.Frame(tab6)
-        ext_list_frame.grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=4)
-        ext_listbox = tk.Listbox(ext_list_frame, font=("微软雅黑", 9), height=6, width=40)
-        ext_listbox.pack(side="left", fill="x", expand=True)
-        ext_sb = tk.Scrollbar(ext_list_frame, orient="vertical", command=ext_listbox.yview)
-        ext_sb.pack(side="right", fill="y")
-        ext_listbox.config(yscrollcommand=ext_sb.set)
-        for e in whitelist_exts:
-            ext_listbox.insert(tk.END, e)
-        r+=1
-        ext_entry = tk.Entry(tab6, font=("微软雅黑", 9), width=20)
-        ext_entry.grid(row=r, column=0, sticky="w", padx=15, pady=4)
-        def add_whitelist_ext():
-            val = ext_entry.get().strip().lower()
-            if val and val not in [ext_listbox.get(i).lower() for i in range(ext_listbox.size())]:
-                ext_listbox.insert(tk.END, val)
-                ext_entry.delete(0, tk.END)
-        def del_whitelist_ext():
-            sel = ext_listbox.curselection()
-            if sel:
-                ext_listbox.delete(sel[0])
-        tk.Button(tab6, text="添加", font=("微软雅黑", 8), width=6,
-                  command=add_whitelist_ext).grid(row=r, column=1, sticky="w", padx=5, pady=4)
-        r+=1
-        tk.Button(tab6, text="删除选中", font=("微软雅黑", 8), width=8,
-                  command=del_whitelist_ext).grid(row=r, column=0, sticky="w", padx=15, pady=4); r+=1
-
-        tk.Label(tab6, text="白名单程序（程序对任意扩展名的操作自动同意）",
-                 font=("微软雅黑", 9, "bold")).grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=(15,4)); r+=1
-        whitelist_progs = cfg.get("whitelist_programs", [])
-        prog_list_frame = tk.Frame(tab6)
-        prog_list_frame.grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=4)
-        prog_listbox = tk.Listbox(prog_list_frame, font=("微软雅黑", 9), height=6, width=40)
-        prog_listbox.pack(side="left", fill="x", expand=True)
-        prog_sb = tk.Scrollbar(prog_list_frame, orient="vertical", command=prog_listbox.yview)
-        prog_sb.pack(side="right", fill="y")
-        prog_listbox.config(yscrollcommand=prog_sb.set)
-        for p in whitelist_progs:
-            prog_listbox.insert(tk.END, p)
-        r+=1
-        prog_entry = tk.Entry(tab6, font=("微软雅黑", 9), width=20)
-        prog_entry.grid(row=r, column=0, sticky="w", padx=15, pady=4)
-        def add_whitelist_prog():
-            val = prog_entry.get().strip()
-            if val and val not in [prog_listbox.get(i) for i in range(prog_listbox.size())]:
-                prog_listbox.insert(tk.END, val)
-                prog_entry.delete(0, tk.END)
-        def del_whitelist_prog():
-            sel = prog_listbox.curselection()
-            if sel:
-                prog_listbox.delete(sel[0])
-        tk.Button(tab6, text="添加", font=("微软雅黑", 8), width=6,
-                  command=add_whitelist_prog).grid(row=r, column=1, sticky="w", padx=5, pady=4)
-        r+=1
-        tk.Button(tab6, text="删除选中", font=("微软雅黑", 8), width=8,
-                  command=del_whitelist_prog).grid(row=r, column=0, sticky="w", padx=15, pady=4); r+=1
-        tk.Label(tab6, text="默认白名单程序：火绒安全、360安全卫士、360杀毒、卡巴斯基、电脑管家、Windows Defender等",
-                 font=("微软雅黑", 8), fg="#666", justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=15, pady=6)
-
-        # 底部按钮
-        bottom_frame = tk.Frame(win)
-        bottom_frame.pack(side="bottom", fill="x", pady=8)
-
-        def save_settings():
-            old_perm = cfg.get("default_permission", "t")
-            new_perm = perm_var.get()
-            cfg["history_versions"] = hist_var.get()
-            cfg["default_permission"] = new_perm
-            cfg["autostart"] = autostart_var.get()
-            cfg["show_popup"] = popup_var.get()
-            cfg["operation_mode"] = mode_var.get() if mode_var.get() in OPERATION_MODES else "normal"
-            cfg["audit_level"] = audit_level_var.get() if audit_level_var.get() in AUDIT_LEVELS else "normal"
-            self.change_history.set_audit_level(cfg["audit_level"])
-            _save_timeout = block_var.get()
-            if _save_timeout < 1: _save_timeout = 1
-            elif _save_timeout > 180: _save_timeout = 180
-            cfg["block_timeout"] = 1 if not popup_var.get() else _save_timeout
-            cfg["clear_log_on_start"] = clearlog_var.get()
-            cfg["persistent_no_kill"] = nokill_var.get()
-            cfg["batch_popup_mode"] = batch_popup_var.get()
-            # 保存白名单
-            cfg["whitelist_exts"] = [ext_listbox.get(i) for i in range(ext_listbox.size())]
-            cfg["whitelist_programs"] = [prog_listbox.get(i) for i in range(prog_listbox.size())]
-            self.baseline_mgr.save_config()
-            if autostart_var.get():
-                if not is_autostart_set(): add_to_autostart()
-            else:
-                remove_from_autostart()
-            self._append_log("设置已保存", "success")
-            win.destroy()
-            # 权限改变时自动重启
-            if new_perm != old_perm:
-                perm_labels = {"user": "普通用户", "administrator": "管理员", "system": "SYSTEM", "t": "TI"}
-                new_label = perm_labels.get(new_perm, new_perm)
-                if messagebox.askyesno(APP_NAME, f"运行权限已更改为【{new_label}】。\n\n是否立即重启程序使设置生效？"):
-                    _restart_app()
-
-        def _restart_app():
-            """重启程序：启动新实例后退出当前实例"""
-            try:
-                # 停止监控
-                if self.monitor is not None:
-                    self.monitor.stop()
-                # 保存基准
-                try:
-                    self.baseline_mgr.save()
-                except Exception:
-                    pass
-                # 启动新实例，带--restart参数跳过单实例检测
-                import subprocess
-                exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-                # 使用cmd启动，避免继承当前高权限，并传递--restart参数
-                subprocess.Popen(['cmd.exe', '/c', 'start', '', exe_path, '--restart'], shell=False)
-                # 立即退出
-                os._exit(0)
-            except Exception as e:
-                messagebox.showerror(APP_NAME, f"重启失败: {e}\n请手动重启程序。")
-
-        tk.Button(bottom_frame, text="保存", font=("微软雅黑", 9), width=10, command=save_settings).pack(side="left", padx=5)
-        tk.Button(bottom_frame, text="取消", font=("微软雅黑", 9), width=10, command=win.destroy).pack(side="left", padx=5)
-        tk.Label(bottom_frame, text="* 运行权限更改需重启生效", font=("微软雅黑", 8), fg="#999").pack(side="right", padx=10)
+        """设置对话框（兼容旧调用）：直接切换到主窗口「设置」页"""
+        self._select_nav("settings")
 
     def _open_baseline_download(self):
         """打开项目主页（默认基准说明与导入方式）"""
@@ -5858,6 +6537,16 @@ class MainWindow:
         self.log_text.insert("end", f"[{timestamp}] {msg}\n", level)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        # 主界面输出窗口（状态页"保护输出"）同步显示
+        so = getattr(self, "status_output", None)
+        if so is not None:
+            try:
+                so.configure(state="normal")
+                so.insert("end", f"[{timestamp}] {msg}\n", level)
+                so.see("end")
+                so.configure(state="disabled")
+            except Exception:
+                pass
 
     def run(self):
         self.root.mainloop()

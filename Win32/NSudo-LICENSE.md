@@ -1,4 +1,4 @@
-﻿# License
+# License
 
 The offical NSudo repository (not including third-party libraries) is **only** 
 distributed under the MIT License today because we want to give the **maximum 
