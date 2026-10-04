@@ -212,7 +212,10 @@ def _enable_privilege(priv_name):
         result = _AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), 0, None, None)
         err = ctypes.get_last_error()
         kernel32.CloseHandle(hToken)
-        return result != 0 and err == 0
+        # 成功 = 返回非0 且 未报告"特权未全部分配"(1300)。
+        # 注意：AdjustTokenPrivileges 成功时并不保证把 GetLastError 清零，
+        # 因此不能要求 err==0（否则会把成功误判为失败）；1300 才是真实失败信号。
+        return result != 0 and err != 1300
     except Exception:
         return False
 
@@ -6743,6 +6746,8 @@ def get_current_token_privileges():
             return []
 
         class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            # Windows 实际布局 12 字节/条，数组型结构必须 pack=4
+            _pack_ = 4
             _fields_ = [("Luid", LUID), ("Attributes", DWORD)]
         class TOKEN_PRIVILEGES_STRUCT(ctypes.Structure):
             _fields_ = [("PrivilegeCount", DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 64)]
@@ -6828,6 +6833,8 @@ def get_real_permission_detail():
             return "普通用户", False, False, "未知", ""
 
         class SID_AND_ATTRIBUTES(ctypes.Structure):
+            # Windows x64 实际布局 16 字节/条（PSID 8 对齐到8 + Attributes 4 + 尾部填充4）。
+            # 含指针成员不能 pack=4（那会变成 12，数组型 TokenGroups 读错位）。
             _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", DWORD)]
         class TOKEN_USER(ctypes.Structure):
             _fields_ = [("User", SID_AND_ATTRIBUTES)]
@@ -6873,6 +6880,26 @@ def get_real_permission_detail():
         except Exception:
             pass
 
+        # 枚举令牌组：检测 TI 服务组（S-1-5-80-956008885-...）。
+        # NSudo 8.2 的 -U:T 实际产出"SYSTEM 身份 + TI 组"令牌（能力等同 TrustedInstaller 服务），
+        # 仅看 user SID 会误判为普通 SYSTEM，导致界面显示"SYSTEM"而非 TI。
+        ti_group_present = False
+        try:
+            class TOKEN_GROUPS(ctypes.Structure):
+                _fields_ = [("GroupCount", DWORD), ("Groups", SID_AND_ATTRIBUTES * 64)]
+            tg = TOKEN_GROUPS()
+            tg_needed = DWORD()
+            if advapi32.GetTokenInformation(hToken, 2, ctypes.byref(tg), ctypes.sizeof(tg), ctypes.byref(tg_needed)):
+                for gi in range(min(tg.GroupCount, 64)):
+                    g_sid = tg.Groups[gi].Sid
+                    g_str = ctypes.c_wchar_p()
+                    if (g_sid and advapi32.ConvertSidToStringSidW(g_sid, ctypes.byref(g_str))
+                            and g_str.value and g_str.value.startswith("S-1-5-80-956008885-")):
+                        ti_group_present = True
+                        break
+        except Exception:
+            pass
+
         kernel32.CloseHandle(hToken)
 
         is_ti_system = False
@@ -6882,6 +6909,9 @@ def get_real_permission_detail():
         if user_sid == "S-1-5-18":
             status = "SYSTEM"
             is_ti_system = True
+            if ti_group_present:
+                # SYSTEM 身份 + TI 服务组 = TrustedInstaller 能力（NSudo 8.2 -U:T 形态）
+                status = "TI/SYSTEM"
         elif user_sid.startswith("S-1-5-80-956008885-"):
             status = "TI(TrustedInstaller)"
             is_ti_system = True
@@ -6950,6 +6980,8 @@ def run_as_trustedinstaller():
         class LUID(ctypes.Structure):
             _fields_ = [("LowPart", DWORD), ("HighPart", ctypes.c_long)]
         class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            # Windows 实际布局 12 字节/条，pack=4 保持一致
+            _pack_ = 4
             _fields_ = [("Luid", LUID), ("Attributes", DWORD)]
         class TOKEN_PRIVILEGES(ctypes.Structure):
             _fields_ = [("PrivilegeCount", DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
@@ -7089,9 +7121,9 @@ def run_as_trustedinstaller():
         hDupToken = HANDLE()
         if not advapi32.DuplicateTokenEx(hToken, 0x10000000, None, 2, 1, ctypes.byref(hDupToken)):
             _log(f"DuplicateTokenEx失败,错误码:{ctypes.get_last_error()}")
-            advapi32.CloseHandle(hToken)
+            kernel32.CloseHandle(hToken)
             return False
-        advapi32.CloseHandle(hToken)
+        kernel32.CloseHandle(hToken)
         _log("已复制TrustedInstaller令牌(主令牌)")
 
         # 7. 启用当前进程必需特权
@@ -7108,7 +7140,7 @@ def run_as_trustedinstaller():
                 advapi32.AdjustTokenPrivileges(hCurToken, False, ctypes.byref(tp), 0, None, None)
                 if ctypes.get_last_error() == 0:
                     enabled_privs.append(priv_name)
-        advapi32.CloseHandle(hCurToken)
+        kernel32.CloseHandle(hCurToken)
         _log(f"已启用特权:{','.join(enabled_privs) if enabled_privs else '无'}")
 
         required_privs = ["SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege", "SeDebugPrivilege", "SeTcbPrivilege"]
@@ -7176,7 +7208,7 @@ def run_as_trustedinstaller():
         else:
             err3 = 0
 
-        advapi32.CloseHandle(hDupToken)
+        kernel32.CloseHandle(hDupToken)
         if pi.hProcess:
             kernel32.CloseHandle(pi.hProcess)
         if pi.hThread:
@@ -7354,26 +7386,55 @@ def enable_all_privileges():
         class LUID(ctypes.Structure):
             _fields_ = [("LowPart", DWORD), ("HighPart", ctypes.c_long)]
         class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            # Windows 实际布局 12 字节/条（LUID 8 + Attributes 4，连续无填充）。
+            # 默认对齐会让 sizeof 变 16，数组型 TokenPrivileges 全部读错位，必须 pack。
+            _pack_ = 4
             _fields_ = [("Luid", LUID), ("Attributes", DWORD)]
         class TOKEN_PRIVILEGES(ctypes.Structure):
             _fields_ = [("PrivilegeCount", DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 64)]
 
         tp = TOKEN_PRIVILEGES()
         ret_len = DWORD()
-        advapi32.GetTokenInformation(hToken, 3, ctypes.byref(tp), ctypes.sizeof(tp), ctypes.byref(ret_len))
+        if not advapi32.GetTokenInformation(hToken, 3, ctypes.byref(tp), ctypes.sizeof(tp), ctypes.byref(ret_len)):
+            kernel32.CloseHandle(hToken)
+            return 0
 
+        count = min(tp.PrivilegeCount, 64)
+        if count == 0:
+            kernel32.CloseHandle(hToken)
+            return 0
+
+        # 一次性请求启用全部特权（全部成功则 err==0；1300=部分特权不可用）
+        all_tp = TOKEN_PRIVILEGES()
+        all_tp.PrivilegeCount = count
+        for i in range(count):
+            p = tp.Privileges[i]
+            all_tp.Privileges[i].Luid = p.Luid
+            all_tp.Privileges[i].Attributes = 0x00000002  # SE_ENABLED
+
+        ctypes.set_last_error(0)
+        ok = advapi32.AdjustTokenPrivileges(hToken, False, ctypes.byref(all_tp), 0, None, None)
+        err = ctypes.get_last_error()
+        if ok == 0:
+            kernel32.CloseHandle(hToken)
+            return 0
+        if err != 1300:
+            kernel32.CloseHandle(hToken)
+            return count
+
+        # 部分特权不可用（1300）：逐项确认实际成功数
         enabled_count = 0
-        for i in range(min(tp.PrivilegeCount, 64)):
-            priv = tp.Privileges[i]
-            priv.Attributes = 0x00000002  # SE_ENABLED
-            new_tp = TOKEN_PRIVILEGES()
-            new_tp.PrivilegeCount = 1
-            new_tp.Privileges[0] = priv
-            advapi32.AdjustTokenPrivileges(hToken, False, ctypes.byref(new_tp), 0, None, None)
-            if ctypes.get_last_error() == 0:
+        for i in range(count):
+            one = TOKEN_PRIVILEGES()
+            one.PrivilegeCount = 1
+            one.Privileges[0].Luid = all_tp.Privileges[i].Luid
+            one.Privileges[0].Attributes = 0x00000002
+            ctypes.set_last_error(0)
+            r2 = advapi32.AdjustTokenPrivileges(hToken, False, ctypes.byref(one), 0, None, None)
+            e2 = ctypes.get_last_error()
+            if r2 != 0 and e2 != 1300:
                 enabled_count += 1
-
-        advapi32.CloseHandle(hToken)
+        kernel32.CloseHandle(hToken)
         return enabled_count
     except Exception:
         return 0
