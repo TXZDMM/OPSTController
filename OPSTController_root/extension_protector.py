@@ -1756,22 +1756,27 @@ class ProtectionEngine:
                 continue
 
             root_name = bl_item.get("root")
-            if root_name is None:
-                continue
-            root = ROOT_MAP.get(str(root_name))
-            if root is None:
-                continue
-
-            path = bl_item.get("path", "")
-            if not path:
-                continue
-
-            name = bl_item.get("name", "")
-            if str(root_name) == "HKCR" and HKCU_REMAPPED:
-                # TI 下 HKCR 不含用户 HKCU\Software\Classes 覆盖，用合并视图
-                cur_val, cur_type = read_hkcr_effective(path, name)
+            if key in ("userchoice_progid", "userchoice_hash"):
+                # UserChoice 路径固定；基线键不存在时 root='?'，此前会被整体跳过，
+                # 导致"从无到有"的 UserChoice 篡改永远检测不到。这里固定读取。
+                uc_path_fixed = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
+                uc_name = "ProgId" if key == "userchoice_progid" else "Hash"
+                cur_val, cur_type = reg_read_value(HKCU, uc_path_fixed, uc_name)
             else:
-                cur_val, cur_type = reg_read_value(root, path, name)
+                if root_name is None:
+                    continue
+                root = ROOT_MAP.get(str(root_name))
+                if root is None:
+                    continue
+                path = bl_item.get("path", "")
+                if not path:
+                    continue
+                name = bl_item.get("name", "")
+                if str(root_name) == "HKCR" and HKCU_REMAPPED:
+                    # TI 下 HKCR 不含用户 HKCU\Software\Classes 覆盖，用合并视图
+                    cur_val, cur_type = read_hkcr_effective(path, name)
+                else:
+                    cur_val, cur_type = reg_read_value(root, path, name)
 
             if key == "userchoice_progid" and cur_val is None and cur_uc_progid is not None:
                 cur_val = cur_uc_progid
@@ -2838,12 +2843,15 @@ class MonitorThread(threading.Thread):
             for i, wait_sec in enumerate(verify_points):
                 time.sleep(wait_sec)
                 remaining = self.engine.check_extension(ext)
-                if remaining:
+                # new_progid_command 是伴随合成项（ProgId 恢复后自然失效），
+                # 不参与验证判定，避免系统默认程序(如照片AppX)对抗时无限重试刷屏
+                remaining_real = [m for m in remaining if m[0] != "new_progid_command"]
+                if remaining_real:
                     all_passed = False
                     mismatches = remaining  # 用最新不一致列表重试
                     if attempt < max_retries - 1:
                         log_event(ext, "恢复", f"重试{attempt+1}",
-                                  f"{wait_sec}s后仍有{len(remaining)}项不一致")
+                                  f"{wait_sec}s后仍有{len(remaining_real)}项不一致")
                     break  # 跳出验证循环，进入重试
 
             if all_passed:
