@@ -1745,7 +1745,9 @@ class ProtectionEngine:
         cur_uc_progid_for_hash = reg_read_value(HKCU, uc_path, "ProgId")[0]
         uc_progid_matches = (cur_uc_progid_for_hash == bl_uc_progid)
 
-        for key, bl_item in bl.items():
+        # 用快照遍历，避免并发(主线程update_extension等)修改bl时
+        # 抛 "dictionary changed size during iteration"
+        for key, bl_item in list(bl.items()):
             if key == "new_progid_command" or not isinstance(bl_item, dict):
                 continue
 
@@ -2000,8 +2002,8 @@ class ProtectionEngine:
             bl = self.baseline.baseline.get(ext_name, {})
             if not bl:
                 continue
-            # 缺失项：基准存在，但当前键已不存在
-            for key, item in bl.items():
+            # 缺失项：基准存在，但当前键已不存在（快照遍历防并发修改）
+            for key, item in list(bl.items()):
                 if not isinstance(item, dict):
                     continue
                 path = item.get("path")
