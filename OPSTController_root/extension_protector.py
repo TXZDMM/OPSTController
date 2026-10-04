@@ -427,6 +427,21 @@ def reg_delete_value(root, path, name=""):
         return False
 
 
+def read_hkcr_effective(path, name=""):
+    """
+    HKCR 合并视图读取（返回真实生效值）。
+    TI/SYSTEM 下 HKEY_CLASSES_ROOT 只合并 HKLM/SOFTWARE/Classes 与 SYSTEM 自身
+    HKCU/Software/Classes，不含交互用户的 HKCU/Software/Classes 覆盖。
+    而 Windows 关联解析时用户 HKCU/Software/Classes 优先于 HKLM，因此
+    TI 模式下必须手动合并用户覆盖；普通模式 HKCU 即当前用户，直接读 HKCR。
+    """
+    if HKCU_REMAPPED:
+        v, t = reg_read_value(HKCU, "Software\\Classes\\" + path, name)
+        if v is not None:
+            return v, t
+    return reg_read_value(HKCR, path, name)
+
+
 def reg_delete_key(root, path):
     """删除注册表项，返回 bool。键不存在也视为成功（已删除状态）。"""
     try:
@@ -992,7 +1007,10 @@ def identify_tamperer(prog_id):
             return name, "high"
     # 从注册表查ProgId的友好名称
     try:
-        friendly, _ = reg_read_value(HKCR, prog_id, "")
+        if HKCU_REMAPPED:
+            friendly, _ = read_hkcr_effective(prog_id, "")
+        else:
+            friendly, _ = reg_read_value(HKCR, prog_id, "")
         if friendly and len(friendly) < 60:
             return friendly, "medium"
     except Exception:
@@ -1693,7 +1711,7 @@ class ProtectionEngine:
                 self.baseline.save()
                 log_event(ext, "UserChoice", "Hash过期", "已自动回退到系统默认关联(HKCR)")
         # 确保 HKCR/.ext 默认值正确（系统回退关联）
-        hkcr_val = reg_read_value(HKCR, ext, "")[0]
+        hkcr_val = read_hkcr_effective(ext, "")[0]
         if hkcr_val:
             log_event(ext, "关联", "回退", f"使用HKCR默认:{hkcr_val}")
         self.reset_uc_failure(ext)
@@ -1714,7 +1732,7 @@ class ProtectionEngine:
         bl_uc_hash = bl.get("userchoice_hash", {}).get("value")
         uc_baseline_none = (bl_uc_progid is None and bl_uc_hash is None)
 
-        hkcr_default = reg_read_value(HKCR, ext, "")[0]
+        hkcr_default = read_hkcr_effective(ext, "")[0]
         uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
         cur_uc_progid = reg_read_value(HKCU, uc_path, "ProgId")[0]
         cur_uc_hash = reg_read_value(HKCU, uc_path, "Hash")[0]
@@ -1749,7 +1767,11 @@ class ProtectionEngine:
                 continue
 
             name = bl_item.get("name", "")
-            cur_val, cur_type = reg_read_value(root, path, name)
+            if str(root_name) == "HKCR" and HKCU_REMAPPED:
+                # TI 下 HKCR 不含用户 HKCU\Software\Classes 覆盖，用合并视图
+                cur_val, cur_type = read_hkcr_effective(path, name)
+            else:
+                cur_val, cur_type = reg_read_value(root, path, name)
 
             if key == "userchoice_progid" and cur_val is None and cur_uc_progid is not None:
                 cur_val = cur_uc_progid
@@ -1780,7 +1802,10 @@ class ProtectionEngine:
                 root = ROOT_MAP.get(root_name)
                 if root is None:
                     continue
-                cmd_val, _ = reg_read_value(root, reg_path, "")
+                if root_name == "HKCR" and HKCU_REMAPPED:
+                    cmd_val, _ = read_hkcr_effective(reg_path, "")
+                else:
+                    cmd_val, _ = reg_read_value(root, reg_path, "")
                 if cmd_val is not None:
                     mismatches.append(("new_progid_command", f"(基准:{bl_prog_id})",
                                        f"{root_name} {cur_prog_id} -> {cmd_val}", None))
@@ -1886,16 +1911,29 @@ class ProtectionEngine:
                 continue
 
             if target_val is None and target_type is None:
-                if reg_delete_value(root, path, name):
+                del_ok = reg_delete_value(root, path, name)
+                extra_del = ""
+                if del_ok and str(root_name) == "HKCR" and HKCU_REMAPPED:
+                    if reg_delete_value(HKCU, "Software\\Classes\\" + path, name):
+                        extra_del = "(含用户HKCU)"
+                if del_ok:
                     success += 1
-                    details.append(f"{self.ITEM_LABELS.get(key, key)}:已删除")
+                    details.append(f"{self.ITEM_LABELS.get(key, key)}:已删除{extra_del}")
                 else:
                     fail += 1
                     details.append(f"{self.ITEM_LABELS.get(key, key)}:删除失败")
             else:
-                if reg_write_value(root, path, name, target_val, target_type):
+                write_ok = reg_write_value(root, path, name, target_val, target_type)
+                extra_note = ""
+                if write_ok and str(root_name) == "HKCR" and HKCU_REMAPPED:
+                    # TI 下 HKCR 不含用户 HKCU\Software\Classes 覆盖；
+                    # 同步写/删用户 HKCU 保证恢复值真实生效
+                    user_path = "Software\\Classes\\" + path
+                    if reg_write_value(HKCU, user_path, name, target_val, target_type):
+                        extra_note = "(含用户HKCU)"
+                if write_ok:
                     success += 1
-                    details.append(f"{self.ITEM_LABELS.get(key, key)}:已恢复")
+                    details.append(f"{self.ITEM_LABELS.get(key, key)}:已恢复{extra_note}")
                 else:
                     fail += 1
                     details.append(f"{self.ITEM_LABELS.get(key, key)}:恢复失败(权限不足?)")
@@ -1935,7 +1973,10 @@ class ProtectionEngine:
             prog_id = get_prog_id(ext)
             has_cmd = False
             if prog_id:
-                has_cmd = reg_read_value(HKCR, f"{prog_id}\\shell\\open\\command", "")[0] is not None
+                if HKCU_REMAPPED:
+                    has_cmd = read_hkcr_effective(f"{prog_id}\\shell\\open\\command", "")[0] is not None
+                else:
+                    has_cmd = reg_read_value(HKCR, f"{prog_id}\\shell\\open\\command", "")[0] is not None
             if has_uc or has_cmd:
                 suspicious_new.append(ext)
 
@@ -1986,7 +2027,10 @@ class ProtectionEngine:
                     root = ROOT_MAP.get(root_name)
                     if root is None:
                         continue
-                    cmd_val, _ = reg_read_value(root, reg_path, "")
+                    if root_name == "HKCR" and HKCU_REMAPPED:
+                        cmd_val, _ = read_hkcr_effective(reg_path, "")
+                    else:
+                        cmd_val, _ = reg_read_value(root, reg_path, "")
                     if cmd_val is None:
                         issues.append((ext_name, f"无效关联: {prog_id} 命令缺失"))
                         break
