@@ -2587,6 +2587,7 @@ class MonitorThread(threading.Thread):
         self._last_hunt_check = 0
         self._last_lock_stats_log = 0
         self._notify_extra_seconds = 0  # 批量篡改触发后弹窗额外时长（秒）
+        self.last_cycle_ts = time.time()  # 监控周期心跳：主线程看门狗据此检测监控线程是否卡死/死亡
 
     def _verify_hkcu_mapping(self):
         """运行时验证HKCU是否正确映射到用户配置单元，失败则自动重映射。
@@ -2620,6 +2621,7 @@ class MonitorThread(threading.Thread):
     def run(self):
         logger.info("监控线程启动")
         while not self._stop_event.is_set():
+            self.last_cycle_ts = time.time()  # 心跳：每轮周期更新
             mode = self.baseline.config.get("operation_mode", "normal")
             if mode == "paused":
                 self._pause_event.set()
@@ -5286,7 +5288,8 @@ class MainWindow:
         self._append_log("无响应监测已启动（超时30秒自动重启）", "info")
 
     def _watchdog_loop(self):
-        """看门狗循环：每5秒检查一次心跳，超过30秒无响应则自动重启"""
+        """看门狗循环：每5秒检查一次主线程心跳（30秒超时自动重启）；
+        同时监测监控线程周期心跳，卡死/死亡则告警并重启监控（防保护静默失效）"""
         while not self._watchdog_stop.is_set():
             time.sleep(5)
             if self._exiting:
@@ -5308,6 +5311,38 @@ class MainWindow:
                 time.sleep(1)
                 os._exit(1)
                 break
+            # 监控线程心跳检查：保护静默失效检测
+            mon = self.monitor
+            if mon is not None:
+                if not mon.is_alive():
+                    log_event("SYSTEM", "监控", "异常", "监控线程已退出，保护已静默失效，正在重启...")
+                    self._restart_monitor("监控线程已退出")
+                elif time.time() - mon.last_cycle_ts > 30:
+                    log_event("SYSTEM", "监控", "异常", f"监控线程卡死{time.time()-mon.last_cycle_ts:.0f}秒无心跳，正在重启...")
+                    self._restart_monitor("监控线程卡死")
+
+    def _restart_monitor(self, reason):
+        """重启监控线程（幂等）：安全停止旧线程后重新创建"""
+        try:
+            old = self.monitor
+            if old is not None:
+                old._stop_event.set()
+                try:
+                    old.join(timeout=3)
+                except Exception:
+                    pass
+            self.monitor = MonitorThread(
+                self.engine, self.baseline_mgr,
+                popup_callback=self._show_notification,
+                log_callback=self._append_log,
+                root=self.root
+            )
+            self.monitor.start()
+            self._append_log(f"监控线程已重启（原因：{reason}）", "warn")
+            log_event("SYSTEM", "监控", "重启", f"原因={reason}")
+        except Exception as e:
+            self._append_log(f"监控线程重启失败: {e}", "error")
+            log_event("SYSTEM", "监控", "重启失败", str(e))
 
     def _stop_watchdog(self):
         """停止看门狗"""
