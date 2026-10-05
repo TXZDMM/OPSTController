@@ -7651,6 +7651,45 @@ def is_admin():
         return False
 
 
+def _force_kill_all_opst():
+    """管理员+SeDebug 强杀所有 OPSTcontroller 进程（排除自身）。
+    自我保护实例对普通令牌返回 ACCESS_DENIED；管理员启用 SeDebugPrivilege
+    后可绕过 Deny ACL 完成 TerminateProcess（与 kill_admin.py 同机制）。"""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        enable_all_privileges()
+        self_pid = os.getpid()
+        TH32CS_SNAPPROCESS = 0x00000002
+        class _PE32(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_void_p),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (-1, 0):
+            return 0
+        killed = 0
+        pe = _PE32()
+        pe.dwSize = ctypes.sizeof(_PE32)
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(pe)):
+            while True:
+                if pe.szExeFile.lower() == "opstcontroller.exe" and pe.th32ProcessID != self_pid:
+                    h = kernel32.OpenProcess(0x1001, False, pe.th32ProcessID)  # TERMINATE|QUERY
+                    if h:
+                        if kernel32.TerminateProcess(h, 1):
+                            killed += 1
+                        kernel32.CloseHandle(h)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(pe)):
+                    break
+        kernel32.CloseHandle(snapshot)
+        return killed
+    except Exception:
+        return -1
+
+
 def run_as_admin():
     """以管理员权限重新启动程序"""
     try:
@@ -8500,7 +8539,28 @@ def main():
         except Exception:
             pass
 
-    # 处理 --stop 命令：向运行中的实例发送退出信号
+    # 处理 --stop 命令：向运行中的实例发送退出信号。
+    # 自我保护实例（TI/SYSTEM + Deny ACL）无法被普通令牌终止：
+    # 信号（命名事件跨会话不可见）与 taskkill 均失败时，
+    # 自动经 runas 提升到管理员执行 --stop-admin 强杀（SeDebug+TerminateProcess）。
+    if "--stop-admin" in sys.argv:
+        _killed = _force_kill_all_opst()
+        print(f"--stop-admin: 已终止 {_killed} 个 OPSTcontroller 进程")
+        time.sleep(2)
+        # 同样清理 _MEI 残留并跳过 bootloader 清理（防弹窗）
+        try:
+            time.sleep(3)
+            _cur_mei = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
+            for _d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+                try:
+                    if _cur_mei and os.path.normcase(os.path.abspath(_d)) == _cur_mei:
+                        continue
+                    shutil.rmtree(_d, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        os._exit(0)
     if "--stop" in sys.argv or "/stop" in sys.argv:
         signaled = signal_exit()
         if signaled:
@@ -8531,6 +8591,26 @@ def main():
                 _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
                               capture_output=True)
                 print("已发送强制终止命令。")
+        # 信号/taskkill 可能对自我保护实例无效：若进程仍在，
+        # 提升到管理员执行 --stop-admin 强杀
+        try:
+            time.sleep(2)
+            r = _run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe'],
+                               capture_output=True, text=True)
+            if 'OPSTcontroller.exe' in r.stdout:
+                print("自我保护实例仍存活，提升管理员权限强制终止...")
+                if is_admin():
+                    _killed = _force_kill_all_opst()
+                    print(f"已终止 {_killed} 个进程")
+                else:
+                    try:
+                        ctypes.windll.shell32.ShellExecuteW(
+                            None, "runas", sys.executable, "--stop-admin", None, 1)
+                        print("已请求管理员权限执行 --stop-admin（UAC 关闭时自动提权）")
+                    except Exception as e:
+                        print(f"提权请求失败: {e}")
+        except Exception:
+            pass
         # 短暂等待，让安全软件完成对 _MEI 解压文件的扫描，
         # 避免 PyInstaller 退出清理时文件被锁定导致"Failed to remove temporary directory"弹窗
         try:

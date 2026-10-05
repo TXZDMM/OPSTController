@@ -1,0 +1,9 @@
+﻿python.exe : [Errno 13] Permission denied: 'C:\\Users\\TXZDM\\AppData\\Local\\Doubao\\User Data\\sandbox_runtime\\.cach
+e\\python\\pyc-cache\\Users\\TXZDM\\Desktop\\OPSTController-main\\OPSTController_root\\extension_protector.cpython-313.
+pyc.1762132755152'
+所在位置 行:1 字符: 96
++ ... ython.exe'; & $py -m py_compile 'C:\Users\TXZDM\Desktop\OPSTControlle ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([Errno 13] Perm....1762132755152':String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
