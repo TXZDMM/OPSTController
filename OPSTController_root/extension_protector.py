@@ -4685,7 +4685,7 @@ class MainWindow:
         # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 诊断 / 设置（日志页保留但不再出现在导航，从设置页进入）
         for key, text in [("home", "状态"), ("exts", "扩展名"),
                           ("history", "防护记录"), ("tools", "异常修复"),
-                          ("diag", "诊断"), ("settings", "设置")]:
+                          ("diag", "诊断"), ("config", "配置与备份"), ("settings", "设置")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -4712,6 +4712,7 @@ class MainWindow:
         self._build_page_history(content)
         self._build_page_tools(content)
         self._build_page_diag(content)
+        self._build_page_config(content)
         self._build_page_log(content)
         self._build_page_settings(content)
         # 所有页面构建完成后，统一收集可滚动小项并绑定“单击激活”滚轮逻辑
@@ -7749,6 +7750,215 @@ class MainWindow:
             messagebox.showinfo(APP_NAME, f"诊断报告已保存到:\n{path}")
         except Exception as e:
             messagebox.showerror(APP_NAME, f"保存失败: {e}")
+
+    # =====================================================================
+    # 页面：配置与备份 —— 一键备份/恢复配置、导出导入黑白名单
+    # =====================================================================
+    def _build_page_config(self, parent):
+        """页面：配置与备份 —— 一键备份/恢复配置文件，导出/导入黑白名单"""
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["config"] = page
+        self._mk_page_header(page, "配置与备份",
+                             "备份/恢复全部配置（基准、锁定、黑白名单），导出导入名单以便迁移")
+        body = self._mk_scroll_container(page)
+        dark = self.C
+
+        # 节1：一键备份 / 恢复
+        sec, cb = self._mk_card(body, "配置备份与恢复",
+            "备份包含：基准快照、锁定配置、黑白名单、识别库与防护记录；恢复后建议重启程序生效")
+        ops = tk.Frame(cb, bg=dark["card"])
+        ops.pack(fill="x", pady=(0, 6))
+        self._mk_button(ops, "一键备份配置", self._cfg_backup, kind="primary", small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "从备份恢复", self._cfg_restore, small_adapt=True).pack(side="left")
+        self._cfg_status = tk.Label(cb, text="尚未操作。点击「一键备份配置」打包全部设置；「从备份恢复」导入先前备份。",
+                                    font=("微软雅黑", 9), fg=dark["text2"], bg=dark["card"],
+                                    anchor="w", justify="left", wraplength=620)
+        self._cfg_status.pack(fill="x", pady=(4, 0))
+
+        # 节2：黑白名单迁移
+        sec2, cb2 = self._mk_card(body, "黑白名单迁移",
+            "导出当前白名单/黑名单/锁定配置为 JSON 文件，可在其他电脑上导入")
+        ops2 = tk.Frame(cb2, bg=dark["card"])
+        ops2.pack(fill="x", pady=(0, 6))
+        self._mk_button(ops2, "导出名单与锁定", self._cfg_export_lists, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(ops2, "导入名单与锁定", self._cfg_import_lists, small_adapt=True).pack(side="left")
+
+        # 节3：当前配置概览
+        sec3, cb3 = self._mk_card(body, "当前配置概览",
+            "实时统计当前受保护范围与运行配置规模")
+        self._cfg_overview = tk.Text(cb3, font=("Consolas", 9), height=10, wrap="word",
+                                     bg=dark["btn"], fg=dark["text"], relief="flat",
+                                     highlightthickness=0, state="disabled")
+        self._cfg_overview.pack(fill="x")
+        self._cfg_refresh_overview()
+
+    def _cfg_refresh_overview(self):
+        """刷新当前配置概览（无副作用，仅读取统计）"""
+        try:
+            cfg = self.baseline_mgr.config or {}
+            locked = cfg.get("locked_defaults", {}) or {}
+            wl_ext = cfg.get("whitelist_exts", []) or []
+            wl_prog = cfg.get("whitelist_programs", []) or []
+            bl_prog = cfg.get("blacklist_programs", []) or []
+            baseline = self.baseline_mgr.baseline or {}
+            n_names = 0
+            try:
+                import json as _json
+                with open(PROGRAM_NAMES_FILE, "r", encoding="utf-8") as _f:
+                    n_names = len(_json.load(_f) or {})
+            except Exception:
+                n_names = 0
+            lines = [
+                f"基准规模      : {len(baseline)} 个扩展名（基准时间: {cfg.get('baseline_time', '无')}）",
+                f"单扩展名锁定  : {len(locked)} 个",
+                f"白名单扩展名  : {len(wl_ext)} 个",
+                f"白名单程序    : {len(wl_prog)} 个（{'、'.join(str(x) for x in wl_prog[:6])}{'…' if len(wl_prog) > 6 else ''}）",
+                f"黑名单程序    : {len(bl_prog)} 个",
+                f"识别库        : {n_names} 条软件名称",
+                f"运行模式      : {cfg.get('operation_mode', 'normal')}    弹窗: {'开' if cfg.get('show_popup', True) else '关'}",
+                f"默认权限级别  : {cfg.get('default_permission', 't')}    审计级别: {cfg.get('audit_level', 'normal')}",
+                f"基准保留版本  : {cfg.get('history_versions', MAX_HISTORY_VERSIONS)} 份",
+            ]
+            self._cfg_overview.configure(state="normal")
+            self._cfg_overview.delete("1.0", tk.END)
+            self._cfg_overview.insert(tk.END, "\n".join(lines) + "\n")
+            self._cfg_overview.configure(state="disabled")
+        except Exception as e:
+            logger.warning(f"刷新配置概览失败: {e}")
+
+    def _cfg_backup(self):
+        """一键备份配置：打包 config/baseline/识别库/防护记录 到用户选择的 zip"""
+        try:
+            import zipfile
+            from datetime import datetime as _dt
+            stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+            path = filedialog.asksaveasfilename(
+                title="备份配置", defaultextension=".zip",
+                initialfile=f"OPSTconfig-backup-{stamp}.zip",
+                filetypes=[("ZIP压缩包", "*.zip"), ("所有文件", "*.*")])
+            if not path:
+                return
+            ud = USERDATA_DIR
+            files = []
+            for name in ("config.json", "baseline.json", "program_names.json", "change_history.json", "protector.log"):
+                fp = os.path.join(ud, name)
+                if os.path.exists(fp):
+                    files.append(fp)
+            hist = os.path.join(ud, "baseline_history")
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                for fp in files:
+                    z.write(fp, os.path.join("userdata", os.path.basename(fp)))
+                if os.path.isdir(hist):
+                    for root, _, fs in os.walk(hist):
+                        for f in fs:
+                            full = os.path.join(root, f)
+                            z.write(full, os.path.join("userdata", "baseline_history", f))
+                z.writestr("backup_info.txt",
+                           f"OPSTcontroller v{APP_VERSION} 配置备份\n时间: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                           f"包含: {'、'.join(os.path.basename(f) for f in files)}\n")
+            self._cfg_status.config(text=f"备份完成，已保存到:\n{path}", fg=self.C["success"])
+            self._append_log(f"配置备份完成: {path}", "success")
+        except Exception as e:
+            self._cfg_status.config(text=f"备份失败: {e}", fg=self.C["error"])
+            messagebox.showerror(APP_NAME, f"备份失败: {e}")
+
+    def _cfg_restore(self):
+        """从备份 zip 恢复配置（先备份当前，再解压覆盖；提示重启生效）"""
+        try:
+            import zipfile
+            path = filedialog.askopenfilename(
+                title="选择配置备份", filetypes=[("ZIP压缩包", "*.zip"), ("所有文件", "*.*")])
+            if not path:
+                return
+            # 先备份当前配置（防误操作）
+            try:
+                ud = USERDATA_DIR
+                cur = os.path.join(ud, "config.json")
+                if os.path.exists(cur):
+                    import shutil
+                    shutil.copy2(cur, os.path.join(ud, "config.before_restore.json"))
+            except Exception:
+                pass
+            with zipfile.ZipFile(path, "r") as z:
+                bad = z.testzip()
+                if bad is not None:
+                    raise IOError(f"备份包损坏（{bad}）")
+                names = z.namelist()
+                if not any(n.endswith("config.json") for n in names):
+                    raise IOError("该备份包不包含 config.json，不是有效的配置备份")
+                z.extractall(USERDATA_DIR)
+            # 恢复后重载内存配置与基准
+            try:
+                self.baseline_mgr.load()
+                self._refresh_locked_ext_list()
+                self._cfg_refresh_overview()
+            except Exception as e:
+                logger.warning(f"恢复后重载配置失败: {e}")
+            self._cfg_status.config(
+                text=f"已从备份恢复配置，建议重启程序使全部设置生效（当前内存已重载）", fg=self.C["success"])
+            self._append_log(f"已从备份恢复配置: {path}", "success")
+        except Exception as e:
+            self._cfg_status.config(text=f"恢复失败: {e}", fg=self.C["error"])
+            messagebox.showerror(APP_NAME, f"恢复失败: {e}")
+
+    def _cfg_export_lists(self):
+        """导出白名单/黑名单/锁定配置为 JSON（用于迁移）"""
+        try:
+            cfg = self.baseline_mgr.config or {}
+            payload = {
+                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "app_version": APP_VERSION,
+                "whitelist_exts": cfg.get("whitelist_exts", []),
+                "whitelist_programs": cfg.get("whitelist_programs", []),
+                "blacklist_programs": cfg.get("blacklist_programs", []),
+                "locked_defaults": cfg.get("locked_defaults", {}),
+            }
+            path = filedialog.asksaveasfilename(
+                title="导出名单与锁定", defaultextension=".json",
+                initialfile="opst-lists-export.json",
+                filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._cfg_status.config(text=f"名单已导出:\n{path}", fg=self.C["success"])
+            self._append_log(f"已导出名单与锁定配置: {path}", "success")
+        except Exception as e:
+            self._cfg_status.config(text=f"导出失败: {e}", fg=self.C["error"])
+            messagebox.showerror(APP_NAME, f"导出失败: {e}")
+
+    def _cfg_import_lists(self):
+        """导入白名单/黑名单/锁定配置 JSON（合并导入，不删除现有项）"""
+        try:
+            path = filedialog.askopenfilename(
+                title="选择名单导出文件", filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict) or "export_time" not in payload:
+                raise IOError("该文件不是有效的名单导出文件")
+            cfg = self.baseline_mgr.config
+            for key in ("whitelist_exts", "whitelist_programs", "blacklist_programs"):
+                vals = payload.get(key, []) or []
+                cur = cfg.setdefault(key, [])
+                for v in vals:
+                    if v not in cur:
+                        cur.append(v)
+            ld = payload.get("locked_defaults", {}) or {}
+            locked = cfg.setdefault("locked_defaults", {})
+            for ext, progid in ld.items():
+                if ext not in locked:
+                    locked[ext] = progid
+            self.baseline_mgr.save_config()
+            self._cfg_refresh_overview()
+            self._cfg_status.config(
+                text=f"导入完成（合并方式）: 白名单扩展名{len(cfg.get('whitelist_exts', []))}个 / 白名单程序{len(cfg.get('whitelist_programs', []))}个 / 锁定{len(locked)}个",
+                fg=self.C["success"])
+            self._append_log(f"已导入名单与锁定配置: {path}", "success")
+        except Exception as e:
+            self._cfg_status.config(text=f"导入失败: {e}", fg=self.C["error"])
+            messagebox.showerror(APP_NAME, f"导入失败: {e}")
 
     def _show_settings(self):
         """设置对话框（兼容旧调用）：直接切换到主窗口「设置」页"""
