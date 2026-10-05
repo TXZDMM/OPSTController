@@ -1,0 +1,7 @@
+﻿PASS button consent visible | x=14 w=86
+PASS button pause_min visible | x=108 w=116
+PASS button forever visible | x=232 w=85
+PASS buttons inside toast width | max_right=317 toast_w=440
+PASS toast height adaptive | h=253
+PASS hint label exists | wraplength=400
+ALL DONE

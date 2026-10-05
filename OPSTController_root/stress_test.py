@@ -19,7 +19,8 @@ rounds = 0
 while time.time() - start < 150 and rounds < 40:
     ext = EXTS[rounds % len(EXTS)]
     evil = f"evil_pid{rounds % 7}"
-    r = subprocess.run(["reg", "add", f"HKCR\\{ext.lstrip('.')}", "/ve", "/d", evil, "/f"],
+    # 关键：保留扩展名开头的点（监控保护的是带点的 ".ext" 注册表键）
+    r = subprocess.run(["reg", "add", f"HKCR\\{ext}", "/ve", "/d", evil, "/f"],
                        capture_output=True, text=True)
     rounds += 1
     time.sleep(2.0)  # let monitor notice between injections
@@ -33,6 +34,10 @@ out = [f"rounds={rounds} elapsed={int(time.time()-start)}s",
        f"detect={detect} restore_ok={restore}",
        "---last12---"]
 out.extend(last)
-with open(r"C:\Users\TXZDM\Desktop\OPSTController-main\OPSTController_root\stress_out.txt", "w", encoding="utf-8") as f:
-    f.write("\n".join(out))
+# 输出重定向冲突规避：写入独立结果文件（脚本外部重定向到 stress_out.txt 时避免自锁）
+try:
+    with open(r"C:\Users\TXZDM\Desktop\OPSTController-main\OPSTController_root\stress_result.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+except Exception:
+    print("\n".join(out))
 print("done")
