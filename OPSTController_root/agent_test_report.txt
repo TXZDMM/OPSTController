@@ -1,0 +1,165 @@
+====================================================================
+OPSTcontroller v0.8.1 —— 独立测试与验收报告
+（单扩展名锁定强锁升级专项；分派多智能体并行测试）
+测试时间: 2026-10-06 02:50–03:30 (UTC+8)
+执行模式: 完全访问；只测不改
+====================================================================
+
+【测试对象与版本说明（重要）】
+  被测文件: C:\Users\TXZDM\Desktop\OPSTController-main\OPSTController_root\extension_protector.py
+  解释器:   C:\Users\TXZDM\Desktop\OPSTController-main\OPSTController_root\.venv\Scripts\python.exe (Python 3.13.5)
+  注意: 源码在测试窗口内被并行修改（开始前 9135 行 → 测试中段 9523行/449746字节 →
+        03:12:54 版 459268字节 → 本报告落盘时 459274字节/03:22:30/SHA256 474F94AD906DA7E5D7E6A763FAEC878D50BC7F9EFAE9E614E3E9024D54D6102B）。
+        本报告各证据标注对应文件状态；"当前状态"一律指 03:22:30 版本，行号可能继续漂移，
+        关键结论以行内容为准。
+
+【约束遵守声明】
+  - 未修改 extension_protector.py 及任何 ui_test*.py（只测不改）；未执行 git push；
+    未删除/移动用户文件；未运行 stress_test.py / make_zip.py；未重打 zip。
+  - 未对运行中 OPSTcontroller 进程做任何操作（全程未 Stop-Process；PID 16256/17816
+    存活期间未触碰，其消失/重启为 live app 自身行为）。
+  - 真实 userdata\config.json 与 baseline.json SHA256 测试前后完全一致
+    (9F9CF8E4161DE2FFA9F710076C3A478C7FF86B51E49970FBA2B94D63D9E96FD2 /
+    E36D3208BF400D0B0B14F4AB52B275F5A314D8E381975B62BB84B1CBD4BCCB00)，未改动。
+
+====================================================================
+一、静态回归（路径A） —— 全部通过
+--------------------------------------------------------------------
+  A1  ast.parse 语法检查                PASS（无语法错误）
+  A2  ui_test5.py                       PASS（small-adapt OK / flow-wrap OK / ALL DONE）
+  A3  ui_test6.py                       PASS（6 条 PASS + ALL DONE）
+  A4  ui_test7.py                       PASS（TOTAL_BUTTONS=60 / WITHOUT_COMMAND=0 /
+                                          NAV_FAILS=0 / REPAIR_BUTTON_OK / SMALL_ADAPT_OK / ALL DONE）
+  A5  最新源码（03:22:30 版）上重跑      PASS（结果与 A2-A4 完全一致，无回归）
+  说明: ui_test7 对按钮总数【无硬编码期望值】——TOTAL_BUTTONS 为运行时动态遍历统计，
+        任务书历史参考值 51 已随新功能增为 60（含锁定面板 3 个新增按钮：解锁选中/解锁全部/
+        刷新状态），不存在"期望值过期"问题；是否将 60 作为回归基线由 MainAgent 决定。
+  输出: OPSTController_root\ui_test5_out.txt / ui_test6_out.txt / ui_test7_out.txt
+
+====================================================================
+二、锁定语义真机测试（路径B，重点） —— 核心语义链路验证通过；
+   受权限影响的落盘项如实记录"需 TI 真机验证"；并命中 1 个严重缺陷（见五#1）
+--------------------------------------------------------------------
+  测试脚本: OPSTController_root\lock_semantics_test.py（保留，可复用）
+  隔离方法: import 后立即重定向 USERDATA_DIR/CONFIG_FILE/BASELINE_FILE/HISTORY_DIR/
+            LOG_FILE/PROGRAM_NAMES_FILE 至临时目录 _locktest_tmp\（已删除），
+            注册表根句柄保持真实；日志 handler 改挂临时文件。
+  虚构扩展名: .zzztest999（ProgId=TestProgId）；未触碰任何真实扩展名。
+
+  B1  锁定优先分支（recover_extension 命中 locked_defaults → _recover_locked）  通过
+      （1976-1981 行命中锁定表；未返回"基准不存在"；traceback 行号 1981→2117 佐证）
+  B2  UserChoice 删除（键不存在即成功）                                          通过
+      force_delete_userchoice('.zzztest999') 精确返回 (True, '键已不存在(无需删除)')
+  B3  HKCR 默认值写入（=锁定应用）       未达成（两层原因，均如实记录）
+      - 本进程非提权（TokenElevation=False），HKCR 新键落 HKLM\Software\Classes，
+        普通令牌写 = [WinError 5] 拒绝访问
+        => 需 TI/管理员权限，真机验证由 MainAgent 执行
+      - 且命中缺陷: 03:12:54 版 2117 行裸 KEY_SET_VALUE → NameError（见五#1）
+  B4  OpenWithProgids 加入锁定应用       未出现（写失败被 2131 行 except OSError: pass
+      吞掉，details 无诊断行；同为权限所致；诊断不可见问题见五#6）
+  B5  基准同步锁定态（update_extension）                                         通过
+  B6  create_baseline 后锁定重新落实（_reapply_locked_defaults）
+      - config['locked_defaults'] 保持原值不变                                   通过
+      - 基准中 '.zzztest999' 被同步                                             通过
+      - HKCR 重新落实写入                                                       未落地
+        （a) 03:12:54 版 1477 行同样 NameError，被 except Exception: continue 静默吞掉，
+            发布版行为 = 重建基准后重新锁定【静默失效】；b) 测试进程注入 KEY_SET_VALUE
+            后仍 WinError 5（非提权））
+  B7  _handle_change 锁定扩展名静默强制恢复（不弹窗）                             通过
+      - _recover_with_verify 被调用 1 次；log_callback 收到原文
+        "[info] .zzztest999 已按锁定目标强制恢复: TestProgId（锁定中，不弹窗）"；
+        popup 零调用（对应 3145-3154 行）
+  B8  _handle_change 非锁定扩展名 allowed_this_cycle 短路
+      （锁定判断先于"本周期已同意"判断）                                          通过
+      - _recover_with_verify 调用次数=0，log/popup 零调用（对应 3156-3157 行）
+  B9  清理证明                                                                    通过
+      - HKCR/HKCU\Software\Classes/HKLM\SOFTWARE\Classes 下 .zzztest999
+        三根 Test-Path 全 False；临时目录 _locktest_tmp\ 已删除
+  B10 权限状态如实记录（测试项5）
+      - 本进程 TokenElevation=False（非提权）；HKCU_REMAPPED=False；
+        HKCR 新键落 HKLM → 非提权必然 WinError 5 → 所有 HKCR 写入步骤
+        "需 TI/管理员权限，真机验证由 MainAgent 执行"；读注册表/HKCU 判定不受限
+      - 注意: 即便提权成功，NameError（五#1）也会先于权限问题抛出，是发布版第一道闸
+
+====================================================================
+三、锁定面板 UI 验证（路径C） —— 5 项全部通过
+--------------------------------------------------------------------
+  C1  按钮绑定核查                        通过（5 按钮均存在且 command 非空:
+      读取当前/锁定当前默认应用/解锁选中/解锁全部/刷新状态；_mk_button 4822 行
+      command=command 直传；5 个处理器方法均有 def；动态探针 present=True×5）
+  C2  状态显示逻辑                        通过（✓一致 / ✗当前=cur / ○系统默认(待落实)
+      三分支与大小写不敏感比较正确；数据源 config['locked_defaults']；
+      面板构建末尾调用 _refresh_locked_ext_list 初始化列表）
+  C3  重复锁定/更新提示                   通过（同值→"无需重复锁定"并 return；
+      异值→"更新锁定目标: A → B"；save_config 与 update_extension 均调用）
+  C4  解锁同步基准                        通过（解锁选中/解锁全部均 save_config，
+      且对每个解锁扩展名调用 update_extension）
+  C5  动态回归                            通过（ui_test7: TOTAL_BUTTONS=60 /
+      WITHOUT_COMMAND=0 / NAV_FAILS=0 / ALL DONE；新增按钮已计入且绑定有效；
+      ui_test5 small-adapt OK 复核按钮行不溢出）
+
+====================================================================
+四、权限与特权状态（如实说明，无伪造）
+--------------------------------------------------------------------
+  - 本轮所有测试进程均为【非提权】普通令牌；NSudo TrustedInstaller 提权链未实际触发。
+    涉及 HKCR/HKLM 写入的步骤（锁定恢复落盘、基准重建后重新落实锁定）在普通令牌下
+    必然 WinError 5 —— 按铁律如实记录为"需 TI 权限，真机验证由 MainAgent 执行"。
+  - 不依赖提权的行为（分支/判定/删除/基准同步/静默路径/UI 绑定/动态回归）结论有效。
+
+====================================================================
+五、其他问题清单（发现的问题/风险，仅记录未修改）
+--------------------------------------------------------------------
+#1 【严重】裸 KEY_SET_VALUE 未定义 —— 强锁定核心路径崩溃/静默失效
+   [当前状态 03:22:30 版] 1477 行仍为裸 KEY_SET_VALUE；
+   2117/2127 行已被并行修改修复为 KEY_SET_VALUE_64（实时观测到修复进行中）。
+   模块仅 127 行定义 KEY_SET_VALUE_64（=winreg.KEY_SET_VALUE|KEY_WOW64_64KEY）。
+   - 1477 行（_reapply_locked_defaults）: NameError 被 except Exception: continue
+     吞掉 → 基准重建后 HKCR 重新锁定【静默失效】，无任何日志。
+   - （历史）03:12:54 版 2117 行（_recover_locked）: NameError 逃逸出 try/except OSError
+     → recover_extension 直接抛异常，锁定恢复崩溃（traceback 原文见
+     lock_semantics_result.txt）。
+   建议: 1477 行改为 KEY_SET_VALUE_64，并全文件搜索确认无其他裸用
+   （8268/8310 行为合格的 winreg.KEY_SET_VALUE 限定用法，475 行为 KEY_SET_VALUE_64，均不受影响）。
+
+#2 【中】"更新锁定目标: A → B"提示被立即覆盖不可见（5434-5435 行无条件覆盖状态文本；
+   功能正常执行，仅文案可见性问题）。建议异值分支区分"新增锁定/更新锁定"文案。
+
+#3 【低】三处 update_extension 基准同步异常被 except: pass 静默吞掉
+   （锁定 5428-5431 / 解锁选中 5454-5457 / 解锁全部 5475-5479 行）：
+   配置已保存但基准未同步时界面仍提示成功且无日志。建议至少追加 warn 日志。
+
+#4 【低】_refresh_locked_ext_list 内层 get_prog_id 异常被吞（5380-5381 行），
+   "查询失败"与"一致"无法区分。
+
+#5 【低】_lock_ext_unlock 未选中任何项时直接 return（5442-5444 行），无任何反馈。
+
+#6 【低】OpenWithProgids 写失败被 except OSError: pass 吞掉（2131 行），
+   details 无诊断行，失败原因不可见；建议失败时至少记日志。
+
+#7 【提示】构建产物过期: _dist_tmp\OPSTcontroller.exe 与发行版 exe 时间戳 02:42:35，
+   落后于源码 03:12:54→03:22:30 的持续修改；当前发布包未包含本轮锁定修复。
+
+#8 【提示】源码在测试期间被并行修改（9135→9522 行，多次 mtime），行号可能继续漂移；
+   本报告关键缺陷以行内容为准。另发现未跟踪新文件 ui_test8.py / ui_test8_out.txt
+   （疑似并行开发中的测试，测试方未触碰）。
+
+#9 【背景】开发 config 当前 locked_defaults 为空（新功能尚未启用任何锁定项）；
+   git HEAD = c32fd4a（"防护记录/系统诊断"两大菜单已提交）；release userdata
+   与开发 userdata 相互独立（运行中实例不受开发测试影响）。
+
+====================================================================
+六、未覆盖项（如实声明）
+--------------------------------------------------------------------
+  - stress_test.py 篡改压力测试: 未运行（可能触发真实监控实例反应并弹窗打扰用户，且任务书未要求）
+  - exe 可执行文件启动: 未启动（与运行中实例单实例互斥，会激活既有窗口打扰用户）
+  - zip 打包/完整性校验: 未执行（任务书明确不重打 zip）
+  - TI 提权下的真实落盘: 未执行（非提权进程无法完成，需 MainAgent 真机验证）
+
+====================================================================
+七、证据文件清单
+--------------------------------------------------------------------
+  本报告    : OPSTController_root\agent_test_report.txt
+  静态回归  : OPSTController_root\ui_test5_out.txt / ui_test6_out.txt / ui_test7_out.txt
+  语义测试  : OPSTController_root\lock_semantics_test.py（脚本保留）
+  各智能体交付: run_summary.txt / lock_semantics_result.txt / ui_lock_result.txt
+====================================================================

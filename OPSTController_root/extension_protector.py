@@ -1477,7 +1477,7 @@ class BaselineManager:
                 with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE_64) as k:
                     winreg.SetValueEx(k, None, 0, winreg.REG_SZ, progid)
                 try:
-                    self.update_extension(ext)  # 同步基准为锁定态
+                    self.update_extension(ext, reason="锁定重落实")  # 同步基准为锁定态
                 except Exception:
                     pass
                 ok += 1
@@ -1552,16 +1552,16 @@ class BaselineManager:
             log_event("ALL", "恢复历史基准", "失败", str(e))
             return False
 
-    def update_extension(self, ext):
+    def update_extension(self, ext, reason="用户单次同意"):
         """
-        更新单个扩展名的基准（用户单次同意时调用）。
+        更新单个扩展名的基准（用户单次同意或锁定同步等场景调用）。
         同时推入历史版本。
         """
         self._push_history()
         with self._lock:
             self.baseline[ext] = snapshot_extension(ext)
         self.save()
-        log_event(ext, "更新基准", "成功", "用户单次同意")
+        log_event(ext, "更新基准", "成功", reason)
         return True
 
     def update_selected_extensions(self, ext_list):
@@ -2121,6 +2121,47 @@ class ProtectionEngine:
         except OSError as e:
             fail += 1
             details.append(f"HKCR默认:写入失败({e})")
+        # 2b) 用户级覆盖 HKCU\Software\Classes\ext 默认值 = 锁定应用
+        #     （普通令牌程序篡改关联时通常经 HKCU\Software\Classes 覆盖生效，
+        #      仅写 HKCR 会被用户级覆盖遮蔽，必须同步修正该覆盖键）
+        try:
+            uc_cls = f"Software\\Classes\\{ext}"
+            with winreg.CreateKeyEx(HKCU, uc_cls, 0, KEY_SET_VALUE_64) as k:
+                winreg.SetValueEx(k, None, 0, winreg.REG_SZ, lock_progid)
+            success += 1
+            details.append("HKCU覆盖:已设为锁定应用")
+        except OSError as e:
+            fail += 1
+            details.append(f"HKCU覆盖:写入失败({e})")
+        # 2c) 清理用户级覆盖残留的 shell\open\command（避免锁定应用被旧命令绕过）
+        def _del_tree(root, path):
+            try:
+                k = winreg.OpenKey(root, path, 0, KEY_SET_VALUE_64)
+                try:
+                    subkeys = []
+                    i = 0
+                    while True:
+                        try:
+                            subkeys.append(winreg.EnumKey(k, i))
+                            i += 1
+                        except OSError:
+                            break
+                    for sk in subkeys:
+                        _del_tree(root, f"{path}\\{sk}")
+                finally:
+                    winreg.CloseKey(k)
+                winreg.DeleteKey(root, path)
+                return True
+            except OSError:
+                return False
+        try:
+            uc_cmd = f"Software\\Classes\\{ext}\\shell"
+            if _del_tree(HKCU, uc_cmd):
+                details.append("HKCU命令:已清理残留")
+            else:
+                details.append("HKCU命令:无残留")
+        except Exception:
+            pass
         # 3) OpenWithProgids 加入锁定应用（非关键，失败不影响）
         try:
             owp = f"{ext}\\OpenWithProgids"
@@ -2132,7 +2173,7 @@ class ProtectionEngine:
             pass
         # 4) 同步基准为该扩展名当前态（无UserChoice + HKCR=锁定），验证与监控口径一致
         try:
-            self.baseline.update_extension(ext)
+            self.baseline.update_extension(ext, reason="锁定同步")
             details.append("基准:已同步锁定态")
         except Exception as e:
             details.append(f"基准:同步失败({e})")
