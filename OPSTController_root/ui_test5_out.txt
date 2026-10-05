@@ -12,13 +12,13 @@ installed programs: 496 in 0.12s
     'Microsoft Office' -> C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE
     'fsquirt' -> None
     'GetHelp' -> C:\Program Files\WindowsApps\Microsoft.GetHelp_10.2409.41132.0_x64__8wekyb3d8bbwe\GetHelp.exe
-page home: wheel_items=8
-page exts: wheel_items=8
-page tools: wheel_items=8
-page settings: wheel_items=8
-page log: wheel_items=8
-canvases: 4
-total wheel items: 8
+page home: wheel_items=10
+page exts: wheel_items=10
+page tools: wheel_items=10
+page settings: wheel_items=10
+page log: wheel_items=10
+canvases: 6
+total wheel items: 10
 active after click: True
 wheel on active item OK
 cleared active

@@ -1474,7 +1474,7 @@ class BaselineManager:
         for ext, progid in locked.items():
             try:
                 force_delete_userchoice(ext)
-                with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE) as k:
+                with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE_64) as k:
                     winreg.SetValueEx(k, None, 0, winreg.REG_SZ, progid)
                 try:
                     self.update_extension(ext)  # 同步基准为锁定态
@@ -2114,7 +2114,7 @@ class ProtectionEngine:
             details.append(f"UserChoice:异常({e})")
         # 2) HKCR\ext 默认值 = 锁定应用
         try:
-            with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE) as k:
+            with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE_64) as k:
                 winreg.SetValueEx(k, None, 0, winreg.REG_SZ, lock_progid)
             success += 1
             details.append("HKCR默认:已设为锁定应用")
@@ -2124,7 +2124,7 @@ class ProtectionEngine:
         # 3) OpenWithProgids 加入锁定应用（非关键，失败不影响）
         try:
             owp = f"{ext}\\OpenWithProgids"
-            with winreg.CreateKeyEx(HKCR, owp, 0, KEY_SET_VALUE) as k:
+            with winreg.CreateKeyEx(HKCR, owp, 0, KEY_SET_VALUE_64) as k:
                 winreg.SetValueEx(k, lock_progid, 0, winreg.REG_SZ, "")
             success += 1
             details.append("OpenWithProgids:已加入锁定应用")
