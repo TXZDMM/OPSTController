@@ -1459,8 +1459,32 @@ class BaselineManager:
         self.config["baseline_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.config["extension_count"] = len(new_baseline)
         self.save_config()
+        # 基准重建后重新落实单扩展名锁定：删除UserChoice + HKCR默认=锁定应用，
+        # 使锁定不受"以目前方式为基准"重建影响
+        self._reapply_locked_defaults()
         log_event("ALL", "创建基准", "成功", f"模式={mode}, 扩展名数={len(new_baseline)}, 错误={errors}")
         return len(new_baseline)
+
+    def _reapply_locked_defaults(self):
+        """基准创建/重建后重新落实单扩展名锁定（锁定优先于基准）"""
+        locked = self.config.get("locked_defaults", {}) or {}
+        if not locked:
+            return
+        ok = 0
+        for ext, progid in locked.items():
+            try:
+                force_delete_userchoice(ext)
+                with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, None, 0, winreg.REG_SZ, progid)
+                try:
+                    self.update_extension(ext)  # 同步基准为锁定态
+                except Exception:
+                    pass
+                ok += 1
+            except Exception:
+                continue
+        if ok:
+            log_event("LOCK", "重建基准后重新锁定", "成功", f"{ok}/{len(locked)}个扩展名")
 
     def _clear_all_user_choice(self):
         """清除所有 UserChoice 键（用于默认模式）"""
@@ -1946,6 +1970,16 @@ class ProtectionEngine:
         这样可以避免伪造路径、空项误判和重复恢复循环。
         返回 (success_count, fail_count, details)
         """
+        # 单扩展名锁定优先（强锁定语义）：锁定表中的扩展名走专用恢复，
+        # 恢复目标为 locked_defaults 中的锁定应用，而非基准值（锁定不受基准重建影响）
+        try:
+            _locked = (self.baseline.config or {}).get("locked_defaults", {}) or {}
+        except Exception:
+            _locked = {}
+        lock_progid = _locked.get(ext)
+        if lock_progid:
+            return self._recover_locked(ext, lock_progid)
+
         bl = self.baseline.baseline.get(ext)
         if not bl:
             return 0, len(mismatches), ["基准不存在"]
@@ -2053,6 +2087,55 @@ class ProtectionEngine:
                     fail += 1
                     details.append(f"{self.ITEM_LABELS.get(key, key)}:恢复失败(权限不足?)")
 
+        return success, fail, details
+
+    def _recover_locked(self, ext, lock_progid):
+        """锁定扩展名专用恢复（强锁定语义，恢复目标=锁定应用而非基准值）：
+        1) 删除 UserChoice（其 Hash 与锁定 ProgId 不匹配会失效，删除后系统回退到 HKCR 默认）
+        2) HKCR\\ext 默认值 = 锁定应用（无 Hash 限制，资源管理器无 UserChoice 时回退到此）
+        3) OpenWithProgids 加入锁定应用（保持可选打开列表完整）
+        4) 同步基准为该扩展名当前态，保证后续验证与监控口径一致
+        返回 (success_count, fail_count, details)
+        """
+        success = 0
+        fail = 0
+        details = []
+        # 1) 删除 UserChoice
+        try:
+            del_ok, del_method = force_delete_userchoice(ext)
+            if del_ok:
+                success += 1
+                details.append(f"UserChoice:已删除({del_method})")
+            else:
+                fail += 1
+                details.append(f"UserChoice:删除失败({del_method})")
+        except Exception as e:
+            fail += 1
+            details.append(f"UserChoice:异常({e})")
+        # 2) HKCR\ext 默认值 = 锁定应用
+        try:
+            with winreg.CreateKeyEx(HKCR, ext, 0, KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, None, 0, winreg.REG_SZ, lock_progid)
+            success += 1
+            details.append("HKCR默认:已设为锁定应用")
+        except OSError as e:
+            fail += 1
+            details.append(f"HKCR默认:写入失败({e})")
+        # 3) OpenWithProgids 加入锁定应用（非关键，失败不影响）
+        try:
+            owp = f"{ext}\\OpenWithProgids"
+            with winreg.CreateKeyEx(HKCR, owp, 0, KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, lock_progid, 0, winreg.REG_SZ, "")
+            success += 1
+            details.append("OpenWithProgids:已加入锁定应用")
+        except OSError:
+            pass
+        # 4) 同步基准为该扩展名当前态（无UserChoice + HKCR=锁定），验证与监控口径一致
+        try:
+            self.baseline.update_extension(ext)
+            details.append("基准:已同步锁定态")
+        except Exception as e:
+            details.append(f"基准:同步失败({e})")
         return success, fail, details
 
     def scan_all(self):
@@ -3053,6 +3136,21 @@ class MonitorThread(threading.Thread):
         """处理检测到的更改：持续篡改判定 → 冷却判断 → 恢复+验证 → 锁定/进程打击 → 通知"""
         # 跳过纯invalid_association（无效关联/缺失项，仅报告，不自动恢复/锁定）
         if mismatches and all(m[0] == "invalid_association" for m in mismatches):
+            return
+        # 单扩展名锁定优先：锁定表中的扩展名静默强制恢复为锁定应用（不弹窗、不累积持续篡改）
+        try:
+            _locked = (self.engine.baseline.config or {}).get("locked_defaults", {}) or {}
+        except Exception:
+            _locked = {}
+        if ext in _locked:
+            lock_target = _locked[ext]
+            s, f, dets, verified = self._recover_with_verify(ext, mismatches)
+            if verified:
+                log_event(ext, "恢复", "成功", f"锁定强制恢复(锁定目标={lock_target})")
+                self.log_callback(f"{ext} 已按锁定目标强制恢复: {lock_target}（锁定中，不弹窗）")
+            else:
+                log_event(ext, "恢复", "失败", f"锁定恢复未通过: {';'.join(dets) if dets else '未知'}")
+                self.log_callback(f"{ext} 锁定强制恢复未通过: {'; '.join(dets) if dets else '未知'}", "warn")
             return
         # 检查是否本周期已同意
         if ext in self.engine.allowed_this_cycle:
@@ -5255,7 +5353,9 @@ class MainWindow:
         self._locked_ext_listbox.config(yscrollcommand=lambda *a: None)
         lk_ops = tk.Frame(lock_cb, bg=self.C["card"])
         lk_ops.pack(fill="x")
-        self._mk_button(lk_ops, "解锁选中", self._lock_ext_unlock, width=10).pack(side="left")
+        self._mk_button(lk_ops, "解锁选中", self._lock_ext_unlock, width=10).pack(side="left", padx=(0, 8))
+        self._mk_button(lk_ops, "解锁全部", self._lock_ext_unlock_all, width=10).pack(side="left", padx=(0, 8))
+        self._mk_button(lk_ops, "刷新状态", self._refresh_locked_ext_list, width=10).pack(side="left")
         self._refresh_locked_ext_list()
 
     def _refresh_locked_ext_list(self):
@@ -5264,7 +5364,19 @@ class MainWindow:
             locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
             self._locked_ext_listbox.delete(0, tk.END)
             for ext in sorted(locked.keys()):
-                self._locked_ext_listbox.insert(tk.END, f"{ext}  →  {locked[ext]}")
+                target = locked[ext]
+                status = ""
+                try:
+                    cur = get_prog_id(ext)
+                    if cur and cur.lower() == target.lower():
+                        status = "  ✓ 一致"
+                    elif cur:
+                        status = f"  ✗ 当前={cur}"
+                    else:
+                        status = "  ○ 系统默认(待落实)"
+                except Exception:
+                    pass
+                self._locked_ext_listbox.insert(tk.END, f"{ext} → {target}{status}")
         except Exception:
             pass
 
@@ -5300,6 +5412,13 @@ class MainWindow:
                 return
             cfg = self.baseline_mgr.config
             locked = cfg.setdefault("locked_defaults", {})
+            if ext in locked:
+                if locked[ext].lower() == progid.lower():
+                    self._lock_ext_status.config(
+                        text=f"{ext} 已锁定为 {progid}，无需重复锁定", fg=self.C["warn"])
+                    return
+                self._lock_ext_status.config(
+                    text=f"更新锁定目标: {locked[ext]} → {progid}", fg=self.C["text2"])
             locked[ext] = progid
             self.baseline_mgr.save_config()
             # 同步基准：锁定值成为恢复目标
@@ -5328,9 +5447,36 @@ class MainWindow:
             if ext in locked:
                 del locked[ext]
                 self.baseline_mgr.save_config()
+                # 解锁后同步基准为当前实际关联，恢复普通保护
+                try:
+                    self.baseline_mgr.update_extension(ext)
+                except Exception:
+                    pass
             self._refresh_locked_ext_list()
             self._lock_ext_status.config(text=f"已解锁 {ext}，配置已保存到文件", fg=self.C["text2"])
             self._append_log(f"已解锁扩展名: {ext}", "info")
+        except Exception as e:
+            self._lock_ext_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
+
+    def _lock_ext_unlock_all(self):
+        """解锁全部扩展名锁定项"""
+        try:
+            cfg = self.baseline_mgr.config
+            locked = cfg.get("locked_defaults", {}) or {}
+            if not locked:
+                self._lock_ext_status.config(text="当前没有已锁定的扩展名", fg=self.C["text2"])
+                return
+            exts = list(locked.keys())
+            locked.clear()
+            self.baseline_mgr.save_config()
+            for ext in exts:
+                try:
+                    self.baseline_mgr.update_extension(ext)
+                except Exception:
+                    pass
+            self._refresh_locked_ext_list()
+            self._lock_ext_status.config(text=f"已解锁全部 {len(exts)} 个扩展名，配置已保存到文件", fg=self.C["text2"])
+            self._append_log(f"已解锁全部扩展名: {', '.join(exts)}", "info")
         except Exception as e:
             self._lock_ext_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
 
