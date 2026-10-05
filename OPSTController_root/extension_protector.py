@@ -7661,6 +7661,7 @@ def signal_show_window():
 
 def add_to_autostart():
     """添加到开机自启动（HKCU Run），返回 bool"""
+    exe_path = None
     try:
         if getattr(sys, 'frozen', False):
             exe_path = sys.executable
@@ -7672,17 +7673,35 @@ def add_to_autostart():
         winreg.CloseKey(key)
         return True
     except OSError as e:
-        logger.error(f"添加自启动失败: {e}")
-        return False
+        logger.error(f"添加自启动失败(winreg): {e}")
+        # 兜底：部分受限环境 winreg 打开被拒时改用 reg 命令
+        # （/d 值内引号需以 \" 转义，reg 才能写入带引号的路径）
+        try:
+            import subprocess
+            if exe_path is None:
+                exe_path = sys.executable
+            r = subprocess.run(
+                ["reg", "add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                 "/v", APP_NAME, "/d", f'\\"{exe_path}\\" -m', "/f"],
+                capture_output=True, text=True)
+            return r.returncode == 0
+        except Exception as e2:
+            logger.error(f"添加自启动失败(reg兜底): {e2}")
+            return False
 
 
 def is_autostart_set():
-    """检查是否已添加自启动"""
+    """检查是否已添加自启动（值必须带 -m 最小化参数才算有效）"""
     try:
         key = winreg.OpenKey(HKCU, AUTOSTART_KEY, 0, KEY_READ_64)
         val, _ = winreg.QueryValueEx(key, APP_NAME)
         winreg.CloseKey(key)
-        return bool(val)
+        if not val:
+            return False
+        # 旧版本写入的裸路径（不带 -m）视为未设置，启动时自动升级为带 -m 的启动项
+        if "-m" not in str(val):
+            return False
+        return True
     except OSError:
         return False
 
@@ -7695,7 +7714,16 @@ def remove_from_autostart():
         winreg.CloseKey(key)
         return True
     except OSError:
-        return False
+        # 兜底：reg 命令删除
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["reg", "delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                 "/v", APP_NAME, "/f"],
+                capture_output=True, text=True)
+            return r.returncode == 0
+        except Exception:
+            return False
 
 
 # ============================================================
