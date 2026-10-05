@@ -7886,6 +7886,11 @@ class MainWindow:
                 names = z.namelist()
                 if not any(n.endswith("config.json") for n in names):
                     raise IOError("该备份包不包含 config.json，不是有效的配置备份")
+                # 路径穿越防护：拒绝绝对路径与 .. 逃逸，只允许 userdata/ 前缀
+                import posixpath as _pp
+                for n in names:
+                    if n.startswith("/") or ".." in _pp.normpath(n).split("/"):
+                        raise IOError(f"备份包含非法路径条目: {n}，已中止恢复")
                 z.extractall(USERDATA_DIR)
             # 恢复后重载内存配置与基准
             try:
