@@ -2162,15 +2162,16 @@ class ProtectionEngine:
                 details.append("HKCU命令:无残留")
         except Exception:
             pass
-        # 3) OpenWithProgids 加入锁定应用（非关键，失败不影响）
+        # 3) OpenWithProgids 加入锁定应用（非关键，失败不影响主恢复）
         try:
             owp = f"{ext}\\OpenWithProgids"
             with winreg.CreateKeyEx(HKCR, owp, 0, KEY_SET_VALUE_64) as k:
                 winreg.SetValueEx(k, lock_progid, 0, winreg.REG_SZ, "")
             success += 1
             details.append("OpenWithProgids:已加入锁定应用")
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning(f"锁定恢复: {ext} OpenWithProgids 写入失败: {e}")
+            details.append(f"OpenWithProgids:写入失败({e})")
         # 4) 同步基准为该扩展名当前态（无UserChoice + HKCR=锁定），验证与监控口径一致
         try:
             self.baseline.update_extension(ext, reason="锁定同步")
@@ -5418,8 +5419,8 @@ class MainWindow:
                         status = f"  ✗ 当前={cur}"
                     else:
                         status = "  ○ 系统默认(待落实)"
-                except Exception:
-                    pass
+                except Exception as e:
+                    status = f"  ? 查询失败({e})"
                 self._locked_ext_listbox.insert(tk.END, f"{ext} → {target}{status}")
         except Exception:
             pass
@@ -5456,25 +5457,30 @@ class MainWindow:
                 return
             cfg = self.baseline_mgr.config
             locked = cfg.setdefault("locked_defaults", {})
-            if ext in locked:
+            is_update = ext in locked
+            if is_update:
                 if locked[ext].lower() == progid.lower():
                     self._lock_ext_status.config(
                         text=f"{ext} 已锁定为 {progid}，无需重复锁定", fg=self.C["warn"])
                     return
-                self._lock_ext_status.config(
-                    text=f"更新锁定目标: {locked[ext]} → {progid}", fg=self.C["text2"])
             locked[ext] = progid
             self.baseline_mgr.save_config()
             # 同步基准：锁定值成为恢复目标
             try:
-                self.baseline_mgr.update_extension(ext)
-            except Exception:
-                pass
+                self.baseline_mgr.update_extension(ext, reason="锁定设置")
+            except Exception as e:
+                logger.warning(f"锁定 {ext} 后同步基准失败: {e}")
+                self._lock_ext_status.config(
+                    text=f"配置已保存，但基准同步失败（{e}），下次扫描将按新基准比对", fg=self.C["warn"])
+                self._refresh_locked_ext_list()
+                self._append_log(f"锁定 {ext} → {progid} 配置已保存，基准同步失败: {e}", "warn")
+                return
             self._refresh_locked_ext_list()
             name, _ = identify_tamperer(progid)
+            verb = "已更新锁定目标" if is_update else "已锁定"
             self._lock_ext_status.config(
-                text=f"已锁定 {ext} → {progid}（{name or '未知软件'}），配置已保存到文件", fg=self.C["success"])
-            self._append_log(f"已锁定扩展名默认应用: {ext} → {progid}", "success")
+                text=f"{verb} {ext} → {progid}（{name or '未知软件'}），配置已保存到文件", fg=self.C["success"])
+            self._append_log(f"{verb}扩展名默认应用: {ext} → {progid}", "success")
         except Exception as e:
             self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
 
@@ -5482,6 +5488,7 @@ class MainWindow:
         """解锁选中的扩展名锁定项"""
         sel = self._locked_ext_listbox.curselection()
         if not sel:
+            self._lock_ext_status.config(text="请先在列表中选中要解锁的扩展名", fg=self.C["warn"])
             return
         line = self._locked_ext_listbox.get(sel[0])
         ext = line.split("→")[0].strip()
@@ -5493,9 +5500,13 @@ class MainWindow:
                 self.baseline_mgr.save_config()
                 # 解锁后同步基准为当前实际关联，恢复普通保护
                 try:
-                    self.baseline_mgr.update_extension(ext)
-                except Exception:
-                    pass
+                    self.baseline_mgr.update_extension(ext, reason="锁定解锁")
+                except Exception as e:
+                    logger.warning(f"解锁 {ext} 后同步基准失败: {e}")
+                    self._lock_ext_status.config(
+                        text=f"解锁配置已保存，但基准同步失败（{e}）", fg=self.C["warn"])
+                    self._refresh_locked_ext_list()
+                    return
             self._refresh_locked_ext_list()
             self._lock_ext_status.config(text=f"已解锁 {ext}，配置已保存到文件", fg=self.C["text2"])
             self._append_log(f"已解锁扩展名: {ext}", "info")
@@ -5513,13 +5524,20 @@ class MainWindow:
             exts = list(locked.keys())
             locked.clear()
             self.baseline_mgr.save_config()
+            sync_fail = []
             for ext in exts:
                 try:
-                    self.baseline_mgr.update_extension(ext)
-                except Exception:
-                    pass
+                    self.baseline_mgr.update_extension(ext, reason="锁定解锁")
+                except Exception as e:
+                    sync_fail.append(f"{ext}({e})")
+                    logger.warning(f"解锁全部: {ext} 基准同步失败: {e}")
             self._refresh_locked_ext_list()
-            self._lock_ext_status.config(text=f"已解锁全部 {len(exts)} 个扩展名，配置已保存到文件", fg=self.C["text2"])
+            if sync_fail:
+                self._lock_ext_status.config(
+                    text=f"已解锁 {len(exts)} 个扩展名（{len(sync_fail)} 个基准同步失败: {'; '.join(sync_fail[:3])}）",
+                    fg=self.C["warn"])
+            else:
+                self._lock_ext_status.config(text=f"已解锁全部 {len(exts)} 个扩展名，配置已保存到文件", fg=self.C["text2"])
             self._append_log(f"已解锁全部扩展名: {', '.join(exts)}", "info")
         except Exception as e:
             self._lock_ext_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
