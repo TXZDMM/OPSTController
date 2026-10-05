@@ -4437,7 +4437,7 @@ class MainWindow:
             time.sleep(0.5)
 
     def _threadsafe_exit(self):
-        """线程安全的强制退出：停监控→保存→解锁→立即退出进程。
+        """线程安全的强制退出：停监控→解锁→保存→立即退出进程。
         仅在无 tk 主循环或主循环卡死时由看门狗线程调用。
         不做长清理/长等待（监控线程退出路径自带 _unlock_all；
         _MEI 残留由下次启动的延迟清扫线程处理），避免退出卡死。"""
@@ -4445,6 +4445,13 @@ class MainWindow:
             if self.monitor is not None and self.monitor.is_alive():
                 try:
                     self.monitor.stop()
+                except Exception:
+                    pass
+                # 显式解锁：stop() 只置位事件，run 循环可能仍在 sleep，
+                # 若不立即解锁则 os._exit 抢先导致注册表 Deny ACL 残留，
+                # 下次启动扩展名会被锁死（stress 实测 40/40 注入被拒）
+                try:
+                    self.monitor._unlock_all()
                 except Exception:
                     pass
         except Exception:
