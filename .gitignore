@@ -39,6 +39,8 @@ seq_inject.txt
 OPSTController_root/kill_probe*.py
 OPSTController_root/kill_probe_out.txt
 OPSTController_root/kill_out*.txt
+OPSTController_root/autostart_probe.py
+OPSTController_root/reg_probe.py
 
 # 编辑器/系统
 .idea/
