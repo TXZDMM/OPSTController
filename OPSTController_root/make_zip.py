@@ -4,7 +4,7 @@ import os, shutil, zipfile
 
 REL = r"C:\Users\TXZDM\Desktop\OPSTcontroller_Release"
 TMP = r"C:\Users\TXZDM\Desktop\OPSTController-main\OPSTController_root\_pkg_tmp"
-ZIP = r"C:\Users\TXZDM\Desktop\OPSTcontroller-0.8.0.zip"
+ZIP = r"C:\Users\TXZDM\Desktop\OPSTController-main\OPSTcontroller-0.8.1.zip"
 
 if os.path.exists(TMP):
     shutil.rmtree(TMP)
