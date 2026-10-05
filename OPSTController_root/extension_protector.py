@@ -4640,9 +4640,10 @@ class MainWindow:
 
         self._nav_buttons = {}
         self._nav_sel = None
-        # 导航：状态 / 扩展名 / 异常修复 / 设置（日志页保留但不再出现在导航，从设置页进入）
+        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 诊断 / 设置（日志页保留但不再出现在导航，从设置页进入）
         for key, text in [("home", "状态"), ("exts", "扩展名"),
-                          ("tools", "异常修复"), ("settings", "设置")]:
+                          ("history", "防护记录"), ("tools", "异常修复"),
+                          ("diag", "诊断"), ("settings", "设置")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -4666,7 +4667,9 @@ class MainWindow:
         self._scroll_bound = False
         self._build_page_home(content)
         self._build_page_exts(content)
+        self._build_page_history(content)
         self._build_page_tools(content)
+        self._build_page_diag(content)
         self._build_page_log(content)
         self._build_page_settings(content)
         # 所有页面构建完成后，统一收集可滚动小项并绑定“单击激活”滚轮逻辑
@@ -7303,6 +7306,390 @@ class MainWindow:
         self._repair_set_status("全部修复完成！")
         self._append_log("=== 一键全部修复完成 ===", "success")
         messagebox.showinfo(APP_NAME, "一键全部修复完成！\n\n全部 20 项状态已重置，保护已恢复正常。")
+
+    def _build_page_history(self, parent):
+        """页面：防护记录 —— 历史更改审计（统计概览 + 可搜索记录表格 + 详情/状态检查）"""
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["history"] = page
+        self._mk_page_header(page, "防护记录", "程序识别并处理的所有关联更改审计，自动保存在文件中")
+        body = self._mk_scroll_container(page)
+
+        # —— 统计概览 ——
+        card, cb = self._mk_card(body, "统计概览", "实时汇总防护记录数据（每次刷新时重新计算）")
+        self._hist_stat_var = tk.StringVar(value="统计计算中…")
+        tk.Label(cb, textvariable=self._hist_stat_var, font=("微软雅黑", 9),
+                 fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left"
+                 ).pack(fill="x", pady=2)
+
+        # —— 记录列表 ——
+        list_card, list_cb = self._mk_card(body, "记录列表",
+            "输入关键词过滤（扩展名 / 篡改者）；单击行查看摘要，双击行对比该扩展名当前注册表状态")
+        search_row = tk.Frame(list_cb, bg=self.C["card"])
+        search_row.pack(fill="x", pady=(0, 6))
+        self._hist_search_var = tk.StringVar()
+        tk.Entry(search_row, textvariable=self._hist_search_var,
+                 font=("微软雅黑", 9), bg=self.C["btn"], fg=self.C["text"],
+                 relief="flat", highlightthickness=0, insertbackground=self.C["text"]
+                 ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._hist_search_var.trace_add("write", lambda *a: self._refresh_history_table())
+
+        tree_frame = tk.Frame(list_cb, bg=self.C["card"])
+        tree_frame.pack(fill="x", pady=2)
+        cols = ("time", "ext", "tamperer", "action", "result")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10)
+        headers = {"time": "时间", "ext": "扩展名", "tamperer": "篡改者", "action": "操作", "result": "结果"}
+        widths = {"time": 150, "ext": 90, "tamperer": 150, "action": 90, "result": 70}
+        for c in cols:
+            tree.heading(c, text=headers[c])
+            tree.column(c, width=widths[c], anchor="w", stretch=True)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="x", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._hist_tree = tree
+        try:
+            st = ttk.Style(self.root)
+            st.configure("Hist.Treeview", background=self.C["btn"], fieldbackground=self.C["btn"],
+                         foreground=self.C["text"], borderwidth=0, rowheight=24)
+            st.configure("Hist.Treeview.Heading", background=self.C["nav"], foreground=self.C["text2"],
+                         borderwidth=0, relief="flat")
+            st.map("Hist.Treeview", background=[("selected", self.C["nav_sel"])],
+                   foreground=[("selected", self.C["text"])])
+            tree.configure(style="Hist.Treeview")
+        except Exception:
+            pass
+
+        detail = tk.Text(list_cb, font=("微软雅黑", 9), height=7, wrap="word",
+                         bg=self.C["btn"], fg=self.C["text"], relief="flat",
+                         highlightthickness=0, state="disabled")
+        detail.pack(fill="x", pady=(6, 0))
+        self._hist_detail_text = detail
+
+        ops = tk.Frame(list_cb, bg=self.C["card"])
+        ops.pack(fill="x", pady=(8, 2))
+        self._mk_button(ops, "刷新", self._refresh_history_table, width=8).pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "清空记录", self._history_clear, width=10, kind="danger").pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "导出记录", self._history_export, width=10).pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "检查当前状态", self._history_check_status, width=12).pack(side="left")
+        tree.bind("<ButtonRelease-1>", lambda _e: self._history_show_detail())
+        tree.bind("<Double-Button-1>", lambda _e: self._history_check_status())
+        self._refresh_history_table()
+
+    def _refresh_history_table(self):
+        """刷新防护记录表格（含统计概览与搜索过滤）"""
+        try:
+            from collections import Counter
+            q = self._hist_search_var.get().strip().lower()
+            records = self.change_history.get_records(limit=100000)
+            # 统计概览
+            total = len(records)
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_cnt = sum(1 for r in records if str(r.get("timestamp", "")).startswith(today))
+            blocked = sum(1 for r in records if r.get("action") == "auto_blocked")
+            consented = sum(1 for r in records if r.get("action") == "user_consent")
+            ext_counter = Counter(str(r.get("ext", "")) for r in records)
+            tam_counter = Counter(str(r.get("tamperer") or "未知") for r in records)
+            top_exts = "、".join(f"{e}({c})" for e, c in ext_counter.most_common(5)) or "—"
+            top_tams = "、".join(f"{t}({c})" for t, c in tam_counter.most_common(5)) or "—"
+            self._hist_stat_var.set(
+                f"总记录: {total}  今日: {today_cnt}  自动阻止: {blocked}  用户同意: {consented}\n"
+                f"Top 扩展名: {top_exts}\nTop 篡改者: {top_tams}")
+            # 表格（倒序：最新在前）
+            tree = self._hist_tree
+            tree.delete(*tree.get_children())
+            for i, rec in enumerate(reversed(records)):
+                ext = str(rec.get("ext", ""))
+                tam = str(rec.get("tamperer") or "未知")
+                if q and q not in ext.lower() and q not in tam.lower():
+                    continue
+                action_text = {"user_consent": "用户同意", "auto_blocked": "自动阻止",
+                               "detected_only": "仅检测"}.get(rec.get("action"), str(rec.get("action")))
+                tree.insert("", tk.END, iid=str(i), values=(
+                    str(rec.get("timestamp", "")), ext, tam, action_text, str(rec.get("result", ""))))
+        except Exception as e:
+            if hasattr(self, "_hist_stat_var"):
+                self._hist_stat_var.set(f"读取记录失败: {e}")
+
+    def _history_rows(self):
+        """返回当前表格对应的记录列表（与显示顺序一致：倒序 + 过滤）"""
+        q = self._hist_search_var.get().strip().lower()
+        records = self.change_history.get_records(limit=100000)
+        rows = []
+        for rec in reversed(records):
+            ext = str(rec.get("ext", ""))
+            tam = str(rec.get("tamperer") or "未知")
+            if q and q not in ext.lower() and q not in tam.lower():
+                continue
+            rows.append(rec)
+        return rows
+
+    def _history_show_detail(self):
+        """单击行显示该记录摘要"""
+        try:
+            sel = self._hist_tree.selection()
+            if not sel:
+                return
+            rows = self._history_rows()
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(rows):
+                return
+            rec = rows[idx]
+            txt = self._hist_detail_text
+            txt.configure(state="normal")
+            txt.delete("1.0", tk.END)
+            txt.insert(tk.END, f"时间: {rec.get('timestamp', '')}\n")
+            txt.insert(tk.END, f"扩展名: {rec.get('ext', '')}   篡改者: {rec.get('tamperer') or '未知'}\n")
+            txt.insert(tk.END, f"操作: {rec.get('action', '')}   结果: {rec.get('result', '')}\n")
+            txt.insert(tk.END, "更改详情:\n")
+            for ch in rec.get("changes", []):
+                txt.insert(tk.END, f"  {ch.get('item', '')}: {ch.get('old', '')} → {ch.get('new', '')}\n")
+            src = rec.get("source") or {}
+            if isinstance(src, dict) and src.get("process_name"):
+                txt.insert(tk.END, f"来源进程: {src.get('process_name')} {src.get('process_path') or ''}\n")
+            txt.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _history_check_status(self):
+        """双击行：对比该扩展名当前注册表状态与基准"""
+        try:
+            sel = self._hist_tree.selection()
+            if not sel:
+                return
+            rows = self._history_rows()
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(rows):
+                return
+            rec = rows[idx]
+            ext = str(rec.get("ext", ""))
+            txt = self._hist_detail_text
+            txt.configure(state="normal")
+            txt.delete("1.0", tk.END)
+            bl = self.baseline_mgr.baseline.get(ext, {})
+            txt.insert(tk.END, f"=== {ext} 当前注册表状态 ===")
+            if not bl:
+                txt.insert(tk.END, "\n\n该扩展名不在当前基准中（可能已移除或为新扩展名）")
+                txt.configure(state="disabled")
+                return
+            try:
+                mismatches = self.engine.check_extension(ext)
+            except Exception:
+                mismatches = []
+            item_order = ["userchoice_progid", "userchoice_hash", "hkcr_ext",
+                          "hkcu_ext", "hklm_ext", "hkcr_command", "hkcu_command"]
+            labels = {"userchoice_progid": "UserChoice.ProgId", "userchoice_hash": "UserChoice.Hash",
+                      "hkcr_ext": "HKCR 默认值", "hkcu_ext": "HKCU\\Software\\Classes",
+                      "hklm_ext": "HKLM\\Software\\Classes", "hkcr_command": "HKCR 命令",
+                      "hkcu_command": "HKCU 命令"}
+            mismatch_keys = {m[0] for m in mismatches}
+            for key in item_order:
+                bl_item = bl.get(key, {})
+                blv = bl_item.get("value") if isinstance(bl_item, dict) else None
+                tag = " ✓" if key not in mismatch_keys else " ✗ 不一致"
+                txt.insert(tk.END, f"\n{labels.get(key, key)}: {blv if blv is not None else '（无）'}{tag}")
+            if mismatch_keys:
+                txt.insert(tk.END, f"\n\n存在 {len(mismatch_keys)} 项不一致，可到「扩展名」页更新基准，或到「异常修复」页处理")
+            else:
+                txt.insert(tk.END, "\n\n当前状态与基准完全一致")
+            txt.configure(state="disabled")
+        except Exception as e:
+            txt = getattr(self, "_hist_detail_text", None)
+            if txt:
+                txt.configure(state="normal")
+                txt.delete("1.0", tk.END)
+                txt.insert(tk.END, f"检查失败: {e}")
+                txt.configure(state="disabled")
+
+    def _history_clear(self):
+        """清空全部防护记录"""
+        if not messagebox.askyesno(APP_NAME, "确定清空全部防护记录？\n（记录保存在文件中，清空后不可恢复）"):
+            return
+        try:
+            self.change_history.clear()
+            self._refresh_history_table()
+            txt = getattr(self, "_hist_detail_text", None)
+            if txt:
+                txt.configure(state="normal")
+                txt.delete("1.0", tk.END)
+                txt.configure(state="disabled")
+            self._append_log("已清空全部防护记录", "warn")
+            messagebox.showinfo(APP_NAME, "防护记录已清空")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"清空失败: {e}")
+
+    def _history_export(self):
+        """导出防护记录（JSON 审计文件）"""
+        try:
+            path = filedialog.asksaveasfilename(
+                title="导出防护记录", defaultextension=".json",
+                initialfile="opst-protect-history.json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return
+            ok = self.change_history.export_records(path)
+            if ok:
+                messagebox.showinfo(APP_NAME, f"记录已导出到:\n{path}")
+            else:
+                messagebox.showerror(APP_NAME, "导出失败")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"导出失败: {e}")
+
+    def _build_page_diag(self, parent):
+        """页面：系统诊断 —— 一键体检报告（权限/提权链/基准/锁定/自启动/运行健康）"""
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["diag"] = page
+        self._mk_page_header(page, "系统诊断", "一键检查权限、提权链、基准、锁定、自启动与运行健康")
+        body = self._mk_scroll_container(page)
+        card, cb = self._mk_card(body, "一键诊断",
+            "点击「开始诊断」逐项检查并生成报告；报告可复制或保存为 txt 文件")
+        ops = tk.Frame(cb, bg=self.C["card"])
+        ops.pack(fill="x", pady=(0, 6))
+        self._mk_button(ops, "开始诊断", self._diag_run, kind="primary").pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "复制报告", self._diag_copy).pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "保存报告", self._diag_save).pack(side="left")
+        text = tk.Text(cb, font=("Consolas", 9), height=22, wrap="word",
+                       bg=self.C["btn"], fg=self.C["text"], relief="flat",
+                       highlightthickness=0, state="disabled")
+        text.pack(fill="x")
+        self._diag_text = text
+        text.configure(state="normal")
+        text.insert(tk.END, "尚未诊断。点击「开始诊断」生成体检报告。\n")
+        text.configure(state="disabled")
+
+    def _diag_write(self, line):
+        """向诊断报告追加一行（自动滚到底部）"""
+        txt = self._diag_text
+        txt.configure(state="normal")
+        txt.insert(tk.END, line + "\n")
+        txt.see(tk.END)
+        txt.configure(state="disabled")
+
+    def _diag_run(self):
+        """执行一键诊断并输出报告"""
+        txt = self._diag_text
+        txt.configure(state="normal")
+        txt.delete("1.0", tk.END)
+        txt.configure(state="disabled")
+        self._diag_write(f"===== {APP_NAME} v{APP_VERSION} 诊断报告 =====")
+        self._diag_write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._diag_write("")
+        # 1) 权限与提权
+        self._diag_write("[1] 权限状态")
+        priv_txt = self.ti_status if self.ti_status else "未知"
+        self._diag_write(f"    - 界面权限显示: {priv_txt}")
+        try:
+            import ctypes
+            elev = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            self._diag_write(f"    - 进程管理员令牌: {'是' if elev else '否'}")
+        except Exception:
+            self._diag_write("    - 进程管理员令牌: 无法判断")
+        self._diag_write("")
+        # 2) 提权链
+        self._diag_write("[2] 提权链（TrustedInstaller）")
+        self._diag_write(f"    - 提权模式: {getattr(self, '_ti_mode_text', 'TI(SYSTEM)')}")
+        self._diag_write(f"    - 自我保护: {'已启用' if self._process_protected else '未启用'}")
+        self._diag_write("")
+        # 3) 基准
+        self._diag_write("[3] 基准状态")
+        cfg = self.baseline_mgr.config
+        bl = self.baseline_mgr.baseline
+        self._diag_write(f"    - 保护扩展名: {len(bl)}")
+        self._diag_write(f"    - 基准模式: {cfg.get('baseline_mode', '—')}")
+        self._diag_write(f"    - 基准时间: {cfg.get('baseline_time', '—')}")
+        self._diag_write("")
+        # 4) 单扩展名锁定
+        self._diag_write("[4] 单扩展名锁定")
+        locked = cfg.get("locked_defaults", {}) or {}
+        if locked:
+            for ext, target in sorted(locked.items()):
+                try:
+                    cur = get_prog_id(ext)
+                    mark = "一致" if cur and cur.lower() == target.lower() else ("待落实" if not cur else f"当前={cur}")
+                except Exception:
+                    mark = "无法读取"
+                self._diag_write(f"    - {ext} → {target}  [{mark}]")
+        else:
+            self._diag_write("    - 未设置任何锁定")
+        self._diag_write("")
+        # 5) 自启动
+        self._diag_write("[5] 开机自启动")
+        try:
+            if is_autostart_set():
+                self._diag_write("    - 已设置（带 -m 最小化启动）")
+            else:
+                self._diag_write("    - 未设置")
+        except Exception:
+            self._diag_write("    - 无法读取")
+        self._diag_write("")
+        # 6) 日志与运行健康
+        self._diag_write("[6] 日志与运行健康")
+        try:
+            log_path = os.path.join(USERDATA_DIR, "protector.log")
+            if os.path.exists(log_path):
+                sz = os.path.getsize(log_path)
+                self._diag_write(f"    - 监控日志: {sz/1024:.1f} KB（超过 2MB 自动轮转）")
+            else:
+                self._diag_write("    - 监控日志: 尚未生成")
+        except Exception:
+            self._diag_write("    - 监控日志: 无法读取")
+        try:
+            import tempfile
+            meis = [d for d in os.listdir(tempfile.gettempdir()) if d.startswith("_MEI")]
+            self._diag_write(f"    - 临时 _MEI 目录: {len(meis)} 个（30s 自动清扫）")
+        except Exception:
+            pass
+        self._diag_write("")
+        # 7) 识别库
+        self._diag_write("[7] 软件识别库")
+        try:
+            if os.path.exists(PROGRAM_NAMES_FILE):
+                with open(PROGRAM_NAMES_FILE, "r", encoding="utf-8") as f:
+                    names = json.load(f)
+                self._diag_write(f"    - 内置名称库条目: {len(names)}")
+            else:
+                self._diag_write("    - 识别库文件缺失")
+        except Exception:
+            self._diag_write("    - 识别库读取失败")
+        self._diag_write("")
+        # 8) 防护记录
+        self._diag_write("[8] 防护记录")
+        try:
+            recs = self.change_history.get_records(limit=100000)
+            self._diag_write(f"    - 历史记录: {len(recs)} 条（上限 {self.change_history.MAX_RECORDS}）")
+        except Exception:
+            self._diag_write("    - 历史记录: 无法读取")
+        self._diag_write("")
+        self._diag_write("===== 诊断完成 =====")
+
+    def _diag_copy(self):
+        """复制诊断报告到剪贴板"""
+        try:
+            txt = self._diag_text.get("1.0", tk.END).strip()
+            if not txt:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+            self._append_log("诊断报告已复制到剪贴板", "info")
+        except Exception:
+            pass
+
+    def _diag_save(self):
+        """保存诊断报告为 txt 文件"""
+        try:
+            txt = self._diag_text.get("1.0", tk.END).strip()
+            if not txt:
+                return
+            path = filedialog.asksaveasfilename(
+                title="保存诊断报告", defaultextension=".txt",
+                initialfile="opst-diag-report.txt",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(txt + "\n")
+            messagebox.showinfo(APP_NAME, f"诊断报告已保存到:\n{path}")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"保存失败: {e}")
 
     def _show_settings(self):
         """设置对话框（兼容旧调用）：直接切换到主窗口「设置」页"""
