@@ -5438,7 +5438,7 @@ class MainWindow:
     def _build_page_tools(self, parent):
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["tools"] = page
-        self._mk_page_header(page, "异常修复", "19 项独立修复 + 辅助工具")
+        self._mk_page_header(page, "异常修复", "20 项独立修复 + 辅助工具")
         content = self._mk_scroll_container(page)
 
         self._repair_status_var = tk.StringVar(value="就绪 · 点击任意按钮执行对应修复，完成后自动返回状态页")
