@@ -100,7 +100,7 @@ PROGRAM_NAMES_FILE = os.path.join(USERDATA_DIR, "program_names.json")
 MAX_HISTORY_VERSIONS = 5
 POLL_INTERVAL = 2          # 轮询间隔(秒)
 DEEP_SCAN_INTERVAL = 600   # 深层扫描间隔(秒)，7位置全量扫描较慢，10分钟一次
-NOTIFY_TIMEOUT = 8          # 通知显示时长(秒)，超时默认阻止
+NOTIFY_TIMEOUT = 15         # 通知显示时长(秒)，超时默认阻止（用户要求弹窗时间不能太短）
 COOLDOWN_SECONDS = 30       # 同一扩展名恢复后冷却时间(秒)，期间静默恢复不弹窗
 OPERATION_MODES = [
     "normal",
@@ -2054,25 +2054,30 @@ class ProtectionEngine:
 # 右下角通知 (更改通知 + 单次同意 + 5秒默认阻止)
 # ============================================================
 class NotificationToast:
-    """右下角滑出通知，非模态，5秒后自动关闭默认阻止"""
-    TOAST_WIDTH = 360
-    TOAST_HEIGHT = 200
+    """右下角滑出通知，非模态，超时后默认阻止。
+    三个操作按钮：单次同意 / 关闭弹窗1分钟 / 永久关闭"""
+    TOAST_WIDTH = 380
+    TOAST_HEIGHT = 280
     MARGIN = 50  # 离屏幕底部距离，调高让弹窗位置更高
     GAP = 10
 
-    def __init__(self, parent, ext, mismatches, recover_result, on_consent, on_close, on_show_main, y_offset=0, x_offset=0, timeout=None, tamperer_name=None):
+    def __init__(self, parent, ext, mismatches, recover_result, on_consent, on_close,
+                 on_pause_min, on_forever, on_show_main, y_offset=0, x_offset=0,
+                 timeout=None, tamperer_name=None):
         self.ext = ext
         self.mismatches = mismatches
         self.recover_result = recover_result
         self.on_consent = on_consent
         self.on_close = on_close
+        self.on_pause_min = on_pause_min
+        self.on_forever = on_forever
         self.on_show_main = on_show_main
         self.y_offset = y_offset
         self.x_offset = x_offset
         self.timeout = timeout if timeout and timeout > 0 else NOTIFY_TIMEOUT
         self.remaining = self.timeout
         self._closed = False
-        self.close_reason = None  # "consent" / "timeout"
+        self.close_reason = None  # "consent" / "timeout" / "close" / "pause_min" / "forever"
         self.tamperer_name = tamperer_name
         self._build_ui(parent)
 
@@ -2141,36 +2146,40 @@ class NotificationToast:
         tk.Label(result_frame, text=f"  结果：{result_text}",
                  font=("微软雅黑", 10, "bold"), fg=result_color, bg="#34495e").pack(side="left")
 
-        # 按钮 + 倒计时
+        # 按钮区：单次同意 / 关闭弹窗1分钟 / 永久关闭（三个按钮必须完整显示）
         bottom = tk.Frame(content, bg="#34495e")
-        bottom.pack(fill="x", pady=(8, 0))
+        bottom.pack(fill="x", pady=(10, 0))
 
-        btn_group = tk.Frame(bottom, bg="#34495e")
-        btn_group.pack(side="left")
-
-        self.consent_btn = tk.Button(btn_group, text="同意更改",
+        btn_row1 = tk.Frame(bottom, bg="#34495e")
+        btn_row1.pack(fill="x")
+        self.consent_btn = tk.Button(btn_row1, text="单次同意",
                                       font=("微软雅黑", 9, "bold"),
-                                      command=self._on_consent, width=8, relief="flat",
+                                      command=self._on_consent, width=10, relief="flat",
                                       bg="#27ae60", fg="white", activebackground="#2ecc71",
                                       activeforeground="white", cursor="hand2",
-                                      padx=8, pady=4)
-        self.consent_btn.pack(side="left", padx=(0, 6))
+                                      padx=6, pady=5)
+        self.consent_btn.pack(side="left", padx=(0, 8))
 
-        self.show_main_btn = tk.Button(btn_group, text="打开主程序",
+        self.pause_min_btn = tk.Button(btn_row1, text="关闭弹窗1分钟",
                                         font=("微软雅黑", 9),
-                                        command=self._on_show_main, width=8, relief="flat",
-                                        bg="#3498db", fg="white", activebackground="#5dade2",
+                                        command=self._on_pause_min, width=12, relief="flat",
+                                        bg="#f39c12", fg="white", activebackground="#f5b041",
                                         activeforeground="white", cursor="hand2",
-                                        padx=8, pady=4)
-        self.show_main_btn.pack(side="left", padx=(0, 6))
+                                        padx=6, pady=5)
+        self.pause_min_btn.pack(side="left", padx=(0, 8))
 
-        self.close_btn = tk.Button(btn_group, text="关闭",
-                                    font=("微软雅黑", 9),
-                                    command=self._on_close_btn, width=6, relief="flat",
-                                    bg="#7f8c8d", fg="white", activebackground="#95a5a6",
-                                    activeforeground="white", cursor="hand2",
-                                    padx=8, pady=4)
-        self.close_btn.pack(side="left")
+        self.forever_btn = tk.Button(btn_row1, text="永久关闭",
+                                      font=("微软雅黑", 9),
+                                      command=self._on_forever, width=10, relief="flat",
+                                      bg="#7f8c8d", fg="white", activebackground="#95a5a6",
+                                      activeforeground="white", cursor="hand2",
+                                      padx=6, pady=5)
+        self.forever_btn.pack(side="left")
+
+        # 提示行（按钮含义）
+        tk.Label(bottom, text="单次同意=允许这次更改；关闭1分钟=暂停提醒1分钟；永久关闭=该扩展名永久忽略",
+                 font=("微软雅黑", 7), fg="#7f8c8d", bg="#34495e",
+                 anchor="w").pack(fill="x", pady=(6, 0))
 
         # 倒计时进度条（底部细线）
         self.progress = tk.Frame(self.win, bg="#e74c3c", height=2)
@@ -2231,6 +2240,32 @@ class NotificationToast:
         self.close_reason = "consent"
         try:
             self.on_consent(self.ext)
+        except Exception:
+            pass
+        self._close()
+
+    def _on_pause_min(self):
+        """关闭弹窗1分钟：暂停弹窗提醒1分钟，期间静默阻止"""
+        if self._closed:
+            return
+        self._closed = True
+        self.close_reason = "pause_min"
+        try:
+            if self.on_pause_min:
+                self.on_pause_min(self.ext)
+        except Exception:
+            pass
+        self._close()
+
+    def _on_forever(self):
+        """永久关闭：该扩展名永久忽略，不再弹窗与阻止"""
+        if self._closed:
+            return
+        self._closed = True
+        self.close_reason = "forever"
+        try:
+            if self.on_forever:
+                self.on_forever(self.ext)
         except Exception:
             pass
         self._close()
@@ -4178,11 +4213,12 @@ class ProcessEnforcer:
 # 主窗口
 # ============================================================
 class MainWindow:
-    def __init__(self, ti_elevated=False, ti_status="未知", privilege_failure_detail=None):
+    def __init__(self, ti_elevated=False, ti_status="未知", privilege_failure_detail=None, start_minimized=False):
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("780x560")
         self.root.minsize(700, 500)
+        self.start_minimized = start_minimized  # -m/--minimized：启动后最小化到任务栏
         self.baseline_mgr = BaselineManager()
         self.change_history = ChangeHistoryManager(USERDATA_DIR)
         self.change_history.set_audit_level(self.baseline_mgr.config.get("audit_level", "normal"))
@@ -4214,8 +4250,23 @@ class MainWindow:
         # 关闭按钮改为后台常驻，不退出
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_background)
         self._init_app()
+        # -m/--minimized：开机自启动场景，启动后最小化到任务栏后台常驻
+        if self.start_minimized:
+            try:
+                self.root.withdraw()
+                self.root.after(1500, self._minimize_to_taskbar)
+            except Exception:
+                pass
         # 启动退出信号检查（每500ms检查一次）
         self._check_exit_event()
+
+    def _minimize_to_taskbar(self):
+        """最小化到任务栏（后台常驻，托盘图标仍在）"""
+        try:
+            self.root.deiconify()
+            self.root.iconify()
+        except Exception:
+            pass
 
     def _build_ui(self):
         """主窗口 UI：Win11 设置深色风格（顶部标题栏 + 左侧导航 + 右侧内容页）"""
@@ -4242,7 +4293,9 @@ class MainWindow:
         }
         self._setup_ttk_style()
         self.root.configure(bg=self.C["bg"])
-        self.root.geometry("960x640")
+        # 大窗口（接近全局）：TI 会话下 state("zoomed") 会导致窗口/弹窗不可见，
+        # 改用大尺寸默认窗口，用户可自行最大化
+        self.root.geometry("1280x800")
         self.root.minsize(840, 560)
 
         # ===== 顶部标题栏 =====
@@ -4270,9 +4323,9 @@ class MainWindow:
 
         self._nav_buttons = {}
         self._nav_sel = None
+        # 导航：状态 / 扩展名 / 异常修复 / 设置（日志页保留但不再出现在导航，从设置页进入）
         for key, text in [("home", "状态"), ("exts", "扩展名"),
-                          ("tools", "工具"), ("log", "日志"),
-                          ("settings", "设置")]:
+                          ("tools", "异常修复"), ("settings", "设置")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -4452,8 +4505,8 @@ class MainWindow:
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["home"] = page
         self._mk_page_header(page, "状态", "扩展名保护卫士 · 实时监控文件关联注册表")
-        body = tk.Frame(page, bg=self.C["bg"])
-        body.pack(fill="both", expand=True, padx=24, pady=16)
+        # 全局可滑动：整页内容放入滚动容器（窗口最大化后内容仍可完整访问）
+        body = self._mk_scroll_container(page)
 
         # 卡片1：保护状态（状态行 + 启动/停止）
         card, cb = self._mk_card(body, "保护状态", "实时监控 7 项注册表位置，阻止第三方软件篡改默认打开方式")
@@ -4475,7 +4528,7 @@ class MainWindow:
         out_card = tk.Frame(body, bg=self.C["card"],
                             highlightbackground=self.C["card_border"],
                             highlightthickness=1, bd=0)
-        out_card.pack(fill="both", expand=True, pady=(0, 12))
+        out_card.pack(fill="x", pady=(0, 12))
         tk.Label(out_card, text="保护输出", font=("微软雅黑", 11, "bold"),
                  fg=self.C["text"], bg=self.C["card"], anchor="w"
                  ).pack(fill="x", padx=16, pady=(12, 4))
@@ -4483,10 +4536,10 @@ class MainWindow:
                                                        wrap="word", state="disabled",
                                                        bg="#1A1A1A", fg="#D4D4D4",
                                                        insertbackground="#D4D4D4",
-                                                       relief="flat", bd=0, height=10,
+                                                       relief="flat", bd=0, height=16,
                                                        highlightbackground=self.C["card_border"],
                                                        highlightthickness=1)
-        self.status_output.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self.status_output.pack(fill="x", padx=16, pady=(0, 14))
         for tag, color in (("info", "#D4D4D4"), ("warn", "#FCE100"),
                            ("error", "#FF99A4"), ("success", "#6CCB5F")):
             self.status_output.tag_config(tag, foreground=color)
@@ -4521,8 +4574,7 @@ class MainWindow:
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["exts"] = page
         self._mk_page_header(page, "扩展名", "保护范围与基准信息")
-        body = tk.Frame(page, bg=self.C["bg"])
-        body.pack(fill="both", expand=True, padx=24, pady=16)
+        body = self._mk_scroll_container(page)
 
         card, cb = self._mk_card(body, "统计信息")
         self._ext_info_var = tk.StringVar(value="保护扩展名：—\n基准模式：—\n基准时间：—")
@@ -4568,7 +4620,7 @@ class MainWindow:
     def _build_page_tools(self, parent):
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["tools"] = page
-        self._mk_page_header(page, "工具", "异常修复面板 · 19 项独立修复 + 辅助工具")
+        self._mk_page_header(page, "异常修复", "19 项独立修复 + 辅助工具")
         content = self._mk_scroll_container(page)
 
         self._repair_status_var = tk.StringVar(value="就绪 · 点击任意按钮执行对应修复")
@@ -4724,7 +4776,7 @@ class MainWindow:
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
         _row(body, "批量弹窗模式:", self._mk_radio_row(body, batch_popup_var,
              [("single", "单个(队列)"), ("simultaneous", "同时(堆叠)")]))
-        tk.Label(body, text="单个：一次弹一个，超时自动阻止后下一个缩短为2秒；同时：所有弹窗同时弹出",
+        tk.Label(body, text="单个：一次弹一个，超时自动阻止后下一个缩短为6秒；同时：所有弹窗同时弹出",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
         _row(body, "运行模式:", self._mk_radio_row(body, mode_var,
              [("normal", "正常"), ("quiet", "临时免打扰"), ("game", "游戏模式"),
@@ -4757,7 +4809,8 @@ class MainWindow:
              [("minimal", "极简"), ("normal", "普通"), ("detailed", "详细"), ("full", "完整")]))
         a_ops = tk.Frame(body3, bg=dark["card"])
         a_ops.pack(fill="x", pady=6)
-        self._mk_button(a_ops, "导出审计日志", self._export_audit_log).pack(side="left")
+        self._mk_button(a_ops, "导出审计日志", self._export_audit_log).pack(side="left", padx=(0, 8))
+        self._mk_button(a_ops, "查看运行日志", lambda: self._select_nav("log")).pack(side="left")
         tk.Label(body3, text="审计日志记录：进程名/路径/命令行/数字签名/父进程/时间/注册表路径/旧值/新值",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
 
@@ -6570,6 +6623,31 @@ class MainWindow:
                 else:
                     self._popup_queue_active = False
 
+        def on_pause_min(extension):
+            """关闭弹窗1分钟：暂停弹窗提醒60秒，期间静默阻止"""
+            self._popup_paused_until = time.time() + 60
+            self._append_log(f"{extension} 弹窗已关闭1分钟，期间静默阻止", "warn")
+            log_event(extension, "弹窗", "暂停1分钟", "用户选择关闭弹窗1分钟")
+
+        def on_forever(extension):
+            """永久关闭：该扩展名永久忽略（加入白名单），不再弹窗与阻止"""
+            whitelist = self.baseline_mgr.config.get("whitelist_exts", [])
+            if not any(e.lower() == extension.lower() for e in whitelist):
+                whitelist.append(extension)
+                self.baseline_mgr.config["whitelist_exts"] = whitelist
+                try:
+                    self.baseline_mgr.save()
+                except Exception:
+                    pass
+            self.baseline_mgr.update_extension(extension)
+            self.engine.clear_cooldown(extension)
+            self.engine.allowed_this_cycle.add(extension)
+            if self.monitor is not None:
+                self.monitor.persistent_tracker.clear_ext_history(extension)
+            self.change_history.add_record(extension, tamperer_name, changes_for_history, "forever_ignore", "success")
+            self._append_log(f"已永久关闭 {extension} 的弹窗提醒（加入白名单，不再阻止）", "warn")
+            log_event(extension, "更改", "永久忽略", "用户永久关闭弹窗")
+
         # 单个模式：如果当前有活动弹窗，加入队列不立即显示
         if popup_mode == "single" and self.active_toasts:
             self._popup_queue.append((ext, mismatches, recover_result, extra_timeout))
@@ -6585,8 +6663,8 @@ class MainWindow:
 
         # 计算超时时间
         if popup_mode == "single" and self._popup_last_reason == "timeout":
-            timeout = 2  # 上一个超时自动阻止 → 下一个缩短为2秒
-            self._append_log(f"上一个弹窗超时自动阻止，本次弹窗超时缩短为2秒", "info")
+            timeout = 6  # 上一个超时自动阻止 → 下一个缩短为6秒（用户反馈2秒太短）
+            self._append_log(f"上一个弹窗超时自动阻止，本次弹窗超时缩短为6秒", "info")
         else:
             _cfg_timeout = self.baseline_mgr.config.get("block_timeout", NOTIFY_TIMEOUT)
             if _cfg_timeout < 1: _cfg_timeout = 1
@@ -6605,7 +6683,8 @@ class MainWindow:
             x_offset = 0
 
         toast = NotificationToast(self.root, ext, mismatches, recover_result,
-                                  on_consent, on_close, self._show_main_window,
+                                  on_consent, on_close, on_pause_min, on_forever,
+                                  self._show_main_window,
                                   y_offset=y_offset, x_offset=x_offset, timeout=timeout,
                                   tamperer_name=tamperer_name)
         self.active_toasts.append(toast)
@@ -6750,7 +6829,8 @@ def add_to_autostart():
         else:
             exe_path = os.path.abspath(sys.argv[0])
         key = winreg.OpenKey(HKCU, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE | KEY_READ_64)
-        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+        # 开机自启动带 -m 最小化参数：后台常驻，不打扰
+        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}" -m')
         winreg.CloseKey(key)
         return True
     except OSError as e:
@@ -7535,6 +7615,16 @@ def enable_all_privileges():
 # 主入口
 # ============================================================
 def main():
+    # -m/--minimized：开机自启动最小化启动（须在提权分支之前检测，
+    # 通过环境变量 OPST_MINIMIZED 让 NSudo 子进程(TI实例)同样最小化）
+    _start_minimized = ("-m" in sys.argv) or ("--minimized" in sys.argv)
+    if _start_minimized:
+        try:
+            os.environ["OPST_MINIMIZED"] = "1"
+        except Exception:
+            pass
+    start_minimized = _start_minimized or (os.environ.get("OPST_MINIMIZED") == "1")
+
     # PyInstaller onefile 解压目录 _MEI 退出清理失败(弹"Failed to remove temporary
     # directory")的常见根因：进程工作目录位于 _MEI 内或子进程继承 _MEI 句柄。
     # 启动即切换到 exe 所在目录，消除 cwd 占用，减少退出时清理失败弹窗。
@@ -7716,7 +7806,10 @@ def main():
             log_event("SYSTEM", "自启动", "已添加", "注册表HKCU\\Run")
         else:
             print("警告：添加开机自启失败")
-    app = MainWindow(ti_elevated=ti_elevated, ti_status=ti_status, privilege_failure_detail=privilege_failure_detail)
+    # -m/--minimized：开机自启动最小化启动（普通实例与TI实例均生效）
+    app = MainWindow(ti_elevated=ti_elevated, ti_status=ti_status,
+                     privilege_failure_detail=privilege_failure_detail,
+                     start_minimized=start_minimized)
     app.run()
     # 保持互斥体直到程序退出
     kernel32.CloseHandle(mutex)
