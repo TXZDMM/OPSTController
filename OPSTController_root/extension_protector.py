@@ -8674,9 +8674,17 @@ def main():
                     print(f"已终止 {_killed} 个进程")
                 else:
                     try:
-                        ctypes.windll.shell32.ShellExecuteW(
-                            None, "runas", sys.executable, "--stop-admin", None, 1)
-                        print("已请求管理员权限执行 --stop-admin（UAC 关闭时自动提权）")
+                        # UAC 完全关闭环境下 ShellExecuteW(runas) 静默失败，
+                        # 改用 PowerShell -Verb RunAs 提权启动 --stop-admin
+                        # （与已验证有效的 kill_admin 机制一致）。
+                        import subprocess as _sp
+                        _sp.Popen([
+                            "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                            "-Command",
+                            f"Start-Process -Verb RunAs -Wait -WindowStyle Hidden "
+                            f"-FilePath '{sys.executable}' -ArgumentList '--stop-admin'"
+                        ])
+                        print("已请求管理员权限执行 --stop-admin（PowerShell RunAs）")
                     except Exception as e:
                         print(f"提权请求失败: {e}")
         except Exception:
