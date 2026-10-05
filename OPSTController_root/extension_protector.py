@@ -2056,8 +2056,8 @@ class ProtectionEngine:
 class NotificationToast:
     """右下角滑出通知，非模态，超时后默认阻止。
     三个操作按钮：单次同意 / 关闭弹窗1分钟 / 永久关闭"""
-    TOAST_WIDTH = 380
-    TOAST_HEIGHT = 280
+    TOAST_WIDTH = 440
+    TOAST_HEIGHT = 300
     MARGIN = 50  # 离屏幕底部距离，调高让弹窗位置更高
     GAP = 10
 
@@ -2105,7 +2105,7 @@ class NotificationToast:
         content = tk.Frame(self.win, bg="#34495e")
         content.pack(fill="both", expand=True, padx=14, pady=(10, 6))
 
-        # 标题行：谁改了什么
+        # 标题行：谁改了什么（长文本自动换行）
         title_frame = tk.Frame(content, bg="#34495e")
         title_frame.pack(fill="x")
         if self.tamperer_name:
@@ -2114,7 +2114,8 @@ class NotificationToast:
             title_text = f"{self.ext} 被更改"
         tk.Label(title_frame, text=title_text,
                  font=("微软雅黑", 11, "bold"), fg="#ecf0f1",
-                 bg="#34495e").pack(side="left")
+                 bg="#34495e", anchor="w", justify="left", wraplength=390
+                 ).pack(side="left")
         self.timer_label = tk.Label(title_frame, text=f"{self.remaining}秒后默认阻止",
                                      font=("微软雅黑", 8), fg="#95a5a6", bg="#34495e")
         self.timer_label.pack(side="right")
@@ -2129,7 +2130,7 @@ class NotificationToast:
             detail_text += f" 等{len(self.mismatches)}项"
         tk.Label(content, text=detail_text,
                  font=("微软雅黑", 8), fg="#bdc3c7", bg="#34495e",
-                 anchor="w", wraplength=330, justify="left").pack(fill="x", pady=(6, 0))
+                 anchor="w", wraplength=400, justify="left").pack(fill="x", pady=(6, 0))
 
         # 操作 + 结果
         success, fail, details = self.recover_result
@@ -2146,7 +2147,8 @@ class NotificationToast:
         tk.Label(result_frame, text=f"  结果：{result_text}",
                  font=("微软雅黑", 10, "bold"), fg=result_color, bg="#34495e").pack(side="left")
 
-        # 按钮区：单次同意 / 关闭弹窗1分钟 / 永久关闭（三个按钮必须完整显示）
+        # 按钮区：单次同意 / 关闭弹窗1分钟 / 永久关闭
+        # 不设固定宽度：按钮按文字自适应（文字多自动向左/右伸展），保持一行
         bottom = tk.Frame(content, bg="#34495e")
         bottom.pack(fill="x", pady=(10, 0))
 
@@ -2154,32 +2156,32 @@ class NotificationToast:
         btn_row1.pack(fill="x")
         self.consent_btn = tk.Button(btn_row1, text="单次同意",
                                       font=("微软雅黑", 9, "bold"),
-                                      command=self._on_consent, width=10, relief="flat",
+                                      command=self._on_consent, relief="flat",
                                       bg="#27ae60", fg="white", activebackground="#2ecc71",
                                       activeforeground="white", cursor="hand2",
-                                      padx=6, pady=5)
+                                      padx=14, pady=5)
         self.consent_btn.pack(side="left", padx=(0, 8))
 
         self.pause_min_btn = tk.Button(btn_row1, text="关闭弹窗1分钟",
                                         font=("微软雅黑", 9),
-                                        command=self._on_pause_min, width=12, relief="flat",
+                                        command=self._on_pause_min, relief="flat",
                                         bg="#f39c12", fg="white", activebackground="#f5b041",
                                         activeforeground="white", cursor="hand2",
-                                        padx=6, pady=5)
+                                        padx=14, pady=5)
         self.pause_min_btn.pack(side="left", padx=(0, 8))
 
         self.forever_btn = tk.Button(btn_row1, text="永久关闭",
                                       font=("微软雅黑", 9),
-                                      command=self._on_forever, width=10, relief="flat",
+                                      command=self._on_forever, relief="flat",
                                       bg="#7f8c8d", fg="white", activebackground="#95a5a6",
                                       activeforeground="white", cursor="hand2",
-                                      padx=6, pady=5)
+                                      padx=14, pady=5)
         self.forever_btn.pack(side="left")
 
-        # 提示行（按钮含义）
+        # 提示行（按钮含义，自动换行避免超宽裁切）
         tk.Label(bottom, text="单次同意=允许这次更改；关闭1分钟=暂停提醒1分钟；永久关闭=该扩展名永久忽略",
                  font=("微软雅黑", 7), fg="#7f8c8d", bg="#34495e",
-                 anchor="w").pack(fill="x", pady=(6, 0))
+                 anchor="w", justify="left", wraplength=400).pack(fill="x", pady=(6, 0))
 
         # 倒计时进度条（底部细线）
         self.progress = tk.Frame(self.win, bg="#e74c3c", height=2)
@@ -2353,13 +2355,14 @@ class BatchNotificationToast:
         ext_text.config(state="disabled")
         btn_frame = tk.Frame(content, bg="#34495e")
         btn_frame.pack(fill="x", pady=(10, 0))
-        tk.Button(btn_frame, text="全部阻止", font=("微软雅黑", 9, "bold"), bg="#e74c3c", fg="white", width=9, relief="flat", cursor="hand2", command=self._on_block_all).pack(side="left", padx=2)
-        tk.Button(btn_frame, text="全部允许", font=("微软雅黑", 9), bg="#27ae60", fg="white", width=9, relief="flat", cursor="hand2", command=self._on_allow_all).pack(side="left", padx=2)
-        tk.Button(btn_frame, text="逐个查看", font=("微软雅黑", 9), bg="#3498db", fg="white", width=9, relief="flat", cursor="hand2", command=self._on_view_onebyone).pack(side="left", padx=2)
+        # 按钮不设固定宽度：按文字自适应（长文本自动伸展，避免截断/堆高）
+        tk.Button(btn_frame, text="全部阻止", font=("微软雅黑", 9, "bold"), bg="#e74c3c", fg="white", relief="flat", cursor="hand2", padx=12, pady=4, command=self._on_block_all).pack(side="left", padx=2)
+        tk.Button(btn_frame, text="全部允许", font=("微软雅黑", 9), bg="#27ae60", fg="white", relief="flat", cursor="hand2", padx=12, pady=4, command=self._on_allow_all).pack(side="left", padx=2)
+        tk.Button(btn_frame, text="逐个查看", font=("微软雅黑", 9), bg="#3498db", fg="white", relief="flat", cursor="hand2", padx=12, pady=4, command=self._on_view_onebyone).pack(side="left", padx=2)
         btn_frame2 = tk.Frame(content, bg="#34495e")
         btn_frame2.pack(fill="x", pady=(6, 0))
-        tk.Button(btn_frame2, text="暂停弹窗5分钟", font=("微软雅黑", 8), bg="#7f8c8d", fg="white", width=12, relief="flat", cursor="hand2", command=self._on_pause).pack(side="left", padx=2)
-        tk.Button(btn_frame2, text="关闭", font=("微软雅黑", 8), bg="#95a5a6", fg="white", width=8, relief="flat", cursor="hand2", command=self._on_close_btn).pack(side="right", padx=2)
+        tk.Button(btn_frame2, text="暂停弹窗5分钟", font=("微软雅黑", 8), bg="#7f8c8d", fg="white", relief="flat", cursor="hand2", padx=10, pady=3, command=self._on_pause).pack(side="left", padx=2)
+        tk.Button(btn_frame2, text="关闭", font=("微软雅黑", 8), bg="#95a5a6", fg="white", relief="flat", cursor="hand2", padx=10, pady=3, command=self._on_close_btn).pack(side="right", padx=2)
         self.progress = tk.Frame(self.win, bg="#e74c3c", height=2)
         self.progress.pack(fill="x", side="bottom")
         self._slide_in()
@@ -4481,7 +4484,9 @@ class MainWindow:
                      bg=self.C["bg"], anchor="w").pack(fill="x", padx=24)
 
     def _mk_scroll_container(self, page):
-        """创建可滚动内容容器，返回 content_frame（页面内滚动区）"""
+        """创建可滚动内容容器，返回 content_frame（页面内滚动区）
+        滚轮全局响应：绑定到整个窗口，鼠标在任意子控件（按钮/卡片）上
+        滚动都生效；Text/ScrolledText/Listbox 等自带滚轮的控件除外（避免双滚动）"""
         canvas = tk.Canvas(page, bg=self.C["bg"], highlightthickness=0, bd=0)
         vsb = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
@@ -4495,9 +4500,26 @@ class MainWindow:
         def _sync_width(_e):
             canvas.itemconfig(cw, width=_e.width)
         canvas.bind("<Configure>", _sync_width)
-        def _on_mousewheel(_e):
-            canvas.yview_scroll(int(-_e.delta / 120), "units")
-        page.bind("<MouseWheel>", _on_mousewheel)
+        # 收集所有滚动容器 canvas，供全局滚轮分发
+        if not hasattr(self, "_scroll_canvases"):
+            self._scroll_canvases = []
+        self._scroll_canvases.append(canvas)
+        # 全局滚轮（仅绑定一次）
+        if not getattr(self, "_scroll_bound", False):
+            self._scroll_bound = True
+            def _on_mousewheel(_e):
+                # 自带滚轮的控件（文本/列表）不重复滚动外层
+                w = _e.widget
+                if isinstance(w, (scrolledtext.ScrolledText, tk.Text, tk.Listbox, tk.Spinbox, ttk.Combobox)):
+                    return
+                for c in self._scroll_canvases:
+                    if c.winfo_ismapped():
+                        try:
+                            c.yview_scroll(int(-_e.delta / 120), "units")
+                        except Exception:
+                            pass
+                        break
+            self.root.bind_all("<MouseWheel>", _on_mousewheel)
         return content
 
     # ---------- 页面：状态 ----------
@@ -4567,7 +4589,8 @@ class MainWindow:
             ("全局锁定 / 解除锁定", self._toggle_global_lock, "default"),
             ("历史版本管理", self._show_history, "default"),
         ]:
-            self._mk_button(op_col, text, cmd, kind=kind, width=15).pack(side="left", padx=(0, 6))
+            # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
+            self._mk_button(op_col, text, cmd, kind=kind).pack(side="left", padx=(0, 6))
 
     # ---------- 页面：扩展名 ----------
     def _build_page_exts(self, parent):
@@ -7696,7 +7719,9 @@ def main():
             time.sleep(5)
         except Exception:
             pass
-        sys.exit(0)
+        # os._exit 跳过 PyInstaller bootloader 退出清理，
+        # 彻底消除安全软件锁文件导致的"Failed to remove temporary directory"弹窗
+        os._exit(0)
 
     # 单实例检测（--restart参数时跳过）
     is_restart = "--restart" in sys.argv
@@ -7751,7 +7776,7 @@ def main():
         if not is_admin():
             kernel32.CloseHandle(mutex)
             run_as_admin()
-            sys.exit(0)
+            os._exit(0)
 
         allowed_modes = {"t", "system", "administrator"}
         if default_perm not in allowed_modes:
@@ -7775,7 +7800,8 @@ def main():
             if elevate_via_nsudo_system_only():
                 log_event("SYSTEM", "提权", "成功", "NSudo已按SYSTEM模式发起重启")
                 time.sleep(2)
-                sys.exit(0)
+                # os._exit 跳过 bootloader 清理，避免安全软件锁 _MEI 文件弹 Warning
+                os._exit(0)
             # 提权失败，保持真实权限，不造假
             log_event("SYSTEM", "提权", "失败", "NSudo SYSTEM提权未成功发起新实例")
             ti_status = actual_status
@@ -7788,7 +7814,8 @@ def main():
             if elevate_via_nsudo():
                 log_event("SYSTEM", "提权", "成功", "NSudo已按TI模式发起重启")
                 time.sleep(2)
-                sys.exit(0)
+                # os._exit 跳过 bootloader 清理，避免安全软件锁 _MEI 文件弹 Warning
+                os._exit(0)
             # 提权失败，保持真实权限，不造假
             log_event("SYSTEM", "提权", "失败", "NSudo TI提权未成功发起新实例")
             ti_status = actual_status
@@ -7813,6 +7840,9 @@ def main():
     app.run()
     # 保持互斥体直到程序退出
     kernel32.CloseHandle(mutex)
+    # os._exit 跳过 bootloader 退出清理，避免安全软件锁 _MEI 文件弹 Warning；
+    # 残留 _MEI 目录由下次启动时的空目录清理兜底
+    os._exit(0)
 
 
 def _global_excepthook(exc_type, exc_value, exc_traceback):
