@@ -16,12 +16,18 @@ def get_log_tail():
 
 start = time.time()
 rounds = 0
+inject_ok = 0
+inject_denied = 0
 while time.time() - start < 150 and rounds < 40:
     ext = EXTS[rounds % len(EXTS)]
     evil = f"evil_pid{rounds % 7}"
     # 关键：保留扩展名开头的点（监控保护的是带点的 ".ext" 注册表键）
     r = subprocess.run(["reg", "add", f"HKCR\\{ext}", "/ve", "/d", evil, "/f"],
                        capture_output=True, text=True)
+    if r.returncode == 0:
+        inject_ok += 1
+    else:
+        inject_denied += 1  # 扩展名处于 Deny ACL 锁定期：注入被拒 = 防御生效
     rounds += 1
     time.sleep(2.0)  # let monitor notice between injections
 
@@ -31,6 +37,7 @@ restore = tail.count("恢复:成功")
 lines = tail.splitlines()
 last = lines[-12:] if lines else []
 out = [f"rounds={rounds} elapsed={int(time.time()-start)}s",
+       f"inject_ok={inject_ok} inject_denied_by_lock={inject_denied}",
        f"detect={detect} restore_ok={restore}",
        "---last12---"]
 out.extend(last)

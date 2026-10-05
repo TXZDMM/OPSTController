@@ -1,0 +1,5 @@
+﻿.docx rc= 1 ERROR: Access is denied.
+.xlsx rc= 1 ERROR: Access is denied.
+.png rc= 1 ERROR: Access is denied.
+.jpg rc= 1 ERROR: Access is denied.
+injected 4, waiting 20s
