@@ -2188,6 +2188,22 @@ class NotificationToast:
         self.progress.pack(fill="x", side="bottom")
         self.progress_width = self.TOAST_WIDTH
 
+        # 高度自适应：按内容实际需求高度调整，消灭底部大片空白
+        # （内容全部 pack 后计算，最小 170px 保证按钮区完整，最大 420px 防超屏）
+        try:
+            self.win.update_idletasks()
+            self.TOAST_HEIGHT = max(self.win.winfo_reqheight(), 170)
+            if self.TOAST_HEIGHT > 420:
+                self.TOAST_HEIGHT = 420
+        except Exception:
+            pass
+        # 高度可能已变化，重新计算目标位置，并重置初始位置到屏幕外供滑入
+        sh = self.win.winfo_screenheight()
+        sw = self.win.winfo_screenwidth()
+        self.target_y = sh - self.TOAST_HEIGHT - self.MARGIN - self.y_offset
+        x = sw - self.TOAST_WIDTH - self.MARGIN - self.x_offset
+        self.win.geometry(f"{self.TOAST_WIDTH}x{self.TOAST_HEIGHT}+{x}+{sh}")
+
         # 滑入动画
         self._slide_in()
         # 确保窗口完全渲染后再启动倒计时
@@ -2365,6 +2381,23 @@ class BatchNotificationToast:
         tk.Button(btn_frame2, text="关闭", font=("微软雅黑", 8), bg="#95a5a6", fg="white", relief="flat", cursor="hand2", padx=10, pady=3, command=self._on_close_btn).pack(side="right", padx=2)
         self.progress = tk.Frame(self.win, bg="#e74c3c", height=2)
         self.progress.pack(fill="x", side="bottom")
+
+        # 高度自适应：按内容实际需求高度调整，消灭底部大片空白
+        # （内容全部 pack 后计算，最小 170px 保证按钮区完整，最大 420px 防超屏）
+        try:
+            self.win.update_idletasks()
+            self.TOAST_HEIGHT = max(self.win.winfo_reqheight(), 170)
+            if self.TOAST_HEIGHT > 420:
+                self.TOAST_HEIGHT = 420
+        except Exception:
+            pass
+        # 高度可能已变化，重新计算目标位置，并重置初始位置到屏幕外供滑入
+        sh = self.win.winfo_screenheight()
+        sw = self.win.winfo_screenwidth()
+        self.target_y = sh - self.TOAST_HEIGHT - self.MARGIN
+        x = sw - self.TOAST_WIDTH - self.MARGIN
+        self.win.geometry(f"{self.TOAST_WIDTH}x{self.TOAST_HEIGHT}+{x}+{sh}")
+
         self._slide_in()
         try:
             self.win.update()
