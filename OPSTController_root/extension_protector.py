@@ -347,15 +347,57 @@ WAIT_TIMEOUT = 0x00000102
 def setup_logger():
     logger = logging.getLogger("ExtProtector")
     logger.setLevel(logging.DEBUG)
-    # 日志轮转：单个文件上限 2MB，保留 3 份历史（长期常驻监控避免日志无限膨胀）
-    from logging.handlers import RotatingFileHandler
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    # 安全日志轮转：写入前手动检查大小并备份（多进程共用日志文件时
+    # RotatingFileHandler 的 rename 轮转会因另一进程占用句柄而异常，
+    # 故采用"检查-截断-备份"的轻量轮转，不依赖文件重命名）
+    fh = _SafeRotatingFileHandler(LOG_FILE, max_bytes=2 * 1024 * 1024,
+                                  backup_count=3, encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
+
+
+class _SafeRotatingFileHandler(logging.FileHandler):
+    """轻量安全轮转：追加写入前检查文件大小，超限先做截断备份。
+    不使用重命名（多进程下 rename 会因句柄占用抛 PermissionError）。"""
+
+    def __init__(self, filename, max_bytes=2 * 1024 * 1024, backup_count=3,
+                 encoding=None):
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        super().__init__(filename, mode="a", encoding=encoding)
+
+    def _maybe_rotate(self):
+        try:
+            size = os.path.getsize(self.baseFilename)
+        except OSError:
+            return
+        if size < self.max_bytes:
+            return
+        try:
+            # 备份：protector.log -> protector.log.1 -> .2 -> .3
+            for i in range(self.backup_count - 1, 0, -1):
+                src = f"{self.baseFilename}.{i}"
+                dst = f"{self.baseFilename}.{i + 1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            if os.path.exists(self.baseFilename):
+                os.replace(self.baseFilename, f"{self.baseFilename}.1")
+        except OSError:
+            pass  # 轮转失败不影响主日志记录
+
+    def emit(self, record):
+        try:
+            self._maybe_rotate()
+        except Exception:
+            pass
+        try:
+            super().emit(record)
+        except Exception:
+            pass
 
 logger = setup_logger()
 
@@ -4840,7 +4882,7 @@ class MainWindow:
             pass
         return list(found.items())
 
-    def _pick_program(self, target_callback, title="从程序库选择"):
+    def _pick_program(self, target_callback, title="从本机程序选择"):
         """程序选择窗口：候选 = 本机已安装程序（注册表枚举，名称经识别库
         归一化，保证与“谁更改了什么”提示一致）+ 当前运行进程名。
         选中后回调 target_callback(程序名)，无需用户手动输入。"""
@@ -5652,7 +5694,7 @@ class MainWindow:
         prog_ops.pack(fill="x")
         self._mk_button(prog_ops, "添加", add_whitelist_prog, width=8, small_adapt=True).pack(side="left", padx=(0, 8))
         self._mk_button(prog_ops, "删除选中", del_whitelist_prog, width=10, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(prog_ops, "从程序库选择", lambda: self._pick_program(
+        self._mk_button(prog_ops, "从本机程序选择", lambda: self._pick_program(
             lambda name: self._add_prog_to_listbox(prog_listbox, name)),
             small_adapt=True).pack(side="left")
         tk.Label(body4, text="识别对象为程序名（进程名），可从本机已安装程序或当前运行进程中选择，无需手动输入",
@@ -5673,7 +5715,7 @@ class MainWindow:
         self._bl_listbox.config(yscrollcommand=lambda *a: None)
         bl_ops = tk.Frame(body4b, bg=dark["card"])
         bl_ops.pack(fill="x", pady=4)
-        self._mk_button(bl_ops, "从程序库选择", lambda: self._pick_program(
+        self._mk_button(bl_ops, "从本机程序选择", lambda: self._pick_program(
             lambda name: self._add_blacklist_program(name)),
             small_adapt=True).pack(side="left", padx=(0, 8))
         self._mk_button(bl_ops, "移除选中", self._remove_blacklist_program, width=10, small_adapt=True).pack(side="left", padx=(0, 8))
