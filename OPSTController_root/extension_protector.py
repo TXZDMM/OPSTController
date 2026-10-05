@@ -66,7 +66,7 @@ from tkinter import ttk, scrolledtext, messagebox
 #   userdata/           (基准、配置、日志、历史版本)
 # ============================================================
 APP_NAME = "OPSTcontroller"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 MUTEX_NAME = "OPSTcontroller_SingleInstance_Mutex"
 EXIT_EVENT_NAME = "OPSTcontroller_Exit_Event"
 SHOW_EVENT_NAME = "OPSTcontroller_Show_Window_Event"
@@ -5596,7 +5596,7 @@ class MainWindow:
         self._mk_button(prog_ops, "从程序库选择", lambda: self._pick_program(
             lambda name: self._add_prog_to_listbox(prog_listbox, name)),
             small_adapt=True).pack(side="left")
-        tk.Label(body4, text="识别对象为程序名（进程名），可从内置近500软件库或当前运行进程中选择，无需手动输入",
+        tk.Label(body4, text="识别对象为程序名（进程名），可从本机已安装程序或当前运行进程中选择，无需手动输入",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
 
         # ===== 节4.5：进程黑名单 =====
@@ -8432,30 +8432,53 @@ def main():
             pass
         # 延迟清理非空 _MEI 残留（防安全软件慢扫描锁文件）：后台线程在
         # 30 秒/90 秒后各重试一次，rmtree 失败静默忽略，不阻塞启动。
+        # 注意：TI 子进程的 tempfile.gettempdir() 可能回退到 C:\Windows\Temp
+        # （环境块缺少 TEMP 时），而 bootloader 实际解压在用户 TEMP，
+        # 因此必须多根扫描（TEMP/TMP 环境变量 + gettempdir + 系统 Temp）。
         try:
+            def _mei_roots():
+                roots = []
+                for k in ("TEMP", "TMP"):
+                    v = os.environ.get(k)
+                    if v and v not in roots:
+                        roots.append(v)
+                td = tempfile.gettempdir()
+                if td not in roots:
+                    roots.append(td)
+                sysroot = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp")
+                if sysroot not in roots:
+                    roots.append(sysroot)
+                return roots
+
+            def _sweep_mei(tag):
+                try:
+                    ok_n = fail_n = 0
+                    seen = set()
+                    for root in _mei_roots():
+                        for d in glob.glob(os.path.join(root, "_MEI*")):
+                            ap = os.path.normcase(os.path.abspath(d))
+                            if ap in seen:
+                                continue
+                            seen.add(ap)
+                            try:
+                                if cur_mei and ap == cur_mei:
+                                    continue
+                                shutil.rmtree(d, ignore_errors=False)
+                                ok_n += 1
+                            except Exception as e:
+                                fail_n += 1
+                                log_event("MEIClean", "失败", tag, f"{d}: {type(e).__name__}")
+                    if ok_n or fail_n:
+                        log_event("MEIClean", "延迟清理", tag,
+                                  f"扫描根={len(_mei_roots())} 删除={ok_n} 失败={fail_n}")
+                except Exception as e:
+                    log_event("MEIClean", "异常", tag, repr(e))
+
             def _delayed_mei_cleanup():
                 time.sleep(30)
-                try:
-                    for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
-                        try:
-                            if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
-                                continue
-                            shutil.rmtree(d, ignore_errors=True)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                _sweep_mei("30s")
                 time.sleep(60)
-                try:
-                    for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
-                        try:
-                            if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
-                                continue
-                            shutil.rmtree(d, ignore_errors=True)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                _sweep_mei("90s")
             threading.Thread(target=_delayed_mei_cleanup, daemon=True).start()
         except Exception:
             pass
@@ -8504,6 +8527,32 @@ def main():
         # 避免 PyInstaller 退出清理时文件被锁定导致"Failed to remove temporary directory"弹窗
         try:
             time.sleep(5)
+        except Exception:
+            pass
+        # 尽力清理非空 _MEI 残留（忽略失败：被安全软件锁住时放弃）
+        try:
+            _cur_mei = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
+            _roots = []
+            for _k in ("TEMP", "TMP"):
+                _v = os.environ.get(_k)
+                if _v and _v not in _roots:
+                    _roots.append(_v)
+            _td = tempfile.gettempdir()
+            if _td not in _roots:
+                _roots.append(_td)
+            _seen = set()
+            for _r in _roots:
+                for _d in glob.glob(os.path.join(_r, "_MEI*")):
+                    _ap = os.path.normcase(os.path.abspath(_d))
+                    if _ap in _seen:
+                        continue
+                    _seen.add(_ap)
+                    try:
+                        if _cur_mei and _ap == _cur_mei:
+                            continue
+                        shutil.rmtree(_d, ignore_errors=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
         # os._exit 跳过 PyInstaller bootloader 退出清理，

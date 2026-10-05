@@ -19,6 +19,16 @@ OPSTController_root/dist/
 # 运行时用户数据（首次运行自动生成，不推送）
 OPSTController_root/userdata/
 
+# 调试/构建残留（不推送）
+OPSTController_root/build_out.txt
+OPSTController_root/ui_test_out.txt
+OPSTController_root/clean_mei_probe.py
+OPSTController_root/clean_mei_out.txt
+OPSTController_root/probe*.txt
+OPSTController_root/kill_out*.txt
+OPSTController_root/_dist_tmp/
+OPSTController_root/_pycache_tmp/
+
 # 编辑器/系统
 .idea/
 .vscode/
