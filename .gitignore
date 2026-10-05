@@ -36,6 +36,9 @@ OPSTController_root/_pkg_tmp/
 OPSTController_root/make_zip_out.txt
 OPSTcontroller-*.zip
 seq_inject.txt
+OPSTController_root/kill_probe*.py
+OPSTController_root/kill_probe_out.txt
+OPSTController_root/kill_out*.txt
 
 # 编辑器/系统
 .idea/
