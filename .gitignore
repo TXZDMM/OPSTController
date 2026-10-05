@@ -28,6 +28,9 @@ OPSTController_root/probe*.txt
 OPSTController_root/kill_out*.txt
 OPSTController_root/_dist_tmp/
 OPSTController_root/_pycache_tmp/
+OPSTController_root/_pkg_tmp/
+OPSTController_root/make_zip_out.txt
+OPSTcontroller-*.zip
 
 # 编辑器/系统
 .idea/
