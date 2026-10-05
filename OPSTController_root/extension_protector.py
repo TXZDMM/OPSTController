@@ -27,6 +27,8 @@ import threading
 import logging
 import ctypes
 import shutil
+import glob
+import tempfile
 import subprocess
 from ctypes import wintypes
 
@@ -5039,7 +5041,7 @@ class MainWindow:
                     pass
                 import subprocess
                 exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-                subprocess.Popen(['cmd.exe', '/c', 'start', '', exe_path, '--restart'], shell=False)
+                subprocess.Popen([exe_path, '--restart'], shell=False)
                 os._exit(0)
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"重启失败: {e}\n请手动重启程序。")
@@ -5303,11 +5305,11 @@ class MainWindow:
                     self._append_log(f"检测到程序无响应（{elapsed:.1f}秒），正在自动重启...", "error")
                 except Exception:
                     pass
-                # 自动重启
+                # 自动重启（直接启动，不经 cmd 中间层，避免句柄继承导致 _MEI 清理失败）
                 try:
                     import subprocess
                     exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-                    subprocess.Popen(['cmd.exe', '/c', 'start', '', exe_path, '--restart'], shell=False)
+                    subprocess.Popen([exe_path, '--restart'], shell=False)
                 except Exception:
                     pass
                 time.sleep(1)
@@ -7533,6 +7535,31 @@ def enable_all_privileges():
 # 主入口
 # ============================================================
 def main():
+    # PyInstaller onefile 解压目录 _MEI 退出清理失败(弹"Failed to remove temporary
+    # directory")的常见根因：进程工作目录位于 _MEI 内或子进程继承 _MEI 句柄。
+    # 启动即切换到 exe 所在目录，消除 cwd 占用，减少退出时清理失败弹窗。
+    if getattr(sys, 'frozen', False):
+        try:
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            if exe_dir and os.path.isdir(exe_dir):
+                os.chdir(exe_dir)
+        except Exception:
+            pass
+        # 清理历史 _MEI 残留（当前进程 _MEIPASS 本身除外）：
+        # 仅尝试删除空目录（快速失败，绝不深度遍历），避免对运行中/占用
+        # 目录 rmtree 深度遍历导致启动卡住；非空残留由 bootloader 或系统清理。
+        try:
+            cur_mei = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
+            for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+                try:
+                    if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
+                        continue
+                    os.rmdir(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # 窗口模式（PyInstaller --windowed）下无控制台，sys.stdout 可能为 None，
     # 需先兜底，避免 --stop 等路径的 print() 抛异常中断流程。
     if sys.stdout is None:
@@ -7573,6 +7600,12 @@ def main():
                 _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
                               capture_output=True)
                 print("已发送强制终止命令。")
+        # 短暂等待，让安全软件完成对 _MEI 解压文件的扫描，
+        # 避免 PyInstaller 退出清理时文件被锁定导致"Failed to remove temporary directory"弹窗
+        try:
+            time.sleep(5)
+        except Exception:
+            pass
         sys.exit(0)
 
     # 单实例检测（--restart参数时跳过）
