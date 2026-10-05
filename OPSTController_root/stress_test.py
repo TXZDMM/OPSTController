@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Continuous tamper stress: repeatedly inject tamper into a rotating set of
 extensions, verify the monitor keeps detecting and restoring without hanging.
-Injects via HKCU\Software\Classes\.ext default value (reg add HKCR)."""
+Injects via HKCU Software Classes .ext default value (reg add HKCR)."""
 import subprocess, time, sys, os
 
 EXTS = [".docx", ".xlsx", ".png", ".jpg", ".mp4", ".zip", ".txt", ".pdf"]
