@@ -42,6 +42,7 @@ OPSTController_root/kill_out*.txt
 OPSTController_root/autostart_probe.py
 OPSTController_root/reg_probe.py
 OPSTController_root/ident_probe.py
+OPSTController_root/rot_test.py
 
 # 编辑器/系统
 .idea/

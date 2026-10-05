@@ -378,6 +378,14 @@ class _SafeRotatingFileHandler(logging.FileHandler):
         if size < self.max_bytes:
             return
         try:
+            # 轮转前必须先关闭本进程的打开句柄，否则 Windows 下
+            # rename 被占用文件会抛 PermissionError（Python 默认共享不含 DELETE）
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
             # 备份：protector.log -> protector.log.1 -> .2 -> .3
             for i in range(self.backup_count - 1, 0, -1):
                 src = f"{self.baseFilename}.{i}"
@@ -388,6 +396,12 @@ class _SafeRotatingFileHandler(logging.FileHandler):
                 os.replace(self.baseFilename, f"{self.baseFilename}.1")
         except OSError:
             pass  # 轮转失败不影响主日志记录
+        finally:
+            if self.stream is None:
+                try:
+                    self.stream = self._open()
+                except Exception:
+                    pass
 
     def emit(self, record):
         try:
