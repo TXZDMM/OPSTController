@@ -7755,8 +7755,16 @@ def _force_kill_all_opst():
                 if not kernel32.Process32NextW(snapshot, ctypes.byref(pe)):
                     break
         kernel32.CloseHandle(snapshot)
+        try:
+            log_event("KillAdmin", "完成", f"强杀结果", f"killed={killed} admin={is_admin()}")
+        except Exception:
+            pass
         return killed
-    except Exception:
+    except Exception as e:
+        try:
+            log_event("KillAdmin", "异常", "强杀失败", repr(e))
+        except Exception:
+            pass
         return -1
 
 
