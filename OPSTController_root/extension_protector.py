@@ -347,7 +347,9 @@ WAIT_TIMEOUT = 0x00000102
 def setup_logger():
     logger = logging.getLogger("ExtProtector")
     logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    # 日志轮转：单个文件上限 2MB，保留 3 份历史（长期常驻监控避免日志无限膨胀）
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
