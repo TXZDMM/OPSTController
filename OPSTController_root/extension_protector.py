@@ -8432,23 +8432,28 @@ def main():
             pass
         # 延迟清理非空 _MEI 残留（防安全软件慢扫描锁文件）：后台线程在
         # 30 秒/90 秒后各重试一次，rmtree 失败静默忽略，不阻塞启动。
-        # 注意：TI 子进程的 tempfile.gettempdir() 可能回退到 C:\Windows\Temp
-        # （环境块缺少 TEMP 时），而 bootloader 实际解压在用户 TEMP，
-        # 因此必须多根扫描（TEMP/TMP 环境变量 + gettempdir + 系统 Temp）。
+        # TI 子进程的环境块可能不含用户 TEMP（gettempdir 回退 C:\Windows\Temp），
+        # 因此必须全根扫描：TEMP/TMP 环境变量 + gettempdir + 系统 Temp +
+        # 所有用户 profile 的 AppData\Local\Temp。
         try:
             def _mei_roots():
                 roots = []
                 for k in ("TEMP", "TMP"):
                     v = os.environ.get(k)
-                    if v and v not in roots:
+                    if v:
                         roots.append(v)
-                td = tempfile.gettempdir()
-                if td not in roots:
-                    roots.append(td)
-                sysroot = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp")
-                if sysroot not in roots:
-                    roots.append(sysroot)
-                return roots
+                roots.append(tempfile.gettempdir())
+                roots.append(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp"))
+                try:
+                    for p in glob.glob(os.path.join(r"C:\Users", "*", "AppData", "Local", "Temp")):
+                        roots.append(p)
+                except Exception:
+                    pass
+                uniq = []
+                for r in roots:
+                    if r and r not in uniq:
+                        uniq.append(r)
+                return uniq
 
             def _sweep_mei(tag):
                 try:
@@ -8475,6 +8480,9 @@ def main():
                     log_event("MEIClean", "异常", tag, repr(e))
 
             def _delayed_mei_cleanup():
+                log_event("MEIClean", "线程", "启动",
+                          f"TEMP={os.environ.get('TEMP')} TMP={os.environ.get('TMP')} "
+                          f"gettempdir={tempfile.gettempdir()}")
                 time.sleep(30)
                 _sweep_mei("30s")
                 time.sleep(60)
@@ -8540,6 +8548,15 @@ def main():
             _td = tempfile.gettempdir()
             if _td not in _roots:
                 _roots.append(_td)
+            _sysroot = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp")
+            if _sysroot not in _roots:
+                _roots.append(_sysroot)
+            try:
+                for _p in glob.glob(os.path.join(r"C:\Users", "*", "AppData", "Local", "Temp")):
+                    if _p not in _roots:
+                        _roots.append(_p)
+            except Exception:
+                pass
             _seen = set()
             for _r in _roots:
                 for _d in glob.glob(os.path.join(_r, "_MEI*")):
