@@ -4356,6 +4356,76 @@ class MainWindow:
                 pass
         # 启动退出信号检查（每500ms检查一次）
         self._check_exit_event()
+        # 线程退出看门狗：不依赖 tk 主循环。
+        # TI/SYSTEM 提权实例可能无 UI 主循环（after 回调不执行），
+        # 退出信号只能由独立线程轮询处理，否则 --stop 后进程卡死。
+        try:
+            threading.Thread(target=self._exit_watch_thread, daemon=True).start()
+        except Exception:
+            pass
+
+    def _exit_watch_thread(self):
+        """独立线程轮询退出信号（线程安全退出，不依赖 tk mainloop）"""
+        while True:
+            try:
+                if self._exiting:
+                    return
+                if check_exit_event(self.exit_event):
+                    self._append_log("收到退出信号(看门狗线程)，正在关闭...", "warn")
+                    self._threadsafe_exit()
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def _threadsafe_exit(self):
+        """线程安全的强制退出：停监控→保存→解锁→立即退出进程。
+        仅在无 tk 主循环或主循环卡死时由看门狗线程调用。"""
+        try:
+            if self.monitor is not None and self.monitor.is_alive():
+                try:
+                    self.monitor.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.baseline_mgr.save_config()
+        except Exception:
+            pass
+        try:
+            if self.monitor is not None:
+                self.monitor._unlock_all()
+        except Exception:
+            pass
+        try:
+            if self.exit_event:
+                _CloseHandle(self.exit_event)
+            if self.show_event:
+                _CloseHandle(self.show_event)
+        except Exception:
+            pass
+        self._exiting = True
+        # 留给安全软件/监控线程收尾
+        try:
+            time.sleep(3.5)
+        except Exception:
+            pass
+        # 清理本实例 _MEI 残留后立即退出（不触发 bootloader 清理弹窗）
+        try:
+            import shutil as _shutil
+            _cur = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
+            _td = tempfile.gettempdir()
+            for _d in glob.glob(os.path.join(_td, "_MEI*")):
+                try:
+                    if _cur and os.path.normcase(os.path.abspath(_d)) == _cur:
+                        continue
+                    _shutil.rmtree(_d, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        os._exit(0)
 
     def _minimize_to_taskbar(self):
         """最小化到任务栏（后台常驻，托盘图标仍在）"""
