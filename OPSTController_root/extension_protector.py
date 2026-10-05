@@ -944,6 +944,24 @@ def _generate_default_program_names():
         ("HandBrake", "HandBrake"), ("FormatFactory", "格式工厂"), ("XMediaRecode", "XMedia Recode"),
         ("Freemake", "Freemake视频转换器"), ("AnyVideo", "Any Video Converter"), ("WinX", "WinX视频转换器"),
         ("Movavi", "Movavi视频转换器"), ("Aiseesoft", "Aiseesoft"), ("Wondershare", "万兴"),
+        # ===== 短视频/内容平台 (30) =====
+        ("BiliBili", "哔哩哔哩"), ("哔哩哔哩", "哔哩哔哩"), ("bilibili", "哔哩哔哩"),
+        ("JianYing", "剪映"), ("CapCut", "剪映国际版"), ("剪映", "剪映"),
+        ("Douyin", "抖音"), ("TikTok", "抖音国际版"), ("抖音", "抖音"),
+        ("Kwai", "快手"), ("快手", "快手"), ("XiguaVideo", "西瓜视频"), ("西瓜视频", "西瓜视频"),
+        ("Toutiao", "今日头条"), ("今日头条", "今日头条"), ("Weibo", "微博"), ("微博", "微博"),
+        ("Xiaohongshu", "小红书"), ("RedNote", "小红书"), ("小红书", "小红书"),
+        ("Zhihu", "知乎"), ("知乎", "知乎"), ("MangoTV", "芒果TV"), ("芒果TV", "芒果TV"),
+        ("Sohu", "搜狐"), ("NeteaseVideo", "网易视频"), ("163", "网易"),
+        ("Quark", "夸克浏览器"), ("夸克", "夸克"), ("UCBrowser", "UC浏览器"),
+        # ===== 网盘/云文档补充 (20) =====
+        ("AliyunDrive", "阿里云盘"), ("aDrive", "阿里云盘"), ("阿里云盘", "阿里云盘"),
+        ("TianyiCloud", "天翼云盘"), ("天翼云盘", "天翼云盘"), ("115", "115网盘"),
+        ("115Pan", "115网盘"), ("QuarkPan", "夸克网盘"), ("123Pan", "123云盘"),
+        ("123Yun", "123云盘"), ("TencentDocs", "腾讯文档"), ("腾讯文档", "腾讯文档"),
+        ("Shimo", "石墨文档"), ("石墨文档", "石墨文档"), ("Youdao", "有道"),
+        ("有道", "有道"), ("YoudaoDict", "有道词典"), ("NeteaseMail", "网易邮箱"),
+        ("MailMaster", "网易邮箱大师"), ("Foxmail", "Foxmail"),
     ]
     return names
 
@@ -2636,7 +2654,7 @@ class DefaultOptionDialog:
 class MonitorThread(threading.Thread):
     GRACE_PERIOD_SECONDS = 10  # 启动后宽限期：只检测不恢复，给用户备份机会
 
-    def __init__(self, engine, baseline_mgr, popup_callback, log_callback, root=None):
+    def __init__(self, engine, baseline_mgr, popup_callback, log_callback, root=None, process_enforcer=None):
         super().__init__(daemon=True)
         self.engine = engine
         self.baseline = baseline_mgr
@@ -2653,9 +2671,13 @@ class MonitorThread(threading.Thread):
         self._handling_exts = set()  # 正在处理的扩展名（关联检测防递归）
         # 持续篡改追踪 + 进程打击
         self.persistent_tracker = PersistentTracker()
-        blacklist_path = os.path.join(USERDATA_DIR, "process_blacklist.json")
-        history_path = os.path.join(USERDATA_DIR, "process_blacklist_history.json")
-        self.process_enforcer = ProcessEnforcer(blacklist_path, history_path)
+        if process_enforcer is not None:
+            # 与设置页黑名单管理共享同一实例，避免双份黑名单互不同步
+            self.process_enforcer = process_enforcer
+        else:
+            blacklist_path = os.path.join(USERDATA_DIR, "process_blacklist.json")
+            history_path = os.path.join(USERDATA_DIR, "process_blacklist_history.json")
+            self.process_enforcer = ProcessEnforcer(blacklist_path, history_path)
         self._persistent_mode = False  # 是否处于持续篡改模式（缩短轮询间隔）
         self._persistent_cooldown_until = 0  # 持续模式冷却到期时间（解锁后保持30秒高速轮询）
         self._last_unlock_check = 0
@@ -2857,7 +2879,9 @@ class MonitorThread(threading.Thread):
         # 每10秒输出一次锁定状态统计
         if locked_count > 0 and time.time() - self._last_lock_stats_log >= 10:
             self._last_lock_stats_log = time.time()
-            high_freq = [e for e in self.persistent_tracker._unlocked_exts
+            # list() 快照：锁定巡检/恢复流程可能并发修改 _unlocked_exts，
+            # 直接迭代会抛 RuntimeError: dictionary changed size during iteration
+            high_freq = [e for e in list(self.persistent_tracker._unlocked_exts)
                          if self.persistent_tracker.is_in_high_freq(e)]
             self.log_callback(f"[防护状态] 锁定中:{locked_count} 高频观察:{len(high_freq)} 已检测:{checked_count}", "info")
             log_event("SYSTEM", "防护状态", "统计", f"locked={locked_count}, highfreq={len(high_freq)}, checked={checked_count}")
@@ -4282,6 +4306,13 @@ class MainWindow:
         self._batch_popup_active = False
         self._popup_paused_until = 0  # 暂停弹窗直到的时间戳
         self._global_lock_mode = False  # 全局锁定模式
+        # 共享进程打击器：监控线程与设置页黑名单管理共用同一实例（同一黑名单文件）
+        try:
+            _bl_p = os.path.join(USERDATA_DIR, "process_blacklist.json")
+            _hist_p = os.path.join(USERDATA_DIR, "process_blacklist_history.json")
+            self.process_enforcer = ProcessEnforcer(_bl_p, _hist_p)
+        except Exception:
+            self.process_enforcer = None
         self._build_ui()
         # 关闭按钮改为后台常驻，不退出
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_background)
@@ -4400,6 +4431,9 @@ class MainWindow:
                                         bg=self.C["nav"])
         self.ext_count_label.pack(side="right", padx=16)
 
+        # 窗口缩放适配：设置页小尺寸按钮（文字→「过小」→隐藏）
+        self.root.bind("<Configure>", lambda e: self._apply_small_adapt(e.widget.winfo_width()))
+
     # ---------- UI 基础组件 ----------
     def _setup_ttk_style(self):
         """配置 ttk 深色风格（滚动条等）"""
@@ -4471,6 +4505,26 @@ class MainWindow:
         except Exception:
             pass
 
+    def _reenable_selfprotect(self):
+        """重新启用进程自我保护（状态页按钮）"""
+        if not self.ti_elevated:
+            self._append_log("当前未提权，进程自我保护不可用（需 TI/SYSTEM 权限运行）", "warn")
+            self._set_selfprotect_label(False, "未提权，不可用")
+            return
+        try:
+            ok, msg = protect_self_process()
+            if ok:
+                self._process_protected = True
+                self._append_log("进程自我保护已重新启用", "success")
+                self._set_selfprotect_label(True, msg)
+            else:
+                self._process_protected = False
+                self._append_log(f"进程自我保护启用失败: {msg}", "warn")
+                self._set_selfprotect_label(False, msg)
+        except Exception as e:
+            self._append_log(f"进程自我保护启用异常: {e}", "error")
+            self._set_selfprotect_label(False, str(e))
+
     def _mk_card(self, parent, title=None, desc=None):
         """创建深色卡片，返回 (card_frame, body_frame)"""
         card = tk.Frame(parent, bg=self.C["card"],
@@ -4489,7 +4543,7 @@ class MainWindow:
         card.pack(fill="x", pady=(0, 12))  # 卡片必须 pack 进父容器，否则内容不可见
         return card, body
 
-    def _mk_button(self, parent, text, command, kind="default", width=None, height=1):
+    def _mk_button(self, parent, text, command, kind="default", width=None, height=1, small_adapt=False):
         """创建 Win11 风格按钮（悬停变色）"""
         if kind == "primary":
             bg, hover, fg = self.C["accent"], self.C["accent_hover"], "#0B2B44"
@@ -4505,7 +4559,49 @@ class MainWindow:
                         width=width, height=height, padx=14, pady=5)
         btn.bind("<Enter>", lambda _e: btn.configure(bg=hover))
         btn.bind("<Leave>", lambda _e: btn.configure(bg=bg))
+        # 小尺寸适配注册（设置页按钮）：窗口缩小时文字变「过小」，再缩小直接隐藏
+        if small_adapt:
+            btn._orig_text = text
+            btn._orig_width = width
+            btn._kind = kind
+            if not hasattr(self, "_settings_buttons"):
+                self._settings_buttons = []
+            self._settings_buttons.append(btn)
         return btn
+
+    def _apply_small_adapt(self, root_width):
+        """设置页小尺寸按钮适配：窗口缩小时文字替换为「过小」，继续缩小直接隐藏。
+        禁止出现按钮裁切/显示一半的异常情况。"""
+        if not hasattr(self, "_settings_buttons"):
+            return
+        hide_threshold = 880   # 小于此宽度直接隐藏
+        shrink_threshold = 1000  # 小于此宽度文字替换为「过小」
+        for btn in self._settings_buttons:
+            try:
+                if root_width <= hide_threshold:
+                    if btn.winfo_manager() == "pack":
+                        try:
+                            btn._pack_info = btn.pack_info()
+                        except Exception:
+                            btn._pack_info = {}
+                        btn.pack_forget()
+                    btn.configure(text="过小")
+                elif root_width <= shrink_threshold:
+                    if btn.winfo_manager() == "" and getattr(btn, "_pack_info", None):
+                        try:
+                            btn.pack(**btn._pack_info)
+                        except Exception:
+                            pass
+                    btn.configure(text="过小")
+                else:
+                    if btn.winfo_manager() == "" and getattr(btn, "_pack_info", None):
+                        try:
+                            btn.pack(**btn._pack_info)
+                        except Exception:
+                            pass
+                    btn.configure(text=getattr(btn, "_orig_text", "设置"))
+            except Exception:
+                pass
 
     def _mk_page_header(self, page, title, subtitle=None):
         """创建页面标题区"""
@@ -4515,6 +4611,76 @@ class MainWindow:
         if subtitle:
             tk.Label(page, text=subtitle, font=("微软雅黑", 9), fg=self.C["text3"],
                      bg=self.C["bg"], anchor="w").pack(fill="x", padx=24)
+
+    def _pick_program(self, target_callback, title="从程序库选择"):
+        """程序选择窗口：候选 = 内置近500软件识别库 + 当前运行进程名。
+        选中后回调 target_callback(程序名)，无需用户手动输入。"""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=self.C["bg"])
+        win.geometry("480x540")
+        win.transient(self.root)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        # 候选集合：内置软件库（名称去重）+ 当前运行进程名
+        candidates = set()
+        for _k, name in _KNOWN_PROGID_MAP:
+            if name and isinstance(name, str):
+                candidates.add(name)
+        try:
+            import subprocess as _sp
+            _out = _sp.run(["tasklist", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, timeout=8).stdout
+            for line in _out.splitlines():
+                _p = line.split('","')[0].strip('"')
+                if _p and _p.lower().endswith(".exe"):
+                    candidates.add(_p[:-4])
+        except Exception:
+            pass
+        candidates = sorted(candidates, key=lambda s: s.lower())
+        tk.Label(win, text="搜索并选择程序（双击或点击确定）",
+                 font=("微软雅黑", 10, "bold"), fg=self.C["text"],
+                 bg=self.C["bg"], anchor="w").pack(fill="x", padx=16, pady=(14, 4))
+        search_var = tk.StringVar()
+        entry = tk.Entry(win, textvariable=search_var, font=("微软雅黑", 9),
+                         bg=self.C["btn"], fg=self.C["text"], relief="flat",
+                         highlightthickness=0, insertbackground=self.C["text"])
+        entry.pack(fill="x", padx=16, pady=4)
+        listbox = tk.Listbox(win, font=("微软雅黑", 9), bg=self.C["btn"],
+                             fg=self.C["text"], selectbackground=self.C["nav_sel"],
+                             relief="flat", highlightthickness=0)
+        listbox.pack(fill="both", expand=True, padx=16, pady=(2, 8))
+        tk.Label(win, text=f"共 {len(candidates)} 个候选（内置软件库 + 当前运行进程）",
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["bg"], anchor="w").pack(fill="x", padx=16)
+        ops = tk.Frame(win, bg=self.C["bg"])
+        ops.pack(fill="x", padx=16, pady=(4, 14))
+
+        def _refresh(_a=None, _b=None, _c=None):
+            q = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            for cand in candidates:
+                if not q or q in cand.lower():
+                    listbox.insert(tk.END, cand)
+
+        def _confirm():
+            sel = listbox.curselection()
+            if sel:
+                try:
+                    target_callback(listbox.get(sel[0]))
+                    win.destroy()
+                except Exception:
+                    win.destroy()
+
+        search_var.trace_add("write", _refresh)
+        listbox.bind("<Double-Button-1>", lambda _e: _confirm())
+        entry.bind("<Return>", lambda _e: _confirm())
+        self._mk_button(ops, "确定添加", _confirm, kind="primary").pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "取消", win.destroy).pack(side="left")
+        _refresh()
+        entry.focus_set()
+        return win
 
     def _mk_scroll_container(self, page):
         """创建可滚动内容容器，返回 content_frame（页面内滚动区）
@@ -4555,6 +4721,75 @@ class MainWindow:
             self.root.bind_all("<MouseWheel>", _on_mousewheel)
         return content
 
+    def _flow_wrap(self, parent, widgets, gap=8, anchor="left"):
+        """Flow 布局：容器宽度不足时按钮自动换行（窗口缩放适配）。
+        预建固定行容器 + 重入保护，避免 <Configure> 触发重排造成死循环。"""
+        state = {"busy": False, "pending": False}
+        rows = []
+        for _i in range(max(1, len(widgets))):
+            rf = tk.Frame(parent, bg=parent["bg"])
+            rf.pack(fill="x", pady=2)
+            rows.append(rf)
+        def _relayout(_e=None):
+            if state["busy"]:
+                state["pending"] = True
+                return
+            state["busy"] = True
+            try:
+                avail = parent.winfo_width()
+                if avail <= 1:
+                    return
+                widths = []
+                for w in widgets:
+                    try:
+                        w.update_idletasks()
+                        widths.append(w.winfo_reqwidth())
+                    except Exception:
+                        widths.append(0)
+                # 贪心分行
+                assignment = [[]]
+                total = 0
+                for w, rw in zip(widgets, widths):
+                    if total + rw + gap > avail and assignment[-1]:
+                        assignment.append([])
+                        total = 0
+                    assignment[-1].append(w)
+                    total += rw + gap
+                for w in widgets:
+                    try:
+                        w.pack_forget()
+                    except Exception:
+                        pass
+                for ri, rw_list in enumerate(assignment):
+                    if ri >= len(rows):
+                        break
+                    for w in rw_list:
+                        try:
+                            w.pack(in_=rows[ri], side="left", padx=(0, gap))
+                        except Exception:
+                            pass
+                # 清理未使用的行容器
+                for ri in range(len(assignment), len(rows)):
+                    for c in list(rows[ri].winfo_children()):
+                        try:
+                            c.pack_forget()
+                        except Exception:
+                            pass
+            finally:
+                state["busy"] = False
+                if state["pending"]:
+                    state["pending"] = False
+                    try:
+                        parent.after_idle(_relayout)
+                    except Exception:
+                        pass
+        parent.bind("<Configure>", _relayout)
+        try:
+            self.root.after(50, _relayout)
+        except Exception:
+            pass
+        return _relayout
+
     # ---------- 页面：状态 ----------
     def _build_page_home(self, parent):
         page = tk.Frame(parent, bg=self.C["bg"])
@@ -4563,21 +4798,34 @@ class MainWindow:
         # 全局可滑动：整页内容放入滚动容器（窗口最大化后内容仍可完整访问）
         body = self._mk_scroll_container(page)
 
-        # 卡片1：保护状态（状态行 + 启动/停止）
+        # 卡片1：保护状态（状态行 + 启动/停止 + 进程自我保护合并排布，可自动换行）
         card, cb = self._mk_card(body, "保护状态", "实时监控 7 项注册表位置，阻止第三方软件篡改默认打开方式")
         self.status_label = tk.Label(cb, text="● 状态：未初始化",
                                      font=("微软雅黑", 14, "bold"),
                                      fg=self.C["text2"], bg=self.C["card"], anchor="w")
-        self.status_label.pack(fill="x", pady=(4, 10))
-        btn_row = tk.Frame(cb, bg=self.C["card"])
-        btn_row.pack(fill="x")
-        self.btn_start = self._mk_button(btn_row, "启动保护", self._start_protection,
-                                         kind="success", width=12)
-        self.btn_start.pack(side="left", padx=(0, 8))
-        self.btn_stop = self._mk_button(btn_row, "停止保护", self._stop_protection,
-                                        kind="danger", width=12, )
-        self.btn_stop.configure(state="disabled")
-        self.btn_stop.pack(side="left")
+        self.status_label.pack(fill="x", pady=(4, 8))
+        self._protect_btns = []
+        btn_start = self._mk_button(cb, "启动保护", self._start_protection, kind="success")
+        btn_stop = self._mk_button(cb, "停止保护", self._stop_protection, kind="danger")
+        btn_stop.configure(state="disabled")
+        self.btn_start = btn_start
+        self.btn_stop = btn_stop
+        # 进程自我保护状态（与启动/停止按钮合并排布、自动换行）
+        self._selfprotect_label = tk.Label(cb, text="进程自我保护：—",
+                                           font=("微软雅黑", 10),
+                                           fg=self.C["text2"], bg=self.C["card"], anchor="w")
+        btn_selfprotect = self._mk_button(cb, "重新启用", self._reenable_selfprotect, kind="default")
+        self.btn_selfprotect = btn_selfprotect
+        self._protect_btns += [btn_start, btn_stop, btn_selfprotect]
+        self._flow_wrap(cb, self._protect_btns, gap=8)
+        # 保护级说明（BH0-BH5 + 红名单），原扩展名页迁入状态页"保护状态"分类
+        protect_info = (
+            "BH0：仅检测不阻止 | BH1：自动恢复基准值并验证 | BH2：ACL锁定UserChoice键\n"
+            "BH3：ACL锁定+System完整性标签 | BH4：强锁定+进程降为Untrusted\n"
+            "BH5：强锁定+Untrusted降权+NtSuspendProcess冻结 | 红名单：进程永久拒绝注册表操作"
+        )
+        tk.Label(cb, text=protect_info, font=("微软雅黑", 8), fg=self.C["text3"],
+                 bg=self.C["card"], anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
         # 卡片2：主界面输出窗口（原版风格，实时输出保护事件与状态）
         out_card = tk.Frame(body, bg=self.C["card"],
@@ -4591,7 +4839,7 @@ class MainWindow:
                                                        wrap="word", state="disabled",
                                                        bg="#1A1A1A", fg="#D4D4D4",
                                                        insertbackground="#D4D4D4",
-                                                       relief="flat", bd=0, height=16,
+                                                       relief="flat", bd=0, height=26,
                                                        highlightbackground=self.C["card_border"],
                                                        highlightthickness=1)
         self.status_output.pack(fill="x", padx=16, pady=(0, 14))
@@ -4599,23 +4847,20 @@ class MainWindow:
                            ("error", "#FF99A4"), ("success", "#6CCB5F")):
             self.status_output.tag_config(tag, foreground=color)
 
-        # 底部信息栏：权限与自我保护摘要 + 常用操作（一行，避免挤出可视区）
+        # 底部信息栏：权限摘要 + 常用操作（按钮自动换行适配窗口缩放）
         bar = tk.Frame(body, bg=self.C["card"],
                        highlightbackground=self.C["card_border"],
                        highlightthickness=1, bd=0)
         bar.pack(fill="x")
         info_col = tk.Frame(bar, bg=self.C["card"])
-        info_col.pack(side="left", fill="x", expand=True, padx=16, pady=10)
-        self._selfprotect_label = tk.Label(info_col, text="进程自我保护：—",
-                                           font=("微软雅黑", 10),
-                                           fg=self.C["text2"], bg=self.C["card"], anchor="w")
-        self._selfprotect_label.pack(fill="x", pady=1)
+        info_col.pack(side="left", padx=16, pady=10)
         self._perm_detail_label = tk.Label(info_col, text="权限：—",
                                            font=("微软雅黑", 9),
                                            fg=self.C["text3"], bg=self.C["card"], anchor="w")
         self._perm_detail_label.pack(fill="x", pady=1)
         op_col = tk.Frame(bar, bg=self.C["card"])
-        op_col.pack(side="right", padx=16, pady=10)
+        op_col.pack(side="right", fill="x", expand=True, padx=16, pady=10)
+        op_btns = []
         for text, cmd, kind in [
             ("备份当前基准", self._backup_current, "default"),
             ("深层扫描", self._manual_deep_scan, "default"),
@@ -4623,7 +4868,8 @@ class MainWindow:
             ("历史版本管理", self._show_history, "default"),
         ]:
             # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
-            self._mk_button(op_col, text, cmd, kind=kind).pack(side="left", padx=(0, 6))
+            op_btns.append(self._mk_button(op_col, text, cmd, kind=kind))
+        self._flow_wrap(op_col, op_btns, gap=6)
 
     # ---------- 页面：扩展名 ----------
     def _build_page_exts(self, parent):
@@ -4638,28 +4884,201 @@ class MainWindow:
                  fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left"
                  ).pack(fill="x", pady=2)
 
-        card2, cb2 = self._mk_card(body, "基准操作")
-        for text, cmd in [
-            ("备份当前基准", self._backup_current),
-            ("深层扫描", self._manual_deep_scan),
-            ("历史版本管理", self._show_history),
-            ("从文件加载基准", lambda: self._load_baseline_from_file(self.root)),
-            ("查看基准说明", self._open_baseline_download),
-        ]:
-            self._mk_button(cb2, text, cmd, width=20).pack(side="left", padx=(0, 8), pady=2)
+        # 单扩展名锁定：锁定某个扩展名的默认打开方式（配置保存在文件中）
+        lock_card, lock_cb = self._mk_card(
+            body, "单扩展名锁定",
+            "锁定后该扩展名的默认打开方式不再随其他软件篡改而改变，配置自动保存在文件中")
+        lock_row = tk.Frame(lock_cb, bg=self.C["card"])
+        lock_row.pack(fill="x", pady=(2, 4))
+        self._lock_ext_entry = tk.Entry(lock_row, font=("微软雅黑", 9), width=14,
+                                        bg=self.C["btn"], fg=self.C["text"],
+                                        relief="flat", highlightthickness=0,
+                                        insertbackground=self.C["text"])
+        self._lock_ext_entry.pack(side="left", padx=(0, 6))
+        self._mk_button(lock_row, "读取当前", self._lock_ext_read_current, width=10).pack(side="left", padx=(0, 6))
+        self._mk_button(lock_row, "锁定当前默认应用", self._lock_ext_default, kind="primary").pack(side="left", padx=(0, 6))
+        self._lock_ext_status = tk.Label(lock_cb, text="", font=("微软雅黑", 9),
+                                         fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left")
+        self._lock_ext_status.pack(fill="x", pady=(0, 4))
+        lk_list_frame = tk.Frame(lock_cb, bg=self.C["card"])
+        lk_list_frame.pack(fill="x", pady=4)
+        self._locked_ext_listbox = tk.Listbox(lk_list_frame, font=("微软雅黑", 9), height=4,
+                                              bg=self.C["btn"], fg=self.C["text"],
+                                              selectbackground=self.C["nav_sel"],
+                                              relief="flat", highlightthickness=0)
+        self._locked_ext_listbox.pack(side="left", fill="x", expand=True)
+        tk.Scrollbar(lk_list_frame, orient="vertical",
+                     command=self._locked_ext_listbox.yview).pack(side="right", fill="y")
+        self._locked_ext_listbox.config(yscrollcommand=lambda *a: None)
+        lk_ops = tk.Frame(lock_cb, bg=self.C["card"])
+        lk_ops.pack(fill="x")
+        self._mk_button(lk_ops, "解锁选中", self._lock_ext_unlock, width=10).pack(side="left")
+        self._refresh_locked_ext_list()
 
-        card3, cb3 = self._mk_card(body, "保护级说明")
-        protect_info = (
-            "BH0：仅检测，不阻止（宽限期内）\n"
-            "BH1：自动恢复基准值，验证后生效\n"
-            "BH2：ACL锁定UserChoice键（仅SYSTEM/TI可写）\n"
-            "BH3：ACL锁定 + System完整性标签（Medium进程无法写入）\n"
-            "BH4：强锁定 + 进程降为Untrusted完整性\n"
-            "BH5：强锁定 + Untrusted降权 + NtSuspendProcess全冻结\n"
-            "红名单：进程永久拒绝扩展名相关注册表操作"
-        )
-        tk.Label(cb3, text=protect_info, font=("微软雅黑", 9), fg=self.C["text2"],
-                 bg=self.C["card"], anchor="w", justify="left").pack(fill="x")
+    def _refresh_locked_ext_list(self):
+        """刷新锁定扩展名列表（数据来自 config['locked_defaults']，保存在文件中）"""
+        try:
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            self._locked_ext_listbox.delete(0, tk.END)
+            for ext in sorted(locked.keys()):
+                self._locked_ext_listbox.insert(tk.END, f"{ext}  →  {locked[ext]}")
+        except Exception:
+            pass
+
+    def _lock_ext_read_current(self):
+        """读取输入扩展名当前的默认打开方式"""
+        ext = self._lock_ext_entry.get().strip().lower()
+        if not ext.startswith("."):
+            self._lock_ext_status.config(text="请输入扩展名（以 . 开头，如 .txt）", fg=self.C["warn"])
+            return
+        try:
+            progid = get_prog_id(ext)
+            if progid:
+                name, _ = identify_tamperer(progid)
+                self._lock_ext_status.config(
+                    text=f"扩展名 {ext} 当前默认: {progid}" + (f"（{name}）" if name else ""),
+                    fg=self.C["text2"])
+            else:
+                self._lock_ext_status.config(text=f"扩展名 {ext} 当前为系统默认（无 UserChoice 记录）", fg=self.C["text2"])
+        except Exception as e:
+            self._lock_ext_status.config(text=f"读取失败: {e}", fg=self.C["error"])
+
+    def _lock_ext_default(self):
+        """锁定输入扩展名当前的默认打开方式：写入文件配置并同步基准"""
+        ext = self._lock_ext_entry.get().strip().lower()
+        if not ext.startswith("."):
+            self._lock_ext_status.config(text="请输入扩展名（以 . 开头，如 .txt）", fg=self.C["warn"])
+            return
+        try:
+            progid = get_prog_id(ext)
+            if not progid:
+                self._lock_ext_status.config(
+                    text=f"扩展名 {ext} 没有可锁定的默认应用（请先在系统中设置默认打开方式）", fg=self.C["warn"])
+                return
+            cfg = self.baseline_mgr.config
+            locked = cfg.setdefault("locked_defaults", {})
+            locked[ext] = progid
+            self.baseline_mgr.save_config()
+            # 同步基准：锁定值成为恢复目标
+            try:
+                self.baseline_mgr.update_extension(ext)
+            except Exception:
+                pass
+            self._refresh_locked_ext_list()
+            name, _ = identify_tamperer(progid)
+            self._lock_ext_status.config(
+                text=f"已锁定 {ext} → {progid}（{name or '未知软件'}），配置已保存到文件", fg=self.C["success"])
+            self._append_log(f"已锁定扩展名默认应用: {ext} → {progid}", "success")
+        except Exception as e:
+            self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
+
+    def _lock_ext_unlock(self):
+        """解锁选中的扩展名锁定项"""
+        sel = self._locked_ext_listbox.curselection()
+        if not sel:
+            return
+        line = self._locked_ext_listbox.get(sel[0])
+        ext = line.split("→")[0].strip()
+        try:
+            cfg = self.baseline_mgr.config
+            locked = cfg.get("locked_defaults", {}) or {}
+            if ext in locked:
+                del locked[ext]
+                self.baseline_mgr.save_config()
+            self._refresh_locked_ext_list()
+            self._lock_ext_status.config(text=f"已解锁 {ext}，配置已保存到文件", fg=self.C["text2"])
+            self._append_log(f"已解锁扩展名: {ext}", "info")
+        except Exception as e:
+            self._lock_ext_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
+
+    def _add_prog_to_listbox(self, listbox, name):
+        """从程序选择器添加白名单程序（去重后自动保存）"""
+        try:
+            exists = [listbox.get(i) for i in range(listbox.size())]
+            if name and name not in exists:
+                listbox.insert(tk.END, name)
+                self._append_log(f"已添加白名单程序: {name}", "success")
+                self._save_settings_if_ready()
+        except Exception:
+            pass
+
+    def _save_settings_if_ready(self):
+        """设置页已构建时触发自动保存（构建期间调用则跳过）"""
+        try:
+            if hasattr(self, "_settings_page_ready") and self._settings_page_ready:
+                self._auto_save_fn()
+        except Exception:
+            pass
+
+    def _refresh_blacklist_ui(self):
+        """刷新进程黑名单列表（来源：process_blacklist.json）"""
+        try:
+            if not hasattr(self, "_bl_listbox"):
+                return
+            self._bl_listbox.delete(0, tk.END)
+            pe = getattr(self, "process_enforcer", None)
+            items = sorted(pe._blacklist) if pe else []
+            for it in items:
+                self._bl_listbox.insert(tk.END, it)
+        except Exception:
+            pass
+
+    def _add_blacklist_program(self, name):
+        """添加程序到进程黑名单（进程名，小写保存）"""
+        try:
+            pe = getattr(self, "process_enforcer", None)
+            if not pe:
+                return
+            item = name.strip()
+            if not item:
+                return
+            if item.lower() not in {x.lower() for x in pe._blacklist}:
+                pe._blacklist.add(item.lower())
+                try:
+                    pe._save()
+                except Exception:
+                    pass
+                self._append_log(f"已添加进程黑名单: {item}", "warn")
+            self._refresh_blacklist_ui()
+        except Exception:
+            pass
+
+    def _remove_blacklist_program(self):
+        """移除选中的黑名单项"""
+        try:
+            pe = getattr(self, "process_enforcer", None)
+            if not pe:
+                return
+            sel = self._bl_listbox.curselection()
+            if not sel:
+                return
+            item = self._bl_listbox.get(sel[0])
+            pe._blacklist.discard(item)
+            try:
+                pe._save()
+            except Exception:
+                pass
+            self._append_log(f"已移除进程黑名单: {item}", "info")
+            self._refresh_blacklist_ui()
+        except Exception:
+            pass
+
+    def _clear_blacklist_ui(self):
+        """清空全部进程黑名单"""
+        try:
+            pe = getattr(self, "process_enforcer", None)
+            if not pe:
+                return
+            if messagebox.askyesno("确认", "确定清空全部进程黑名单？"):
+                pe._blacklist.clear()
+                try:
+                    pe._save()
+                except Exception:
+                    pass
+                self._append_log("进程黑名单已清空", "info")
+                self._refresh_blacklist_ui()
+        except Exception:
+            pass
 
     def _refresh_ext_page(self):
         """切换到扩展名页时刷新统计"""
@@ -4679,21 +5098,36 @@ class MainWindow:
         self._mk_page_header(page, "异常修复", "19 项独立修复 + 辅助工具")
         content = self._mk_scroll_container(page)
 
-        self._repair_status_var = tk.StringVar(value="就绪 · 点击任意按钮执行对应修复")
+        self._repair_status_var = tk.StringVar(value="就绪 · 点击任意按钮执行对应修复，完成后自动返回状态页")
         status_bar = tk.Frame(content, bg=self.C["card"], height=34)
         status_bar.pack(fill="x", pady=(4, 8))
         status_bar.pack_propagate(False)
         tk.Label(status_bar, textvariable=self._repair_status_var, font=("微软雅黑", 9),
                  fg=self.C["text2"], bg=self.C["card"], anchor="w").pack(fill="x", padx=12)
 
-        def make_button(parent_w, text, command, color, height=1):
+        def make_button(parent_w, text, command, height=1):
+            # 统一配色：全部使用标准深色按钮风格（取消多色混杂）
             return tk.Button(parent_w, text=text, command=command,
                              font=("微软雅黑", 9, "bold"),
-                             bg=color, fg="white",
-                             activebackground=self._lighten(color), activeforeground="white",
+                             bg=self.C["btn"], fg=self.C["text"],
+                             activebackground=self.C["nav_sel"], activeforeground=self.C["text"],
                              relief="flat", cursor="hand2", bd=0,
                              highlightthickness=0, height=height,
                              padx=8, pady=6)
+
+        def _wrap_jump(cmd):
+            """执行修复命令后自动跳转至状态页（保护输出窗口）"""
+            def _f():
+                try:
+                    cmd()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self._select_nav("home")
+                    except Exception:
+                        pass
+            return _f
 
         def add_section(title):
             sec = tk.LabelFrame(content, text="", bg=self.C["card"], bd=0,
@@ -4710,48 +5144,48 @@ class MainWindow:
         def place_buttons(grid, buttons):
             grid.columnconfigure(0, weight=1, uniform="btn")
             grid.columnconfigure(1, weight=1, uniform="btn")
-            for i, (text, command, bg) in enumerate(buttons):
+            for i, (text, command) in enumerate(buttons):
                 r, c = divmod(i, 2)
-                make_button(grid, text, command, bg).grid(row=r, column=c, sticky="ew", padx=3, pady=3)
+                make_button(grid, text, _wrap_jump(command)).grid(row=r, column=c, sticky="ew", padx=3, pady=3)
 
         place_buttons(add_section("一、解除注册表锁定（最核心）"), [
-            ("① 解除所有注册表锁定", lambda: self._repair_unlock_registry(), "#C0392B"),
-            ("② 清除锁定计数", self._repair_clear_lock_count, "#E67E22"),
+            ("① 解除所有注册表锁定", self._repair_unlock_registry),
+            ("② 清除锁定计数", self._repair_clear_lock_count),
         ])
         place_buttons(add_section("二、重置持续篡改追踪状态"), [
-            ("③ 清除单扩展名篡改历史", self._repair_clear_ext_history, "#2980B9"),
-            ("④ 清除批量篡改历史", self._repair_clear_progid_history, "#2980B9"),
-            ("⑤ 清除持续篡改标记", self._repair_clear_persistent_exts, "#2980B9"),
-            ("⑥ 清除批量篡改标记", self._repair_clear_batch_progids, "#2980B9"),
-            ("⑦ 退出持续篡改模式", self._repair_exit_persistent_mode, "#2980B9"),
-            ("⑧ 清除高频观察期", self._repair_clear_unlocked_exts, "#2980B9"),
+            ("③ 清除单扩展名篡改历史", self._repair_clear_ext_history),
+            ("④ 清除批量篡改历史", self._repair_clear_progid_history),
+            ("⑤ 清除持续篡改标记", self._repair_clear_persistent_exts),
+            ("⑥ 清除批量篡改标记", self._repair_clear_batch_progids),
+            ("⑦ 退出持续篡改模式", self._repair_exit_persistent_mode),
+            ("⑧ 清除高频观察期", self._repair_clear_unlocked_exts),
         ])
         place_buttons(add_section("三、重置防护引擎状态"), [
-            ("⑨ 清除冷却期", self._repair_clear_cooldown, "#16A085"),
-            ("⑩ 清除本周期同意记录", self._repair_clear_allowed_cycle, "#16A085"),
-            ("⑪ 清除 UserChoice 失败计数", self._repair_clear_uc_fail, "#16A085"),
-            ("⑫ 清除处理中集合", self._repair_clear_handling_exts, "#16A085"),
+            ("⑨ 清除冷却期", self._repair_clear_cooldown),
+            ("⑩ 清除本周期同意记录", self._repair_clear_allowed_cycle),
+            ("⑪ 清除 UserChoice 失败计数", self._repair_clear_uc_fail),
+            ("⑫ 清除处理中集合", self._repair_clear_handling_exts),
         ])
         place_buttons(add_section("四、清除弹窗 / 通知状态"), [
-            ("⑬ 关闭所有活动弹窗", self._repair_close_toasts, "#8E44AD"),
-            ("⑭ 清空弹窗队列", self._repair_clear_popup_queue, "#8E44AD"),
-            ("⑮ 清空批量弹窗队列", self._repair_clear_batch_queue, "#8E44AD"),
-            ("⑯ 取消批量计时器", self._repair_cancel_batch_timer, "#8E44AD"),
-            ("⑰ 解除弹窗暂停", self._repair_clear_popup_pause, "#8E44AD"),
+            ("⑬ 关闭所有活动弹窗", self._repair_close_toasts),
+            ("⑭ 清空弹窗队列", self._repair_clear_popup_queue),
+            ("⑮ 清空批量弹窗队列", self._repair_clear_batch_queue),
+            ("⑯ 取消批量计时器", self._repair_cancel_batch_timer),
+            ("⑰ 解除弹窗暂停", self._repair_clear_popup_pause),
         ])
         place_buttons(add_section("五、进程打击状态"), [
-            ("⑱ 清除进程黑名单", self._repair_clear_blacklist, "#96281B"),
-            ("⑲ 清除打击历史", self._repair_clear_strike_history, "#96281B"),
+            ("⑱ 清除进程黑名单", self._repair_clear_blacklist),
+            ("⑲ 清除打击历史", self._repair_clear_strike_history),
         ])
         place_buttons(add_section("六、其他 / 辅助工具"), [
-            ("历史版本管理", self._show_history, "#34495E"),
-            ("锁定模式 / 解除锁定", self._repair_global_lock, "#34495E"),
-            ("重置启动宽限期", self._repair_reset_grace, "#34495E"),
+            ("历史版本管理", self._show_history),
+            ("锁定模式 / 解除锁定", self._repair_global_lock),
+            ("重置启动宽限期", self._repair_reset_grace),
         ])
 
         bottom = tk.Frame(content, bg=self.C["bg"])
         bottom.pack(fill="x", pady=(8, 4))
-        make_button(bottom, "一键全部修复（20 项全部执行）", lambda: self._repair_all(), "#27AE60", height=2).pack(fill="x", pady=2)
+        make_button(bottom, "一键全部修复（20 项全部执行）", _wrap_jump(self._repair_all), height=2).pack(fill="x", pady=2)
 
     def _lighten(self, hex_color, amount=0.18):
         try:
@@ -4825,9 +5259,10 @@ class MainWindow:
 
         _check(body, "开机自启", autostart_var)
         _check(body, "检测到更改时弹窗通知（取消则静默阻止）", popup_var)
-        _row(body, "弹窗等待时间（秒）:", tk.Spinbox(body, from_=1, to=180,
+        block_spin = tk.Spinbox(body, from_=1, to=180,
              textvariable=block_var, width=6, bg=dark["btn"], fg=dark["text"],
-             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0)
+        _row(body, "弹窗等待时间（秒）:", block_spin)
         tk.Label(body, text="范围 1-180 秒；关闭弹窗时此值强制为 1 秒",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
         _row(body, "批量弹窗模式:", self._mk_radio_row(body, batch_popup_var,
@@ -4845,13 +5280,17 @@ class MainWindow:
         # ===== 节2：基准 =====
         sec2, body2 = self._mk_card(content, "基准")
         hist_var = tk.IntVar(value=cfg.get("history_versions", MAX_HISTORY_VERSIONS))
-        _row(body2, "基准保留版本数:", tk.Spinbox(body2, from_=1, to=20,
+        hist_spin = tk.Spinbox(body2, from_=1, to=20,
              textvariable=hist_var, width=6, bg=dark["btn"], fg=dark["text"],
-             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0)
+        _row(body2, "基准保留版本数:", hist_spin)
         b_ops = tk.Frame(body2, bg=dark["card"])
         b_ops.pack(fill="x", pady=6)
-        self._mk_button(b_ops, "查看基准说明", self._open_baseline_download).pack(side="left", padx=(0, 8))
-        self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root)).pack(side="left")
+        self._mk_button(b_ops, "备份当前基准", self._backup_current, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(b_ops, "深层扫描", self._manual_deep_scan, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(b_ops, "历史版本管理", self._show_history, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(b_ops, "查看基准说明", self._open_baseline_download, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root), small_adapt=True).pack(side="left")
 
         # ===== 节3：权限 =====
         sec3, body3 = self._mk_card(content, "权限")
@@ -4865,8 +5304,8 @@ class MainWindow:
              [("minimal", "极简"), ("normal", "普通"), ("detailed", "详细"), ("full", "完整")]))
         a_ops = tk.Frame(body3, bg=dark["card"])
         a_ops.pack(fill="x", pady=6)
-        self._mk_button(a_ops, "导出审计日志", self._export_audit_log).pack(side="left", padx=(0, 8))
-        self._mk_button(a_ops, "查看运行日志", lambda: self._select_nav("log")).pack(side="left")
+        self._mk_button(a_ops, "导出审计日志", self._export_audit_log, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(a_ops, "查看运行日志", lambda: self._select_nav("log"), small_adapt=True).pack(side="left")
         tk.Label(body3, text="审计日志记录：进程名/路径/命令行/数字签名/父进程/时间/注册表路径/旧值/新值",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
 
@@ -4892,14 +5331,16 @@ class MainWindow:
             if val and val not in [ext_listbox.get(i).lower() for i in range(ext_listbox.size())]:
                 ext_listbox.insert(tk.END, val)
                 ext_entry.delete(0, tk.END)
+                save_settings()
         def del_whitelist_ext():
             sel = ext_listbox.curselection()
             if sel:
                 ext_listbox.delete(sel[0])
+                save_settings()
         ext_ops = tk.Frame(body4, bg=dark["card"])
         ext_ops.pack(fill="x")
-        self._mk_button(ext_ops, "添加", add_whitelist_ext, width=8).pack(side="left", padx=(0, 8))
-        self._mk_button(ext_ops, "删除选中", del_whitelist_ext, width=10).pack(side="left")
+        self._mk_button(ext_ops, "添加", add_whitelist_ext, width=8, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(ext_ops, "删除选中", del_whitelist_ext, width=10, small_adapt=True).pack(side="left")
 
         tk.Label(body4, text="白名单程序（程序对任意扩展名的操作自动同意）",
                  font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x", pady=(12, 0))
@@ -4921,14 +5362,45 @@ class MainWindow:
             if val and val not in [prog_listbox.get(i) for i in range(prog_listbox.size())]:
                 prog_listbox.insert(tk.END, val)
                 prog_entry.delete(0, tk.END)
+                save_settings()
         def del_whitelist_prog():
             sel = prog_listbox.curselection()
             if sel:
                 prog_listbox.delete(sel[0])
+                save_settings()
         prog_ops = tk.Frame(body4, bg=dark["card"])
         prog_ops.pack(fill="x")
-        self._mk_button(prog_ops, "添加", add_whitelist_prog, width=8).pack(side="left", padx=(0, 8))
-        self._mk_button(prog_ops, "删除选中", del_whitelist_prog, width=10).pack(side="left")
+        self._mk_button(prog_ops, "添加", add_whitelist_prog, width=8, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(prog_ops, "删除选中", del_whitelist_prog, width=10, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(prog_ops, "从程序库选择", lambda: self._pick_program(
+            lambda name: self._add_prog_to_listbox(prog_listbox, name)),
+            small_adapt=True).pack(side="left")
+        tk.Label(body4, text="识别对象为程序名（进程名），可从内置近500软件库或当前运行进程中选择，无需手动输入",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
+
+        # ===== 节4.5：进程黑名单 =====
+        sec4b, body4b = self._mk_card(content, "进程黑名单")
+        tk.Label(body4b, text="黑名单中的进程被识别为篡改者时将遭到强终止（进程名 / 路径）",
+                 font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x")
+        bl_list_frame = tk.Frame(body4b, bg=dark["card"])
+        bl_list_frame.pack(fill="x", pady=4)
+        self._bl_listbox = tk.Listbox(bl_list_frame, font=("微软雅黑", 9), height=5,
+                                      bg=dark["btn"], fg=dark["text"],
+                                      selectbackground=dark["nav_sel"], relief="flat",
+                                      highlightthickness=0)
+        self._bl_listbox.pack(side="left", fill="x", expand=True)
+        tk.Scrollbar(bl_list_frame, orient="vertical", command=self._bl_listbox.yview).pack(side="right", fill="y")
+        self._bl_listbox.config(yscrollcommand=lambda *a: None)
+        bl_ops = tk.Frame(body4b, bg=dark["card"])
+        bl_ops.pack(fill="x", pady=4)
+        self._mk_button(bl_ops, "从程序库选择", lambda: self._pick_program(
+            lambda name: self._add_blacklist_program(name)),
+            small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(bl_ops, "移除选中", self._remove_blacklist_program, width=10, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(bl_ops, "清空黑名单", self._clear_blacklist_ui, width=10, small_adapt=True).pack(side="left")
+        tk.Label(body4b, text="提示：自动拉黑（关联篡改≥3次）与手动添加均保存在文件中，重启后仍然生效",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
+        self._refresh_blacklist_ui()
 
         # ===== 节5：更改记录 =====
         sec5, body5 = self._mk_card(content, "更改记录")
@@ -5092,9 +5564,9 @@ class MainWindow:
                 self._append_log("=== 弹窗压力测试已触发 ===", "success")
                 return "break"
         detail_text.bind("<KeyRelease-Return>", _check_exit_code)
-        self._mk_button(h_ops, "刷新", refresh_history, width=8).pack(side="left", padx=(0, 8))
-        self._mk_button(h_ops, "检测当前状态", check_current_status, width=12).pack(side="left", padx=(0, 8))
-        self._mk_button(h_ops, "清空记录", clear_history, width=8).pack(side="left")
+        self._mk_button(h_ops, "刷新", refresh_history, width=8, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(h_ops, "检测当前状态", check_current_status, width=12, small_adapt=True).pack(side="left", padx=(0, 8))
+        self._mk_button(h_ops, "清空记录", clear_history, width=8, small_adapt=True).pack(side="left")
         refresh_history()
 
         # ===== 节6：关于 =====
@@ -5104,11 +5576,12 @@ class MainWindow:
         tk.Label(body6, text="GitHub: https://github.com/TXZDMM/OPSTController",
                  font=("微软雅黑", 9), fg=dark["info"], bg=dark["card"], anchor="w").pack(fill="x", pady=(4, 0))
 
-        # ===== 底部保存 =====
+        # ===== 底部：设置自动保存（无保存/放弃按钮，修改即生效） =====
         save_row = tk.Frame(content, bg=dark["bg"])
         save_row.pack(fill="x", pady=10)
+        self._last_perm_prompted = None
 
-        def save_settings():
+        def save_settings(ask_perm=False):
             old_perm = cfg.get("default_permission", "t")
             new_perm = perm_var.get()
             cfg["history_versions"] = hist_var.get()
@@ -5129,15 +5602,23 @@ class MainWindow:
             cfg["whitelist_programs"] = [prog_listbox.get(i) for i in range(prog_listbox.size())]
             self.baseline_mgr.save_config()
             if autostart_var.get():
-                if not is_autostart_set(): add_to_autostart()
+                if not is_autostart_set():
+                    try:
+                        add_to_autostart()
+                    except Exception:
+                        pass
             else:
-                remove_from_autostart()
-            self._append_log("设置已保存", "success")
-            messagebox.showinfo(APP_NAME, "设置已保存")
-            if new_perm != old_perm:
+                try:
+                    remove_from_autostart()
+                except Exception:
+                    pass
+            self._append_log("设置已自动保存", "success")
+            # 权限变更：询问是否立即重启生效（每次变化仅询问一次）
+            if new_perm != old_perm and ask_perm and self._last_perm_prompted != new_perm:
+                self._last_perm_prompted = new_perm
                 perm_labels = {"user": "普通用户", "administrator": "管理员", "system": "SYSTEM", "t": "TI"}
                 new_label = perm_labels.get(new_perm, new_perm)
-                if messagebox.askyesno(APP_NAME, f"运行权限已更改为【{new_label}】。\n\n是否立即重启程序使设置生效？"):
+                if messagebox.askyesno(APP_NAME, f"运行权限已自动保存为【{new_label}】。\n\n是否立即重启程序使设置生效？"):
                     self._restart_app()
 
         def _restart_app():
@@ -5155,11 +5636,18 @@ class MainWindow:
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"重启失败: {e}\n请手动重启程序。")
 
-        self._mk_button(save_row, "保存设置", save_settings, kind="primary", width=14).pack(side="left")
-        self._mk_button(save_row, "放弃修改", lambda: self._select_nav("home"), width=14).pack(side="left", padx=8)
-        tk.Label(save_row, text="* 运行权限更改需重启生效", font=("微软雅黑", 8),
-                 fg=dark["text3"], bg=dark["bg"]).pack(side="right")
+        # ===== 自动保存绑定：任何设置修改立即写入文件（无需点击保存） =====
+        self._auto_save_fn = save_settings
+        self._settings_page_ready = True
+        for _v in (autostart_var, popup_var, clearlog_var, nokill_var,
+                   batch_popup_var, mode_var, audit_level_var):
+            _v.trace_add("write", lambda *a: save_settings(ask_perm=False))
+        perm_var.trace_add("write", lambda *a: save_settings(ask_perm=True))
+        for _sb in (block_spin, hist_spin):
+            _sb.configure(command=lambda: save_settings(ask_perm=False))
 
+        tk.Label(save_row, text="* 设置修改后自动保存；运行权限更改需重启生效", font=("微软雅黑", 8),
+                 fg=dark["text3"], bg=dark["bg"]).pack(side="right")
     def _mk_radio_row(self, parent, var, options):
         """创建横向单选按钮组，返回容器 frame"""
         frame = tk.Frame(parent, bg=self.C["card"])
@@ -5363,7 +5851,8 @@ class MainWindow:
             self.engine, self.baseline_mgr,
             popup_callback=self._show_notification,
             log_callback=self._append_log,
-            root=self.root
+            root=self.root,
+            process_enforcer=self.process_enforcer
         )
         self.monitor.start()
         self.engine.paused = False
