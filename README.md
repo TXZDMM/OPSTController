@@ -44,7 +44,7 @@
 本程序是安全防护工具，但包含以下**强行为**，请在使用前知悉：
 
 1. **进程打击 / Process enforcement**：检测到持续或批量篡改时，会对关联的嫌疑进程执行降权、挂起、**强终止**（TerminateProcess → taskkill → wmic → Stop-Process 多方式重试），并将重复关联的进程自动拉入黑名单；同一进程累计拉黑 10 次进入红名单。系统关键进程（system、lsass、svchost、explorer 等）始终被跳过。
-2. **进程自保护 / Self-protection**：以 TI/SYSTEM 权限运行时，程序会设置自身进程 ACL，普通用户（含管理员）无法通过任务管理器直接终止本进程。完全退出请运行随附的 `停止OPSTcontroller.bat` 或 `OPSTcontroller.exe --stop`。
+2. **进程自保护 / Self-protection**：以 TI/SYSTEM 权限运行时，程序会设置自身进程 ACL，普通用户（含管理员）无法通过任务管理器直接终止本进程。完全退出请运行随附的 `停止OPSTcontroller.bat` 或 `OPSTcontroller.exe --stop`（自我保护实例无法被普通令牌终止时，`--stop` 会自动请求管理员权限执行强杀，UAC 关闭时静默完成）。
 3. **注册表锁键 / Registry locking**：持续/批量篡改时会锁定 UserChoice 等注册表键的 ACL（拒绝 Users/Administrators 写入），程序退出时自动解锁。
 4. **高权限运行 / High privilege**：默认以 TrustedInstaller 权限运行，可在设置中改为 administrator / system / user。未签名提权型工具可能被杀毒软件误报，请自行评估后再安装。
 5. **误报风险 / False-positive risk**：极少数情况下可能将"关联缺失/命令缺失"误判为篡改。请勿与其它修改文件关联的软件同时运行，并定期备份 `userdata/` 目录。
