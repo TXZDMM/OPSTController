@@ -35,6 +35,7 @@ OPSTController_root/_pycache_tmp/
 OPSTController_root/_pkg_tmp/
 OPSTController_root/make_zip_out.txt
 OPSTcontroller-*.zip
+seq_inject.txt
 
 # 编辑器/系统
 .idea/
