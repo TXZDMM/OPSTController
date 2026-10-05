@@ -1,0 +1,1 @@
+﻿page_history=True | page_diag=True | hist_tree_rows=(0, 0) | hist_stat=False | diag_len=480 | diag_has_priv=True | diag_has_lock=True | diag_has_baseline=True | total_buttons=60 no_cmd=0
