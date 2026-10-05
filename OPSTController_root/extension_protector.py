@@ -7049,10 +7049,10 @@ class MainWindow:
 
     # ============ 一键全部修复 ============
     def _repair_all(self, win=None):
-        """一键全部修复：依次执行全部 19 项 + 宽限期重置"""
+        """一键全部修复：依次执行全部 20 项状态修复"""
         if not messagebox.askyesno(APP_NAME,
             "【一键全部修复确认】\n\n"
-            "将依次执行全部 19 项修复：\n"
+            "将依次执行全部 20 项修复：\n"
             "① 解除注册表锁定（含清除锁定计数）\n"
             "② 重置持续篡改追踪状态\n"
             "③ 重置防护引擎状态\n"
@@ -7093,7 +7093,7 @@ class MainWindow:
         self._update_status("异常修复完成，正常监控中")
         self._repair_set_status("全部修复完成！")
         self._append_log("=== 一键全部修复完成 ===", "success")
-        messagebox.showinfo(APP_NAME, "一键全部修复完成！\n\n全部 19 项状态已重置，保护已恢复正常。")
+        messagebox.showinfo(APP_NAME, "一键全部修复完成！\n\n全部 20 项状态已重置，保护已恢复正常。")
 
     def _show_settings(self):
         """设置对话框（兼容旧调用）：直接切换到主窗口「设置」页"""
