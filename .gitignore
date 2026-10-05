@@ -22,6 +22,10 @@ OPSTController_root/userdata/
 # 调试/构建残留（不推送）
 OPSTController_root/build_out.txt
 OPSTController_root/ui_test_out.txt
+OPSTController_root/ui_test6_out.txt
+OPSTController_root/stress_out.txt
+OPSTController_root/stress_result.txt
+OPSTController_root/lib_count.txt
 OPSTController_root/clean_mei_probe.py
 OPSTController_root/clean_mei_out.txt
 OPSTController_root/probe*.txt
