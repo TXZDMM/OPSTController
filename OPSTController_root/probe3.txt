@@ -1,0 +1,8 @@
+'C:\\Program Files\\WindowsApps\\AppleInc.AppleMusicWin_1.1540.23041.0_x64__nzyj5cx40ttqa\\AppleMusic.exe' -> ('Apple Music', 'high')
+'PPS' -> ('PPS影音', 'high')
+'PPS.exe' -> ('PPS影音', 'high')
+'C:\\Program Files\\PPS\\PPS.exe' -> ('PPS影音', 'high')
+'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe' -> ('Edge浏览器', 'high')
+'WeChat' -> ('微信', 'high')
+'chrome.exe' -> ('Chrome浏览器', 'high')
+'QQMusic' -> ('QQ音乐', 'high')

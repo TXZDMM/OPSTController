@@ -1,0 +1,6 @@
+'C:\\Program Files\\WindowsApps\\AppleInc.AppleMusicWin_1.1540.23041.0_x64__nzyj5cx40ttqa\\AppleMusic.exe' -> ('PPS影音', 'high')
+'AppleMusic' -> ('Apple Music', 'high')
+'Apple Music' -> ('Apple Music', 'low')
+'PPS' -> ('PPS影音', 'high')
+'PPS影音' -> ('PPS影音', 'high')
+pps in applemusic: False

@@ -995,6 +995,31 @@ def load_program_names():
 load_program_names()
 
 
+_KNOWN_PROGID_MAP_SORTED = None
+
+
+def _get_sorted_map():
+    """返回按 keyword 长度降序缓存的识别映射（长名优先，避免重复排序）"""
+    global _KNOWN_PROGID_MAP_SORTED
+    if _KNOWN_PROGID_MAP_SORTED is None:
+        _KNOWN_PROGID_MAP_SORTED = sorted(_KNOWN_PROGID_MAP,
+                                          key=lambda kv: len(kv[0]), reverse=True)
+    return _KNOWN_PROGID_MAP_SORTED
+
+
+def _kw_boundary(pid_lower, kw):
+    """短 keyword（≤3字符）匹配要求字符边界，避免误配。
+    例："pps" 不得命中 "windowsapps"（前有字母 'a'）。"""
+    idx = pid_lower.find(kw)
+    while idx != -1:
+        before = pid_lower[idx - 1] if idx > 0 else ""
+        after = pid_lower[idx + len(kw)] if idx + len(kw) < len(pid_lower) else ""
+        if (not before or not before.isalnum()) and (not after or not after.isalnum()):
+            return True
+        idx = pid_lower.find(kw, idx + 1)
+    return False
+
+
 def identify_tamperer(prog_id):
     """根据ProgId识别疑似篡改者/关联软件。
     AppX类型从注册表查应用名，已知软件直接匹配。
@@ -1021,9 +1046,14 @@ def identify_tamperer(prog_id):
             return "Windows商店应用", "low"
         except Exception:
             return "Windows商店应用", "low"
-    # 已知软件匹配
-    for keyword, name in _KNOWN_PROGID_MAP:
-        if keyword.lower() in pid_lower:
+    # 已知软件匹配：长 keyword 优先（更具体），短 keyword 需字符边界，
+    # 避免 "PPS" 误配 "windowsapps"、短名误配其他路径片段
+    for keyword, name in _get_sorted_map():
+        kw = keyword.lower()
+        if len(kw) <= 3:
+            if _kw_boundary(pid_lower, kw):
+                return name, "high"
+        elif kw in pid_lower:
             return name, "high"
     # 从注册表查ProgId的友好名称
     try:
@@ -4409,11 +4439,22 @@ class MainWindow:
         content = tk.Frame(main, bg=self.C["bg"])
         content.pack(side="left", fill="both", expand=True)
         self._pages = {}
+        # 滚轮交互状态：默认滚整页；单击可滚动小项后才滚动小项自身
+        self._wheel_active = set()
+        self._all_wheel_items = set()
+        self._scroll_canvases = []
+        self._scroll_bound = False
         self._build_page_home(content)
         self._build_page_exts(content)
         self._build_page_tools(content)
         self._build_page_log(content)
         self._build_page_settings(content)
+        # 所有页面构建完成后，统一收集可滚动小项并绑定“单击激活”滚轮逻辑
+        # （延迟收集：小项控件在 _mk_scroll_container 之后才创建）
+        for _name, _page in self._pages.items():
+            for _w in self._collect_wheel_items(_page):
+                self._all_wheel_items.add(_w)
+                self._bind_wheel_item(_w)
         # 页面切换：仅 pack 选中页（多个 expand 会纵向均分而非叠层，tkraise 无法独占内容区）
         self._select_nav("home")
 
@@ -4493,6 +4534,8 @@ class MainWindow:
                 page.pack(fill="both", expand=True)
             else:
                 page.pack_forget()
+        # 切换页面后清空小项滚轮激活，恢复“滚轮滚整页”
+        self._wheel_active.clear()
         if key == "exts":
             self._refresh_ext_page()
 
@@ -4612,23 +4655,149 @@ class MainWindow:
             tk.Label(page, text=subtitle, font=("微软雅黑", 9), fg=self.C["text3"],
                      bg=self.C["bg"], anchor="w").pack(fill="x", padx=24)
 
+    def _enumerate_installed_programs(self):
+        """枚举本机已安装的程序，返回 [(显示名, exe路径或None), ...]。
+        来源：注册表 App Paths / Uninstall(32+64位) / HKCR Applications。
+        显示名优先采用软件识别库映射（保证与“谁更改了什么”的提示口径一致）。"""
+        import winreg as _wr
+        import re as _re
+        found = {}  # 显示名 -> exe路径或None（同名去重）
+        def _enum_keys(root, sub):
+            out = []
+            try:
+                k = _wr.OpenKey(root, sub, 0, _wr.KEY_READ | 0x100)
+            except OSError:
+                return out
+            try:
+                i = 0
+                while True:
+                    try:
+                        out.append(_wr.EnumKey(k, i))
+                    except OSError:
+                        break
+                    i += 1
+            finally:
+                _wr.CloseKey(k)
+            return out
+        def _add_name(name, path=None):
+            if not name or not isinstance(name, str):
+                return
+            name = name.strip()
+            if not name or len(name) > 60:
+                return
+            # 显示名不应是完整路径/裸 exe 名：退化为 basename
+            if os.sep in name or name.endswith(".exe"):
+                name = os.path.basename(name)
+                name = name[:-4] if name.lower().endswith(".exe") else name
+            # 优先识别库映射（口径一致）：按 exe 名/路径识别。
+            # 仅采纳 high/medium 可信度的映射；identify 未命中时返回
+            # (输入串, "low")，不得把路径本身当作显示名。
+            mapped = None
+            conf = "low"
+            try:
+                if path:
+                    mapped, conf = identify_tamperer(path)
+                if not mapped or conf == "low":
+                    mapped2, conf2 = identify_tamperer(name)
+                    if mapped2 and conf2 != "low":
+                        mapped, conf = mapped2, conf2
+            except Exception:
+                mapped = None
+            final = (mapped or name) if conf != "low" else name
+            if final not in found:
+                found[final] = path or None
+        # 1) App Paths（exe 名 → 路径）
+        for root, sub in ((_wr.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+                          (_wr.HKEY_CURRENT_USER,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths")):
+            for exe_name in _enum_keys(root, sub):
+                path = None
+                try:
+                    k = _wr.OpenKey(root, sub + "\\" + exe_name, 0, _wr.KEY_READ | 0x100)
+                    try:
+                        path, _ = _wr.QueryValueEx(k, "")
+                    except OSError:
+                        path = None
+                    finally:
+                        _wr.CloseKey(k)
+                except OSError:
+                    pass
+                if path and isinstance(path, str):
+                    path = path.strip().strip('"')
+                base = exe_name[:-4] if exe_name.lower().endswith(".exe") else exe_name
+                _add_name(base, path)
+        # 2) Uninstall（DisplayName + DisplayIcon）
+        for root, sub in ((_wr.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                          (_wr.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                          (_wr.HKEY_CURRENT_USER,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")):
+            for key_name in _enum_keys(root, sub):
+                try:
+                    k = _wr.OpenKey(root, sub + "\\" + key_name, 0, _wr.KEY_READ | 0x100)
+                except OSError:
+                    continue
+                dn = icon = None
+                try:
+                    try:
+                        dn, _ = _wr.QueryValueEx(k, "DisplayName")
+                    except OSError:
+                        pass
+                    try:
+                        icon, _ = _wr.QueryValueEx(k, "DisplayIcon")
+                    except OSError:
+                        pass
+                finally:
+                    _wr.CloseKey(k)
+                if not dn:
+                    continue
+                base = _re.sub(r"\s*[\d.]+([a-zA-Z]?\d*)*\s*$", "", str(dn).strip()).strip() or str(dn).strip()
+                # DisplayIcon 可能是 "C:\path\app.exe,0" 形式（也可能带引号）
+                exe_path = None
+                if icon:
+                    p = str(icon).split(",")[0].strip().strip('"')
+                    if p.lower().endswith(".exe") and os.path.exists(p):
+                        exe_path = p
+                _add_name(base, exe_path)
+        # 3) HKCR\Applications（ProgID 应用）
+        try:
+            k = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\Applications",
+                            0, _wr.KEY_READ | 0x100)
+            try:
+                i = 0
+                while True:
+                    try:
+                        name = _wr.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    base = name[:-4] if name.lower().endswith(".exe") else name
+                    _add_name(base, None)
+            finally:
+                _wr.CloseKey(k)
+        except OSError:
+            pass
+        return list(found.items())
+
     def _pick_program(self, target_callback, title="从程序库选择"):
-        """程序选择窗口：候选 = 内置近500软件识别库 + 当前运行进程名。
+        """程序选择窗口：候选 = 本机已安装程序（注册表枚举，名称经识别库
+        归一化，保证与“谁更改了什么”提示一致）+ 当前运行进程名。
         选中后回调 target_callback(程序名)，无需用户手动输入。"""
         win = tk.Toplevel(self.root)
         win.title(title)
         win.configure(bg=self.C["bg"])
-        win.geometry("480x540")
+        win.geometry("480x560")
         win.transient(self.root)
         try:
             win.grab_set()
         except Exception:
             pass
-        # 候选集合：内置软件库（名称去重）+ 当前运行进程名
-        candidates = set()
-        for _k, name in _KNOWN_PROGID_MAP:
-            if name and isinstance(name, str):
-                candidates.add(name)
+        # 候选集合：本机已安装程序 + 当前运行进程名
+        candidates = {}
+        for name, path in self._enumerate_installed_programs():
+            candidates[name] = path
         try:
             import subprocess as _sp
             _out = _sp.run(["tasklist", "/FO", "CSV", "/NH"],
@@ -4636,10 +4805,12 @@ class MainWindow:
             for line in _out.splitlines():
                 _p = line.split('","')[0].strip('"')
                 if _p and _p.lower().endswith(".exe"):
-                    candidates.add(_p[:-4])
+                    _base = _p[:-4]
+                    if _base not in candidates:
+                        candidates[_base] = None
         except Exception:
             pass
-        candidates = sorted(candidates, key=lambda s: s.lower())
+        ordered = sorted(candidates.items(), key=lambda kv: kv[0].lower())
         tk.Label(win, text="搜索并选择程序（双击或点击确定）",
                  font=("微软雅黑", 10, "bold"), fg=self.C["text"],
                  bg=self.C["bg"], anchor="w").pack(fill="x", padx=16, pady=(14, 4))
@@ -4652,7 +4823,7 @@ class MainWindow:
                              fg=self.C["text"], selectbackground=self.C["nav_sel"],
                              relief="flat", highlightthickness=0)
         listbox.pack(fill="both", expand=True, padx=16, pady=(2, 8))
-        tk.Label(win, text=f"共 {len(candidates)} 个候选（内置软件库 + 当前运行进程）",
+        tk.Label(win, text=f"共 {len(ordered)} 个候选（本机已安装程序 + 当前运行进程）",
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["bg"], anchor="w").pack(fill="x", padx=16)
         ops = tk.Frame(win, bg=self.C["bg"])
         ops.pack(fill="x", padx=16, pady=(4, 14))
@@ -4660,9 +4831,9 @@ class MainWindow:
         def _refresh(_a=None, _b=None, _c=None):
             q = search_var.get().strip().lower()
             listbox.delete(0, tk.END)
-            for cand in candidates:
-                if not q or q in cand.lower():
-                    listbox.insert(tk.END, cand)
+            for name, _path in ordered:
+                if not q or q in name.lower():
+                    listbox.insert(tk.END, name)
 
         def _confirm():
             sel = listbox.curselection()
@@ -4703,14 +4874,14 @@ class MainWindow:
         if not hasattr(self, "_scroll_canvases"):
             self._scroll_canvases = []
         self._scroll_canvases.append(canvas)
-        # 全局滚轮（仅绑定一次）
+        # 点击页面空白/背景时交还滚轮（清除小项激活）
+        canvas.bind("<Button-1>", lambda _e: self._wheel_active.clear())
+        # 全局兜底绑定（仅一次）
         if not getattr(self, "_scroll_bound", False):
             self._scroll_bound = True
             def _on_mousewheel(_e):
-                # 自带滚轮的控件（文本/列表）不重复滚动外层
-                w = _e.widget
-                if isinstance(w, (scrolledtext.ScrolledText, tk.Text, tk.Listbox, tk.Spinbox, ttk.Combobox)):
-                    return
+                # 小项自身的 handler 已 return "break" 阻断；能到这里说明
+                # 鼠标不在小项上 → 滚动当前可见页面
                 for c in self._scroll_canvases:
                     if c.winfo_ismapped():
                         try:
@@ -4718,8 +4889,58 @@ class MainWindow:
                         except Exception:
                             pass
                         break
+            def _on_click(_e):
+                # 点击任意处：若是可滚动小项则激活（交由小项 Button-1 先执行），
+                # 否则交还滚轮给页面
+                w = _e.widget
+                if w not in self._all_wheel_items:
+                    self._wheel_active.clear()
             self.root.bind_all("<MouseWheel>", _on_mousewheel)
+            self.root.bind_all("<Button-1>", _on_click, add="+")
         return content
+
+    def _collect_wheel_items(self, widget, depth=0):
+        """递归收集 widget 下所有可滚动小项控件。
+        ScrolledText 拆取其内部 Text（滚轮事件实际落在 Text 上）。"""
+        out = []
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            return out
+        for c in children:
+            if isinstance(c, scrolledtext.ScrolledText):
+                for sub in c.winfo_children():
+                    if isinstance(sub, tk.Text):
+                        out.append(sub)
+                        break
+            elif isinstance(c, (tk.Text, tk.Listbox, tk.Spinbox, ttk.Combobox)):
+                out.append(c)
+            if depth < 8:
+                out.extend(self._collect_wheel_items(c, depth + 1))
+        return out
+
+    def _bind_wheel_item(self, w):
+        """绑定小项滚轮：单击激活后才滚动小项自身；未激活时滚轮滚动页面。"""
+        def _wheel(_e):
+            if w in self._wheel_active:
+                try:
+                    w.yview_scroll(int(-_e.delta / 120), "units")
+                except Exception:
+                    pass
+            else:
+                for c in self._scroll_canvases:
+                    if c.winfo_ismapped():
+                        try:
+                            c.yview_scroll(int(-_e.delta / 120), "units")
+                        except Exception:
+                            pass
+                        break
+            return "break"
+        try:
+            w.bind("<MouseWheel>", _wheel)
+            w.bind("<Button-1>", lambda _e: self._wheel_active.add(w), add="+")
+        except Exception:
+            pass
 
     def _flow_wrap(self, parent, widgets, gap=8, anchor="left"):
         """Flow 布局：容器宽度不足时按钮自动换行（窗口缩放适配）。
@@ -6004,15 +6225,30 @@ class MainWindow:
         except Exception:
             pass
         self._append_log("程序已退出。", "info")
-        # 销毁主窗口后强制退出进程，确保后台线程也终止
+        # 销毁主窗口后强制退出进程，确保后台线程也终止。
+        # 延迟 3.5 秒：给安全软件完成对 PyInstaller _MEI 解压目录的扫描，
+        # 否则 bootloader 退出时清理临时目录会因文件被锁弹
+        # "Failed to remove temporary directory" Warning。
         def _force_exit():
             try:
                 self.root.destroy()
             except Exception:
                 pass
             import os
+            # 退出前最后一次尝试清理本进程残留 _MEI（当前进程已无文件句柄）
+            try:
+                cur_mei = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
+                for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+                    try:
+                        if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
+                            continue
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             os._exit(0)
-        self.root.after(300, _force_exit)
+        self.root.after(3500, _force_exit)
 
     def _backup_current(self):
         """以当前状态备份为新基准，支持对比选择部分更新"""
@@ -8192,6 +8428,35 @@ def main():
                     os.rmdir(d)
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # 延迟清理非空 _MEI 残留（防安全软件慢扫描锁文件）：后台线程在
+        # 30 秒/90 秒后各重试一次，rmtree 失败静默忽略，不阻塞启动。
+        try:
+            def _delayed_mei_cleanup():
+                time.sleep(30)
+                try:
+                    for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+                        try:
+                            if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
+                                continue
+                            shutil.rmtree(d, ignore_errors=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                time.sleep(60)
+                try:
+                    for d in glob.glob(os.path.join(tempfile.gettempdir(), "_MEI*")):
+                        try:
+                            if cur_mei and os.path.normcase(os.path.abspath(d)) == cur_mei:
+                                continue
+                            shutil.rmtree(d, ignore_errors=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            threading.Thread(target=_delayed_mei_cleanup, daemon=True).start()
         except Exception:
             pass
 

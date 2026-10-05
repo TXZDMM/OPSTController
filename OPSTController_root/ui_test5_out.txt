@@ -1,0 +1,28 @@
+﻿built
+installed programs: 496 in 0.12s
+    'AIoT' -> C:\Program Files\MI\AIoT\MiShare\2.0.0.621\AIoT.exe
+    'Apple Music' -> C:\Program Files\WindowsApps\AppleInc.AppleMusicWin_1.1540.23041.0_x64__nzyj5cx40ttqa\AppleMusic.exe
+    'blender-launcher' -> C:\Program Files\WindowsApps\BlenderFoundation.Blender_5.2.1.0_x64__ppwjx1n5r4v9t\Blender\blender-launcher.exe
+    'Chrome浏览器' -> C:\Program Files\Google\Chrome\Application\chrome.exe
+    'cmmgr32' -> None
+    'copilotapp' -> C:\Program Files (x86)\Microsoft\Copilot\Application\copilotapp.exe
+    'devenv' -> E:\APPS\vs\common7\ide\devenv.exe
+    'dfshim.dll' -> None
+    '钉钉' -> E:\APPS\DingDing\DingtalkLauncher.exe
+    'Microsoft Office' -> C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE
+    'fsquirt' -> None
+    'GetHelp' -> C:\Program Files\WindowsApps\Microsoft.GetHelp_10.2409.41132.0_x64__8wekyb3d8bbwe\GetHelp.exe
+page home: wheel_items=8
+page exts: wheel_items=8
+page tools: wheel_items=8
+page settings: wheel_items=8
+page log: wheel_items=8
+canvases: 4
+total wheel items: 8
+active after click: True
+wheel on active item OK
+cleared active
+picker built OK
+small-adapt OK
+flow-wrap OK
+ALL DONE
