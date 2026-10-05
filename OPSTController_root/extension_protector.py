@@ -4380,7 +4380,9 @@ class MainWindow:
 
     def _threadsafe_exit(self):
         """线程安全的强制退出：停监控→保存→解锁→立即退出进程。
-        仅在无 tk 主循环或主循环卡死时由看门狗线程调用。"""
+        仅在无 tk 主循环或主循环卡死时由看门狗线程调用。
+        不做长清理/长等待（监控线程退出路径自带 _unlock_all；
+        _MEI 残留由下次启动的延迟清扫线程处理），避免退出卡死。"""
         try:
             if self.monitor is not None and self.monitor.is_alive():
                 try:
@@ -4394,11 +4396,6 @@ class MainWindow:
         except Exception:
             pass
         try:
-            if self.monitor is not None:
-                self.monitor._unlock_all()
-        except Exception:
-            pass
-        try:
             if self.exit_event:
                 _CloseHandle(self.exit_event)
             if self.show_event:
@@ -4406,26 +4403,16 @@ class MainWindow:
         except Exception:
             pass
         self._exiting = True
-        # 留给安全软件/监控线程收尾
+        # 不依赖 tk 主循环：短暂等待监控线程收尾后立即退出，
+        # 跳过 PyInstaller bootloader 清理（防 _MEI 弹窗）
         try:
-            time.sleep(3.5)
+            time.sleep(1.0)
         except Exception:
             pass
-        # 清理本实例 _MEI 残留后立即退出（不触发 bootloader 清理弹窗）
         try:
-            import shutil as _shutil
-            _cur = os.path.normcase(getattr(sys, '_MEIPASS', '') or '')
-            _td = tempfile.gettempdir()
-            for _d in glob.glob(os.path.join(_td, "_MEI*")):
-                try:
-                    if _cur and os.path.normcase(os.path.abspath(_d)) == _cur:
-                        continue
-                    _shutil.rmtree(_d, ignore_errors=True)
-                except Exception:
-                    pass
+            os._exit(0)
         except Exception:
             pass
-        os._exit(0)
 
     def _minimize_to_taskbar(self):
         """最小化到任务栏（后台常驻，托盘图标仍在）"""
@@ -7721,6 +7708,28 @@ def is_admin():
         return False
 
 
+def _kill_opst_except_self():
+    """taskkill 所有 OPSTcontroller 进程（排除自身 PID）。
+    修复：taskkill /IM 会误杀 --stop 实例自己，导致提权强杀流程中断。"""
+    try:
+        r = _run(['tasklist', '/FI', 'IMAGENAME eq OPSTcontroller.exe', '/FO', 'CSV'],
+                 capture_output=True, text=True)
+        pids = []
+        for line in r.stdout.splitlines():
+            if 'OPSTcontroller.exe' not in line:
+                continue
+            parts = line.split('","')
+            if len(parts) >= 2:
+                pid = parts[1].strip('"').strip()
+                if pid.isdigit() and int(pid) != os.getpid():
+                    pids.append(pid)
+        for pid in pids:
+            _run(['taskkill', '/F', '/PID', pid], capture_output=True)
+        return len(pids)
+    except Exception:
+        return 0
+
+
 def _force_kill_all_opst():
     """管理员+SeDebug 强杀所有 OPSTcontroller 进程（排除自身）。
     自我保护实例对普通令牌返回 ACCESS_DENIED；管理员启用 SeDebugPrivilege
@@ -8654,8 +8663,7 @@ def main():
                     sys.exit(0)
             # 进程仍在运行，尝试 taskkill
             print("信号方式未生效，尝试强制终止...")
-            _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
-                          capture_output=True)
+            _kill_opst_except_self()
             time.sleep(1)
             print("已发送强制终止命令。")
         else:
@@ -8666,8 +8674,7 @@ def main():
                                capture_output=True, text=True)
             if 'OPSTcontroller.exe' in r.stdout:
                 print("检测到进程，尝试强制终止...")
-                _run(['taskkill', '/F', '/IM', 'OPSTcontroller.exe'],
-                              capture_output=True)
+                _kill_opst_except_self()
                 print("已发送强制终止命令。")
         # 信号/taskkill 可能对自我保护实例无效：若进程仍在，
         # 提升到管理员执行 --stop-admin 强杀
