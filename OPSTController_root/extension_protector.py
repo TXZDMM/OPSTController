@@ -6825,6 +6825,20 @@ class MainWindow:
         save_row.pack(fill="x", pady=10)
         self._last_perm_prompted = None
 
+        # ===== 最底部：完全退出程序按钮 =====
+        exit_row = tk.Frame(content, bg=dark["bg"])
+        exit_row.pack(fill="x", pady=(2, 12))
+        exit_btn = tk.Button(exit_row, text="完全退出程序",
+                             font=("微软雅黑", 9, "bold"),
+                             command=self._exit_program, relief="flat",
+                             bg="#c0392b", fg="white", activebackground="#e74c3c",
+                             activeforeground="white", cursor="hand2",
+                             padx=18, pady=6)
+        exit_btn.pack(side="right")
+        tk.Label(exit_row, text="完全退出后监控停止，开机自启的实例将不再保护扩展名",
+                 font=("微软雅黑", 8), fg=dark["text3"], bg=dark["bg"],
+                 anchor="w").pack(side="left")
+
         def save_settings(ask_perm=False):
             old_perm = cfg.get("default_permission", "t")
             new_perm = perm_var.get()
