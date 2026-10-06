@@ -3401,6 +3401,10 @@ class MonitorThread(threading.Thread):
                         log_event(ext, "恢复", "成功", "锁定中静默恢复(已验证)")
                     else:
                         log_event(ext, "恢复", "失败", f"锁定中恢复未通过: {';'.join(dets) if dets else '未知'}")
+                elif self.app is not None and getattr(self.app, "_pending_ask", None) is not None and ext in self.app._pending_ask:
+                    # ask_first 弹窗正在等待用户决定：跳过本轮处理（不累积持续篡改计数、
+                    # 不静默恢复），避免用户在点"单次同意"前被误判持续篡改并锁定
+                    pass
                 else:
                     self._handle_change(ext, mismatches)
 
@@ -4400,6 +4404,15 @@ class PersistentTracker:
     def force_persistent(self, ext):
         """强制标记为持续篡改（批量篡改时使用，无需积累3次）"""
         self._persistent_exts.add(ext)
+
+    def clear_locked(self, ext):
+        """用户同意后：完全解除锁定状态与持续篡改标记。
+        注册表ACL键的解锁由调用方执行（unlock_all_protected_keys）。"""
+        self._locked_exts.pop(ext, None)
+        self._lock_count.pop(ext, None)
+        self._persistent_exts.discard(ext)
+        self._unlocked_exts.pop(ext, None)  # 退出高频观察
+        self._ext_history.pop(ext, None)
 
     def get_batch_exts(self, progid):
         """返回被某ProgId篡改过的所有扩展名（去重）"""
@@ -7971,7 +7984,22 @@ class MainWindow:
         def _do():
             pt = self._repair_pt()
             if pt:
+                locked_exts = list(pt._locked_exts.keys())  # 先记录再清空
                 pt._persistent_exts.clear()
+                pt._locked_exts.clear()
+                pt._lock_count.clear()
+                pt._unlocked_exts.clear()
+                pt._ext_history.clear()
+                # 实际解锁仍锁定的注册表键，否则"修复了还在锁定"
+                unlocked_n = 0
+                for e in locked_exts:
+                    bl = self.baseline_mgr.baseline.get(e, {})
+                    prog_id = _get_prog_id_from_baseline(bl)
+                    ok_cnt, total, _ = unlock_all_protected_keys(e, prog_id)
+                    if ok_cnt > 0:
+                        unlocked_n += 1
+                if unlocked_n:
+                    log_event("SYSTEM", "异常修复", "解锁", f"已实际解锁{unlocked_n}个扩展名的注册表键")
         self._repair_apply("清除持续篡改标记", _do)
 
     def _repair_clear_batch_progids(self):
@@ -9522,6 +9550,17 @@ class MainWindow:
                 self.engine.allowed_this_cycle.add(ext)
                 if self.monitor is not None:
                     self.monitor.persistent_tracker.clear_ext_history(ext)
+                    # 批量允许=同意所有更改：解除锁定状态+解锁注册表键
+                    try:
+                        self.monitor.persistent_tracker.clear_locked(ext)
+                        bl = self.baseline_mgr.baseline.get(ext, {})
+                        prog_id = _get_prog_id_from_baseline(bl)
+                        ok_cnt, total, dets = unlock_all_protected_keys(ext, prog_id)
+                        if ok_cnt > 0:
+                            self._append_log(f"  已解除 {ext} 的锁定（{ok_cnt}/{total}位置）。", "info")
+                            log_event(ext, "解锁", "成功", f"批量允许后解除锁定 {ok_cnt}/{total}位置")
+                    except Exception as e:
+                        self._append_log(f"解除 {ext} 锁定失败: {e}", "error")
                 changes = []
                 for key, bl_val, cur_val, _ in mismatches:
                     label = ProtectionEngine.ITEM_LABELS.get(key, key)
@@ -9595,6 +9634,18 @@ class MainWindow:
             self.engine.allowed_this_cycle.add(extension)
             if self.monitor is not None:
                 self.monitor.persistent_tracker.clear_ext_history(extension)
+                # 同意后必须解除锁定：清持续标记+锁定标记+解锁注册表ACL键，
+                # 否则"用户都同意了还锁定"，且键被锁用户无法再更改
+                try:
+                    self.monitor.persistent_tracker.clear_locked(extension)
+                    bl = self.baseline_mgr.baseline.get(extension, {})
+                    prog_id = _get_prog_id_from_baseline(bl)
+                    ok_cnt, total, dets = unlock_all_protected_keys(extension, prog_id)
+                    if ok_cnt > 0:
+                        self._append_log(f"已解除 {extension} 的锁定（{ok_cnt}/{total}位置），可自由更改。", "info")
+                        log_event(extension, "解锁", "成功", f"用户同意后解除锁定 {ok_cnt}/{total}位置")
+                except Exception as e:
+                    self._append_log(f"解除 {extension} 锁定失败: {e}", "error")
             self.change_history.add_record(extension, tamperer_name, changes_for_history, "user_consent", "success")
             self._append_log(f"用户同意 {extension} 的更改，已更新基准并重置篡改计数。", "warn")
             log_event(extension, "更改", "已同意", "用户单次同意")
@@ -9690,6 +9741,17 @@ class MainWindow:
             self.engine.allowed_this_cycle.add(extension)
             if self.monitor is not None:
                 self.monitor.persistent_tracker.clear_ext_history(extension)
+                # 永久忽略=接受当前关联，同样解除锁定让用户可自由更改
+                try:
+                    self.monitor.persistent_tracker.clear_locked(extension)
+                    bl = self.baseline_mgr.baseline.get(extension, {})
+                    prog_id = _get_prog_id_from_baseline(bl)
+                    ok_cnt, total, dets = unlock_all_protected_keys(extension, prog_id)
+                    if ok_cnt > 0:
+                        self._append_log(f"已解除 {extension} 的锁定（{ok_cnt}/{total}位置）。", "info")
+                        log_event(extension, "解锁", "成功", "永久忽略后解除锁定")
+                except Exception as e:
+                    self._append_log(f"解除 {extension} 锁定失败: {e}", "error")
             self.change_history.add_record(extension, tamperer_name, changes_for_history, "forever_ignore", "success")
             self._append_log(f"已永久关闭 {extension} 的弹窗提醒（加入白名单，不再阻止）", "warn")
             log_event(extension, "更改", "永久忽略", "用户永久关闭弹窗")
