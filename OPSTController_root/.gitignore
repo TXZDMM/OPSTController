@@ -18,3 +18,7 @@ Thumbs.db
 none_check*.py
 
 none_check*.txt
+
+build_out.txt
+zip_out.txt
+dep*.txt
