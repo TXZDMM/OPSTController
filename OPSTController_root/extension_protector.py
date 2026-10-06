@@ -2544,31 +2544,9 @@ class ProtectionEngine:
                     # 当前键值不存在（对应软件未安装/已卸载）= 正常状态，不视为缺失
                     continue
             # 无效关联：UserChoice ProgId 指向不存在的 ProgId 或命令键空值
-            prog_id = get_prog_id(ext_name)
-            if prog_id:
-                # UWP应用(AppX开头)使用不同的激活机制，没有传统shell\open\command是正常的，跳过
-                if prog_id.startswith("AppX"):
-                    continue
-                for root_name, reg_path in (
-                    ("HKCR", f"{prog_id}\\shell\\open\\command"),
-                    ("HKCU", f"Software\\Classes\\{prog_id}\\shell\\open\\command"),
-                    ("HKLM", f"SOFTWARE\\Classes\\{prog_id}\\shell\\open\\command"),
-                ):
-                    root = ROOT_MAP.get(root_name)
-                    if root is None:
-                        continue
-                    if root_name == "HKCR" and HKCU_REMAPPED:
-                        cmd_val, _ = read_hkcr_effective(reg_path, "")
-                    else:
-                        cmd_val, _ = reg_read_value(root, reg_path, "")
-                    if cmd_val is None:
-                        issues.append((ext_name, f"无效关联: {prog_id} 命令缺失"))
-                        break
-            else:
-                uc_prog_id, _ = reg_read_value(HKCU, f"{USERCHOICE_BASE}\\{ext_name}\\UserChoice", "ProgId")
-                if uc_prog_id is not None and not uc_prog_id.startswith("AppX"):
-                    issues.append((ext_name, "UserChoice 指向无效或已失效 ProgId"))
-        return issues
+            # （软件卸载/未安装的残留键视为正常状态，不报无效关联——
+            #  用户原则：当前没有实际关联=正常；只有“关联被改成其他程序”才算异常）
+            continue
 
 
 # ============================================================
@@ -5704,7 +5682,8 @@ class MainWindow:
             ("备份当前基准", self._backup_current, "default"),
             ("深层扫描", self._manual_deep_scan, "default"),
             ("历史版本管理", self._show_history, "default"),
-            ("检查更新", self._check_update, "primary"),
+            # 手动检查更新：必须传 manual=True，否则失败/无新版时静默无反馈
+            ("检查更新", lambda: self._check_update(True), "primary"),
         ]:
             # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
             op_btns.append(self._mk_button(op_col, text, cmd, kind=kind))
