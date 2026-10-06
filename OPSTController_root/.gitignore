@@ -14,3 +14,7 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+none_check*.py
+
+none_check*.txt

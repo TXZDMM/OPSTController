@@ -1,0 +1,49 @@
+--- rel userdata files ---
+  config.json 232
+  program_names.json 21947
+  protector.log 2945
+--- nested? ---
+NESTED DIR EXISTS
+--- rel config content ---
+{
+  "whitelist_exts": [],
+  "whitelist_programs": [
+    "鐏粧瀹夊叏",
+    "360瀹夊叏鍗＋",
+    "360鏉€姣?,
+    "鍗″反鏂熀",
+    "鐢佃剳绠″",
+    "Windows Defender",
+    "閲戝北姣掗湼",
+    "鐟炴槦鏉€姣?
+  ]
+}
+--- run config ---
+{
+  "whitelist_exts": [],
+  "whitelist_programs": [
+    "鐏粧瀹夊叏",
+    "360瀹夊叏鍗＋",
+    "360鏉€姣?,
+    "鍗″反鏂熀",
+    "鐢佃剳绠″",
+    "Windows Defender",
+    "閲戝北姣掗湼",
+    "鐟炴槦鏉€姣?
+  ],
+  "initialized": true,
+  "baseline_mode": "current",
+  "baseline_time": "2026-10-05 00:38:03",
+  "extension_count": 1283,
+  "locked_defaults": {},
+  "history_versions": 5,
+  "default_permission": "t",
+  "autostart": true,
+  "show_popup": false,
+  "operation_mode": "normal",
+  "audit_level": "normal",
+  "block_timeout": 1,
+  "clear_log_on_start": false,
+  "persistent_no_kill": false,
+  "batch_popup_mode": "single"
+}

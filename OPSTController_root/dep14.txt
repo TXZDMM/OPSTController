@@ -1,0 +1,9 @@
+sign=Valid
+copied both
+pid=13668 title='OPSTcontroller v0.8.1'
+--- log tail ---
+2026-10-06 16:27:12 [INFO] SYSTEM:HKCU重映射:成功:用户=TXZDMM, SID=S-1-5-21-2482818302-1446379007-2612904212-1001, HKCU\Classes扩展名数=1208, UserChoice项数=403
+2026-10-06 16:27:12 [INFO] 监控线程启动
+2026-10-06 16:27:13 [INFO] NSudo:验证:目标进程已启动
+2026-10-06 16:27:13 [INFO] NSudo:成功:已通过 NSudo(T) 发起提权
+2026-10-06 16:27:13 [INFO] SYSTEM:提权:成功:NSudo已按TI模式发起重启

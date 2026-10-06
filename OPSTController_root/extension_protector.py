@@ -1260,6 +1260,8 @@ _APPX_KNOWN = {
     "microsoft.teams": "Teams",
     "microsoft.windows.search": "搜索",
     "microsoft.windows.immersivecontrolpanel": "设置",
+    "microsoft.zunemusic": "媒体播放器",
+    "microsoft.windows.mediaplayer_8wekyb3d8bbwe": "Windows 媒体播放器",
 }
 
 
@@ -1271,6 +1273,11 @@ def _appx_friendly_name(raw):
     try:
         import re
         s = str(raw)
+        # 去 ms-resource URI 尾部
+        if "?ms-resource://" in s:
+            s = s.split("?ms-resource://", 1)[0]
+        elif s.startswith("ms-resource://"):
+            s = s.split("//", 1)[1].split("/", 1)[0]
         # 去 @{...!Resource} 壳
         m = re.search(r"@\{(.+?)(?:!.*)?\}", s)
         if m:
@@ -1279,13 +1286,12 @@ def _appx_friendly_name(raw):
             m = re.search(r"@\{(.+?)\}", s)
             if m:
                 s = m.group(1)
-            else:
-                m = re.search(r"//(.+?)$", s)
-                if m:
-                    s = m.group(1)
-        # 去版本壳（尾部包短ID/长ID：_8wekyb3d8bbwe 或 _<13+字母数字>，非纯hex）
-        s2 = re.sub(r"_[A-Za-z0-9]{10,}$", "", s.strip(), flags=re.IGNORECASE)
-        s2 = s2.strip()
+        # 兜底：无闭合花括号的 @{... 前缀（注册表截断串）
+        s = re.sub(r"^@\{", "", s)
+        # 去版本壳（_11.2606.19.0_x64 版本+架构段 + 尾部包短ID/长ID：_8wekyb3d8bbwe 或 _<13+字母数字>）
+        s2 = re.sub(r"_\d[\d.]*_(?:x\d+|amd64|arm64)", "", s.strip(), flags=re.IGNORECASE)
+        s2 = re.sub(r"_+[A-Za-z0-9]{10,}$", "", s2, flags=re.IGNORECASE)
+        s2 = s2.rstrip("_").strip()
         if not s2:
             return s.strip()
         low = s2.lower()
@@ -2164,6 +2170,9 @@ class ProtectionEngine:
 
             bl_val = bl_item.get("value")
             bl_type = bl_item.get("type")
+            if cur_val is None:
+                # 当前无关联（该软件未安装/已卸载）= 正常状态，不视为不一致
+                continue
             if not self._values_equal(bl_val, cur_val, bl_type, cur_type):
                 mismatches.append((key, bl_val, cur_val, cur_type))
 
@@ -2526,8 +2535,9 @@ class ProtectionEngine:
                 name = item.get("name", "")
                 value = item.get("value")
                 cur_val, _ = reg_read_value(root, path, name)
-                if value is not None and cur_val is None:
-                    issues.append((ext_name, f"{key} 缺失: {root_name}\\{path}\\{name}"))
+                if cur_val is None:
+                    # 当前键值不存在（对应软件未安装/已卸载）= 正常状态，不视为缺失
+                    continue
             # 无效关联：UserChoice ProgId 指向不存在的 ProgId 或命令键空值
             prog_id = get_prog_id(ext_name)
             if prog_id:
@@ -7357,6 +7367,7 @@ class MainWindow:
         win = tk.Toplevel(self.root)
         win.title("深层扫描报告")
         win.geometry("880x680")
+        win.configure(bg="#1f2429")
         win.transient(self.root)
         win.grab_set()
         win.update_idletasks()
@@ -7364,16 +7375,16 @@ class MainWindow:
         win.geometry(f"880x680+{(sw-880)//2}+{(sh-680)//2}")
 
         # ===== 标题栏 =====
-        title_frame = tk.Frame(win, bg="#1a5276", height=70)
+        title_frame = tk.Frame(win, bg="#1f2429", height=70)
         title_frame.pack(fill="x")
         title_frame.pack_propagate(False)
         tk.Label(title_frame, text="深层扫描报告", font=("微软雅黑", 16, "bold"),
-                 bg="#1a5276", fg="white").pack(side="left", padx=20, pady=10)
+                 bg="#1f2429", fg="#e6edf3").pack(side="left", padx=20, pady=10)
         tk.Label(title_frame, text=f"扫描时间：{scan_time}\n版本：v{APP_VERSION}",
-                 font=("微软雅黑", 9), bg="#1a5276", fg="#aed6f1", justify="right").pack(side="right", padx=20, pady=10)
+                 font=("微软雅黑", 9), bg="#1f2429", fg="#8b98a5", justify="right").pack(side="right", padx=20, pady=10)
 
         # ===== 统计摘要栏 =====
-        stats_frame = tk.Frame(win, bg="#f8f9fa", bd=1, relief="solid")
+        stats_frame = tk.Frame(win, bg="#262c31", bd=1, relief="solid")
         stats_frame.pack(fill="x", padx=10, pady=8)
 
         # 按类型统计
@@ -7394,20 +7405,20 @@ class MainWindow:
             ("Hash变更", str(sum(v for k,v in type_counts.items() if "hash" in k.lower())), "#1abc9c"),
         ]
         for i, (label, val, color) in enumerate(stat_items):
-            cell = tk.Frame(stats_frame, bg="#f8f9fa")
+            cell = tk.Frame(stats_frame, bg="#262c31")
             cell.grid(row=0, column=i, padx=15, pady=8)
-            tk.Label(cell, text=val, font=("微软雅黑", 14, "bold"), fg=color, bg="#f8f9fa").pack()
-            tk.Label(cell, text=label, font=("微软雅黑", 8), fg="#666", bg="#f8f9fa").pack()
+            tk.Label(cell, text=val, font=("微软雅黑", 14, "bold"), fg=color, bg="#262c31").pack()
+            tk.Label(cell, text=label, font=("微软雅黑", 8), fg="#666", bg="#262c31").pack()
 
         # ===== 列表表头 =====
         list_frame = tk.Frame(win)
         list_frame.pack(fill="both", expand=True, padx=10, pady=(0,5))
 
-        header_frame = tk.Frame(list_frame, bg="#2c3e50")
+        header_frame = tk.Frame(list_frame, bg="#30363d")
         header_frame.pack(fill="x")
         headers = [("序号", 50), ("扩展名", 90), ("问题类型", 280), ("严重程度", 80), ("状态", 80), ("操作", 240)]
         for text, w in headers:
-            tk.Label(header_frame, text=text, font=("微软雅黑", 9, "bold"), fg="white", bg="#2c3e50",
+            tk.Label(header_frame, text=text, font=("微软雅黑", 9, "bold"), fg="#e6edf3", bg="#30363d",
                      width=w//8, anchor="w").pack(side="left", padx=5, pady=6)
 
         # 滚动列表
@@ -7438,9 +7449,11 @@ class MainWindow:
 
             # 详情标题
             tk.Label(detail_win, text=f"{ext} 不一致详情", font=("微软雅黑", 12, "bold"),
-                     bg="#1a5276", fg="white").pack(fill="x", pady=(0,10))
+                     bg="#1f2429", fg="#e6edf3").pack(fill="x", pady=(0,10))
 
-            text = tk.Text(detail_win, font=("Consolas", 9), wrap="word", padx=10, pady=10)
+            detail_win.configure(bg="#1f2429")
+            text = tk.Text(detail_win, font=("Consolas", 9), wrap="word", padx=10, pady=10,
+                           bg="#23282e", fg="#e6edf3", insertbackground="#e6edf3")
             text.pack(fill="both", expand=True, padx=10, pady=(0,5))
             for i, (key, bl_val, cur_val, extra) in enumerate(mismatches, 1):
                 text.insert("end", f"━━━ 第 {i} 项 ━━━\n", "header")
@@ -7450,7 +7463,7 @@ class MainWindow:
                 if extra:
                     text.insert("end", f"  补充说明：{extra}\n")
                 text.insert("end", "\n")
-            text.tag_config("header", foreground="#1a5276", font=("Consolas", 9, "bold"))
+            text.tag_config("header", foreground="#58a6ff", font=("Consolas", 9, "bold"))
             text.config(state="disabled")
 
             tk.Button(detail_win, text="关闭", font=("微软雅黑",9), width=12,
@@ -7484,14 +7497,14 @@ class MainWindow:
         # 不一致项列表
         row_idx = 0
         for ext, mismatches in inconsistencies.items():
-            bg = "#ffffff" if row_idx % 2 == 0 else "#f8f9fa"
+            bg = "#23282e" if row_idx % 2 == 0 else "#262c31"
             row_frame = tk.Frame(scroll_frame, bg=bg)
             row_frame.pack(fill="x")
 
-            tk.Label(row_frame, text=str(row_idx+1), font=("微软雅黑", 9), bg=bg, width=6, anchor="center").pack(side="left", padx=2, pady=4)
-            tk.Label(row_frame, text=ext, font=("微软雅黑", 9, "bold"), bg=bg, width=10, anchor="w").pack(side="left", padx=2, pady=4)
+            tk.Label(row_frame, text=str(row_idx+1), font=("微软雅黑", 9), bg=bg, fg="#e6edf3", width=6, anchor="center").pack(side="left", padx=2, pady=4)
+            tk.Label(row_frame, text=ext, font=("微软雅黑", 9, "bold"), bg=bg, fg="#e6edf3", width=10, anchor="w").pack(side="left", padx=2, pady=4)
             tk.Label(row_frame, text=mismatch_summary(mismatches), font=("微软雅黑", 8), bg=bg,
-                     fg="#333", width=38, anchor="w", wraplength=280).pack(side="left", padx=2, pady=4)
+                     fg="#c9d1d9", width=38, anchor="w", wraplength=280).pack(side="left", padx=2, pady=4)
 
             sev_text, sev_color = get_severity(mismatches)
             tk.Label(row_frame, text=sev_text, font=("微软雅黑", 8, "bold"), fg="white", bg=sev_color,
@@ -7514,12 +7527,12 @@ class MainWindow:
 
         # 新扩展名
         for ext in new_exts:
-            bg = "#eafaf1" if row_idx % 2 == 0 else "#d5f5e3"
+            bg = "#182b22" if row_idx % 2 == 0 else "#1d3529"
             row_frame = tk.Frame(scroll_frame, bg=bg)
             row_frame.pack(fill="x")
 
-            tk.Label(row_frame, text=str(row_idx+1), font=("微软雅黑", 9), bg=bg, width=6, anchor="center").pack(side="left", padx=2, pady=4)
-            tk.Label(row_frame, text=ext, font=("微软雅黑", 9, "bold"), bg=bg, width=10, anchor="w").pack(side="left", padx=2, pady=4)
+            tk.Label(row_frame, text=str(row_idx+1), font=("微软雅黑", 9), bg=bg, fg="#e6edf3", width=6, anchor="center").pack(side="left", padx=2, pady=4)
+            tk.Label(row_frame, text=ext, font=("微软雅黑", 9, "bold"), bg=bg, fg="#e6edf3", width=10, anchor="w").pack(side="left", padx=2, pady=4)
             tk.Label(row_frame, text="新扩展名，基准中不存在", font=("微软雅黑", 8), bg=bg,
                      fg="#27ae60", width=38, anchor="w").pack(side="left", padx=2, pady=4)
             tk.Label(row_frame, text="低", font=("微软雅黑", 8, "bold"), fg="white", bg="#27ae60",
@@ -7537,7 +7550,7 @@ class MainWindow:
             row_idx += 1
 
         # ===== 底部操作栏 =====
-        bottom_frame = tk.Frame(win, bg="#ecf0f1", bd=1, relief="solid")
+        bottom_frame = tk.Frame(win, bg="#1f2429", bd=1, relief="solid")
         bottom_frame.pack(fill="x", side="bottom", padx=10, pady=8)
 
         def apply_all(act):
@@ -8543,6 +8556,7 @@ class MainWindow:
         self._defapps_tv.tag_configure("locked", foreground="#7ee787")
         self._defapps_tv.tag_configure("appx", foreground="#58a6ff")
         self._defapps_tv.tag_configure("abnormal", foreground="#ffa657")
+        self._defapps_tv.tag_configure("normal", foreground="#7ee787")
         vsb = ttk.Scrollbar(tv_frame, orient="vertical", command=self._defapps_tv.yview)
         self._defapps_tv.configure(yscrollcommand=vsb.set)
         self._defapps_tv.pack(side="left", fill="both", expand=True)
@@ -8646,7 +8660,7 @@ class MainWindow:
                         path = "（商店应用，无文件路径）"
                 else:
                     name, path = "系统默认", ""
-                tag = "locked" if is_locked else ("appx" if is_appx else ("abnormal" if abn else ""))
+                tag = "locked" if is_locked else ("appx" if is_appx else ("abnormal" if abn else ("normal" if not prog else "")))
                 path_short = path if len(path) <= 60 else path[:28] + "…" + path[-28:]
                 rows.append((ext, name, path_short, status, tag))
             total = len(bl)

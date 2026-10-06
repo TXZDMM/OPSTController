@@ -1,0 +1,6 @@
+pid=10928 title='OPSTcontroller - 首次运行校准'
+--- log tail ---
+2026-10-06 16:14:59 [INFO] KillAdmin:完成:强杀结果:killed=2 admin=1
+2026-10-06 16:19:32 [INFO] MEIClean:线程:启动:TEMP=C:\Users\TXZDM\AppData\Local\Temp TMP=C:\Users\TXZDM\AppData\Local\Temp gettempdir=C:\Users\TXZDM\AppData\Local\Temp
+2026-10-06 16:19:47 [INFO] MEIClean:线程:启动:TEMP=C:\Users\TXZDM\AppData\Local\Temp TMP=C:\Users\TXZDM\AppData\Local\Temp gettempdir=C:\Users\TXZDM\AppData\Local\Temp
+2026-10-06 16:19:47 [INFO] KillAdmin:完成:强杀结果:killed=3 admin=1
