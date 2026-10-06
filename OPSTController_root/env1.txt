@@ -1,0 +1,27 @@
+=== HKCU Environment ===
+ChocolateyLastPathUpdate=133989436287025893
+OneDrive=C:\Users\TXZDM\OneDrive
+OneDriveConsumer=C:\Users\TXZDM\OneDrive
+Path=C:\Users\TXZDM\.local\bin;C:\Users\TXZDM\AppData\Local\Microsoft\WindowsApps;C:\Users\TXZDM\AppData\Roaming\npm;E:\APPS\txzdmm_app\platform-tools;E:\APPS\txzdmm_app\Microsoft VS Code\bin;C:\Users\TXZDM\.dotnet\tools;C:\Users\TXZDM\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build\bin;
+TEMP=C:\Users\TXZDM\AppData\Local\Temp
+TMP=C:\Users\TXZDM\AppData\Local\Temp
+HKCU last write: 
+=== HKLM Environment ===
+ChocolateyInstall=C:\ProgramData\chocolatey
+ComSpec=C:\windows\system32\cmd.exe
+DriverData=C:\Windows\System32\Drivers\DriverData
+NUMBER_OF_PROCESSORS=16
+OS=Windows_NT
+Path=C:\Program Files\BellSoft\LibericaJDK-18-Full\bin\;E:\vm\bin\;C:\Program Files\Microsoft\jdk-21.0.8.9-hotspot\bin;C:\Python313\Scripts\;C:\Python313\;C:\windows\system32;C:\windows;C:\windows\System32\Wbem;C:\windows\System32\WindowsPowerShell\v1.0\;C:\windows\System32\OpenSSH\;C:\Program Files\nodejs\;C:\ProgramData\chocolatey\bin;C:\Program Files\Git\cmd;E:\APPS\msys2;E:\APPS\QTSystem\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\dotnet\
+PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW
+PROCESSOR_ARCHITECTURE=AMD64
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 186 Stepping 2, GenuineIntel
+PROCESSOR_LEVEL=6
+PROCESSOR_REVISION=ba02
+TEMP=C:\windows\TEMP
+TMP=C:\windows\TEMP
+USERNAME=SYSTEM
+windir=C:\windows
+ZES_ENABLE_SYSMAN=1
+asl.log=Destination=file
+JAVA_HOME=C:\Program Files\BellSoft\LibericaJDK-18-Full\

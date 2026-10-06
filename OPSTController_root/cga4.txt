@@ -1,0 +1,17 @@
+ProxyEnable=0
+ProxyServer=127.0.0.1:7897
+AutoConfigURL=
+=== 代理端口连通性 ===
+127.0.0.1:7897 OPEN
+=== 云原神日志查找 ===
+=== config 目录 ===
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\de.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\en.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\es.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\fr.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\id.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\it.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\ja.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\ko.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\pc_modules_config.json
+C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\config\pt.json

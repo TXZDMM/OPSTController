@@ -1,0 +1,6 @@
+name=Genshin Impact Cloud Game respond=True cpu=3.6 mem=152.5MB
+title=
+path=C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\Genshin Impact Cloud Game.exe
+start=10-06 17:33:15
+=== 全部云原神相关进程 ===
+Genshin Impact Cloud Game pid=8632 respond=True title=''

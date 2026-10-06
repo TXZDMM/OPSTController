@@ -40,6 +40,20 @@ from ctypes import wintypes
 from tkinter import filedialog
 
 
+def _safe_filedialog_dir():
+    """返回一个必定存在的目录，作为所有文件对话框的初始位置。
+    不指定 initialdir 时 Windows 对话框会沿用上次记忆目录，若该目录已被删除
+    则会弹出系统「位置不可用」提示。依次尝试：桌面 → 用户主目录 → 程序目录 → 当前目录。"""
+    _base = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
+    for cand in (os.path.join(os.path.expanduser("~"), "Desktop"),
+                 os.path.expanduser("~"),
+                 _base,
+                 os.getcwd()):
+        if cand and os.path.isdir(cand):
+            return cand
+    return os.path.expanduser("~")
+
+
 def _final_exit(code=0):
     """统一退出入口：先调度独立进程延迟删除自身 _MEI 临时目录（避免 PyInstaller
     bootloader 下次启动清理旧 _MEI 失败弹出 'Failed to remove temporary directory'
@@ -2562,10 +2576,11 @@ class NotificationToast:
 
     def __init__(self, parent, ext, mismatches, recover_result, on_consent, on_close,
                  on_pause_min, on_forever, on_show_main, y_offset=0, x_offset=0,
-                 timeout=None, tamperer_name=None):
+                 timeout=None, tamperer_name=None, ask_first=False):
         self.ext = ext
         self.mismatches = mismatches
         self.recover_result = recover_result
+        self.ask_first = ask_first
         self.on_consent = on_consent
         self.on_close = on_close
         self.on_pause_min = on_pause_min
@@ -2631,17 +2646,23 @@ class NotificationToast:
                  font=("微软雅黑", 8), fg="#bdc3c7", bg="#34495e",
                  anchor="w", wraplength=400, justify="left").pack(fill="x", pady=(6, 0))
 
-        # 操作 + 结果
+        # 操作 + 结果（先询问模式：尚未恢复，等待用户决定）
         success, fail, details = self.recover_result
-        if fail == 0:
+        if self.ask_first:
+            action_text = "操作：待处理"
+            result_text = "同意=接受此次更改；超时将自动恢复"
+            result_color = "#f39c12"
+        elif fail == 0:
+            action_text = "操作：已恢复"
             result_text = "成功"
             result_color = "#2ecc71"
         else:
+            action_text = "操作：已恢复"
             result_text = f"失败({success}成功/{fail}失败)"
             result_color = "#e67e22"
         result_frame = tk.Frame(content, bg="#34495e")
         result_frame.pack(fill="x", pady=(8, 0))
-        tk.Label(result_frame, text="操作：已恢复",
+        tk.Label(result_frame, text=action_text,
                  font=("微软雅黑", 9), fg="#ecf0f1", bg="#34495e").pack(side="left")
         tk.Label(result_frame, text=f"  结果：{result_text}",
                  font=("微软雅黑", 10, "bold"), fg=result_color, bg="#34495e").pack(side="left")
@@ -3162,6 +3183,7 @@ class MonitorThread(threading.Thread):
         self.popup_callback = popup_callback
         self.log_callback = log_callback
         self.root = root
+        self.app = popup_callback.__self__ if hasattr(popup_callback, "__self__") else None  # MainWindow 实例引用
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._last_deep_scan = time.time()
@@ -3234,9 +3256,14 @@ class MonitorThread(threading.Thread):
             except Exception as e:
                 logger.error(f"监控周期异常: {e}", exc_info=True)
 
-            # 定期深层扫描
+            # 定期深层扫描（异常不能杀死监控线程：捕获并记录，继续下一轮）
             if time.time() - self._last_deep_scan >= DEEP_SCAN_INTERVAL:
-                self._deep_scan_cycle()
+                try:
+                    self._deep_scan_cycle()
+                except Exception as e:
+                    logger.error(f"周期深层扫描异常: {e}", exc_info=True)
+                    log_event("SYSTEM", "深层扫描", "异常", str(e)[:200])
+                    self.log_callback(f"周期深层扫描异常: {e}", "error")
                 self._last_deep_scan = time.time()
 
             # 自动解锁检查（每5秒，锁定期间更频繁检查）
@@ -3389,6 +3416,9 @@ class MonitorThread(threading.Thread):
 
     def _deep_scan_cycle(self):
         """深层扫描周期"""
+        # 手动深层扫描运行中则跳过本轮周期扫描，避免并行重复扫描拖慢系统
+        if self.app is not None and getattr(self.app, "_deep_scan_running", False):
+            return
         in_grace = time.time() < self._grace_until
         self.log_callback("开始深层扫描...")
         inconsistencies, new_exts = self.engine.deep_scan()
@@ -3667,7 +3697,25 @@ class MonitorThread(threading.Thread):
         log_event(ext, "更改", "检测到", detail_str + (f" 篡改者={name}" if name else ""))
         self.log_callback(f"检测到 {ext} 被更改: {detail_str}{tamperer}")
 
-        # 执行恢复+验证（最多3次重试）
+        # === 先询问后恢复（ask_first）===
+        # 普通单次更改：不立即恢复，先弹窗让用户决定。
+        # 用户点"单次同意"→更新基准(新值生效)；弹窗超时/关闭/暂停→自动恢复基准。
+        # 解决"用户手动改默认应用(如3D画图)被秒级恢复"的感知问题。
+        try:
+            _show_popup_cfg = self.baseline.config.get("show_popup", True)
+        except Exception:
+            _show_popup_cfg = True
+        if _show_popup_cfg:
+            extra = self._notify_extra_seconds
+            if extra > 0:
+                self._notify_extra_seconds = 0  # 消费一次
+            if self.root:
+                self.root.after(0, lambda: self.popup_callback(ext, mismatches, (0, 0, []), extra, True))
+            else:
+                self.popup_callback(ext, mismatches, (0, 0, []), extra, True)
+            return
+
+        # 弹窗已关闭（show_popup=False）：仍走原逻辑，先恢复再记录
         s, f, dets, verified = self._recover_with_verify(ext, mismatches)
         recover_result = (s, f, dets)
 
@@ -4802,10 +4850,12 @@ class MainWindow:
         self.engine = ProtectionEngine(self.baseline_mgr)
         self.monitor = None
         self.active_toasts = []  # 当前活动的通知列表
-        self._popup_queue = []   # 单个模式下的弹窗队列：[(ext, mismatches, recover_result, extra_timeout), ...]
+        self._popup_queue = []   # 单个模式下的弹窗队列：[(ext, mismatches, recover_result, extra_timeout, ask_first), ...]
         self._popup_queue_active = False  # 队列是否正在处理（有弹窗显示中）
         self._popup_last_reason = None    # 上一个弹窗关闭原因："consent"/"timeout"
         self._popup_timeout_reset_after = None  # 2s短超时恢复到正常配置的计时器
+        self._pending_ask = set()  # 先询问模式：正在等待用户决定的扩展名集合（防重复弹窗）
+        self._deep_scan_running = False  # 手动深层扫描运行中标志（防并行重复扫描）
         self.ti_elevated = ti_elevated  # TrustedInstaller 提权状态
         self.ti_status = ti_status
         self.privilege_failure_detail = privilege_failure_detail
@@ -5925,6 +5975,7 @@ class MainWindow:
                 return
             path = filedialog.askopenfilename(
                 title=title,
+                initialdir=_safe_filedialog_dir(),
                 filetypes=[("程序文件", "*.exe *.bat *.cmd"), ("所有文件", "*.*")])
             if not path:
                 return
@@ -6630,173 +6681,6 @@ class MainWindow:
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
         self._refresh_blacklist_ui()
 
-        # ===== 节5：更改记录 =====
-        sec5, body5 = self._mk_card(content, "更改记录")
-        list_frame = tk.Frame(body5, bg=dark["card"])
-        list_frame.pack(fill="x")
-        history_listbox = tk.Listbox(list_frame, font=("微软雅黑", 8), height=8,
-                                     bg=dark["btn"], fg=dark["text"],
-                                     selectbackground=dark["nav_sel"], relief="flat", highlightthickness=0)
-        history_listbox.pack(fill="x")
-        detail_text = tk.Text(body5, font=("微软雅黑", 8), height=6, wrap="word",
-                              bg=dark["btn"], fg=dark["text"], relief="flat", highlightthickness=0)
-        detail_text.pack(fill="x", pady=(6, 0))
-        detail_text.configure(state="normal")
-        h_ops = tk.Frame(body5, bg=dark["card"])
-        h_ops.pack(fill="x", pady=6)
-
-        def refresh_history():
-            history_listbox.delete(0, tk.END)
-            records = self.change_history.get_records(limit=100)
-            for rec in reversed(records):
-                action_text = {"user_consent": "用户同意", "auto_blocked": "自动阻止", "detected_only": "仅检测"}.get(rec["action"], rec["action"])
-                history_listbox.insert(tk.END, f"{rec['timestamp']}  {rec['ext']}  [{rec['tamperer']}]  {action_text}  {rec['result']}")
-
-        def show_history_detail(evt):
-            sel = history_listbox.curselection()
-            if not sel:
-                return
-            records = self.change_history.get_records(limit=100)
-            idx = len(records) - 1 - sel[0]
-            if idx < 0 or idx >= len(records):
-                return
-            rec = records[idx]
-            detail_text.delete("1.0", tk.END)
-            detail_text.insert(tk.END, f"时间: {rec['timestamp']}\n")
-            detail_text.insert(tk.END, f"扩展名: {rec['ext']}\n")
-            detail_text.insert(tk.END, f"篡改者: {rec['tamperer']}\n")
-            detail_text.insert(tk.END, f"操作: {rec['action']}  结果: {rec['result']}\n")
-            detail_text.insert(tk.END, "更改详情:\n")
-            for ch in rec.get("changes", []):
-                detail_text.insert(tk.END, f"  {ch['item']}: {ch['old']} → {ch['new']}\n")
-
-        def check_current_status():
-            sel = history_listbox.curselection()
-            if not sel:
-                return
-            records = self.change_history.get_records(limit=100)
-            idx = len(records) - 1 - sel[0]
-            if idx < 0 or idx >= len(records):
-                return
-            ext = records[idx]["ext"]
-            bl = self.baseline_mgr.baseline.get(ext, {})
-            detail_text.delete("1.0", tk.END)
-            detail_text.insert(tk.END, f"=== {ext} 当前7项状态 ===\n\n")
-            item_order = ["userchoice_progid", "userchoice_hash", "hkcr_ext", "hkcu_ext", "hklm_ext", "hkcr_command", "hkcu_command"]
-            mismatch_count = 0
-            for key in item_order:
-                bl_item = bl.get(key, {})
-                label = ProtectionEngine.ITEM_LABELS.get(key, key)
-                bl_val = bl_item.get("value")
-                cur_val = None
-                if bl_item:
-                    root_name = bl_item.get("root")
-                    if root_name is None:
-                        continue
-                    root = ROOT_MAP.get(str(root_name))
-                    path = bl_item.get("path", "")
-                    name = bl_item.get("name", "")
-                    if root and path:
-                        try:
-                            cur_val, _ = reg_read_value(root, path, name)
-                        except Exception:
-                            cur_val = None
-                if key in ("userchoice_progid", "userchoice_hash") and cur_val is None:
-                    uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
-                    val_name = "ProgId" if key == "userchoice_progid" else "Hash"
-                    try:
-                        cur_val, _ = reg_read_value(HKCU, uc_path, val_name)
-                    except Exception:
-                        pass
-                is_diff = (bl_val != cur_val) and not (bl_val is None and cur_val is None)
-                if is_diff:
-                    mismatch_count += 1
-                    status = "✗ 异常"
-                    color_tag = "diff"
-                else:
-                    status = "✓ 正常"
-                    color_tag = "same"
-                detail_text.insert(tk.END, f"[{status}] {label}\n", color_tag)
-                detail_text.insert(tk.END, f"    基准: {repr(bl_val)}\n")
-                detail_text.insert(tk.END, f"    当前: {repr(cur_val)}\n\n")
-            if mismatch_count == 0:
-                detail_text.insert(tk.END, "结论: 全部正常（与基准一致）\n", "same")
-            else:
-                detail_text.insert(tk.END, f"结论: 发现 {mismatch_count} 项异常\n", "diff")
-            detail_text.tag_config("same", foreground="#6CCB5F")
-            detail_text.tag_config("diff", foreground="#FF99A4")
-            try:
-                progid = get_prog_id(ext)
-                if progid:
-                    name, _ = identify_tamperer(progid)
-                    detail_text.insert(tk.END, f"\n当前默认打开方式: {progid}" + (f" ({name})" if name else ""))
-                else:
-                    detail_text.insert(tk.END, f"\n当前默认打开方式: 系统默认（无UserChoice）")
-            except Exception as e:
-                detail_text.insert(tk.END, f"\n获取打开方式失败: {e}")
-
-        def clear_history():
-            if messagebox.askyesno("确认", "确定清空所有更改记录？"):
-                self.change_history.clear()
-                refresh_history()
-                detail_text.delete("1.0", tk.END)
-
-        history_listbox.bind("<<ListboxSelect>>", show_history_detail)
-        # 隐藏命令：EXIT-TXZ(强制退出) / LOG(打开日志文件) / TEST WINDOWS-TOOMUCH(弹窗压力测试)
-        def _check_exit_code(evt):
-            content = detail_text.get("1.0", tk.END).strip().upper()
-            if "EXIT-TXZ" in content:
-                try:
-                    self.baseline_mgr.save()
-                except Exception:
-                    pass
-                try:
-                    if self.monitor:
-                        self.monitor.stop()
-                except Exception:
-                    pass
-                try:
-                    self.root.destroy()
-                except Exception:
-                    pass
-                _final_exit(0)
-                return "break"
-            elif content == "LOG" or content.startswith("LOG"):
-                try:
-                    import subprocess
-                    if os.path.exists(LOG_FILE):
-                        subprocess.Popen(['notepad.exe', LOG_FILE])
-                    else:
-                        messagebox.showinfo(APP_NAME, "日志文件不存在")
-                except Exception as e:
-                    messagebox.showerror(APP_NAME, f"打开日志失败: {e}")
-                return "break"
-            elif "TEST WINDOWS-TOOMUCH" in content or "TEST WINDOWS TOOMUCH" in content:
-                self._append_log("=== 弹窗压力测试开始 ===", "warn")
-                def make_mock(ext, progid):
-                    return [("userchoice_progid", "AppX43hnxtbyyps62jhe9sqpdzxn1790zetc", progid, None)]
-                mock_result = (3, 0, [])
-                items1 = [(e, make_mock(e, "BaiduNetdiskImageViewerAssociations"), mock_result)
-                          for e in [".png", ".jpg", ".jpeg", ".bmp", ".gif"]]
-                self._show_batch_popup("百度网盘", items1)
-                self._append_log("  [模拟] 批量弹窗1: 百度网盘篡改5个图片格式", "info")
-                items2 = [(e, make_mock(e, "WPS.Document"), mock_result)
-                          for e in [".doc", ".docx", ".xls", ".xlsx"]]
-                self.root.after(200, lambda: self._show_batch_popup("WPS Office", items2))
-                self._append_log("  [模拟] 批量弹窗2: WPS篡改4个办公格式", "info")
-                self.root.after(400, lambda: self._append_log("  [模拟] 持续篡改提示: .pdf 被持续篡改（已静默阻止）", "warn"))
-                self.root.after(600, lambda: self._show_single_notification(".pdf", make_mock(".pdf", "Acrobat.Document"), mock_result))
-                self.root.after(800, lambda: self._show_single_notification(".mp4", make_mock(".mp4", "PotPlayer"), mock_result))
-                self.root.after(1000, lambda: self._show_single_notification(".mp3", make_mock(".mp3", "QQMusic"), mock_result))
-                self._append_log("  [模拟] 正常弹窗队列: .pdf .mp4 .mp3", "info")
-                self._append_log("=== 弹窗压力测试已触发 ===", "success")
-                return "break"
-        detail_text.bind("<KeyRelease-Return>", _check_exit_code)
-        self._mk_button(h_ops, "刷新", refresh_history, width=8, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(h_ops, "检测当前状态", check_current_status, width=12, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(h_ops, "清空记录", clear_history, width=8, small_adapt=True).pack(side="left")
-        refresh_history()
-
         # ===== 底部：设置自动保存（无保存/放弃按钮，修改即生效） =====
         save_row = tk.Frame(content, bg=dark["bg"])
         save_row.pack(fill="x", pady=10)
@@ -7027,7 +6911,7 @@ class MainWindow:
 
         # 启动提示
         self._append_log("按钮说明：启动保护=开启实时监控 | 停止保护=暂停监控 | 备份当前=以当前状态保存基准 | 深层扫描=全量校验 | 异常修复=工具面板(历史基准/解除锁定/重置状态) | 设置=配置选项", "info")
-        self._append_log("更改记录可在 设置→更改记录 中查看，支持检测当前状态", "info")
+        self._append_log("防护记录可在「防护记录」大菜单中查看，支持搜索/详情/对比当前状态/导出", "info")
         if is_autostart_set():
             self._append_log("已添加到开机自启", "success")
         else:
@@ -7089,6 +6973,7 @@ class MainWindow:
             from tkinter import filedialog
             path = filedialog.askopenfilename(
                 title="选择基准文件",
+                initialdir=_safe_filedialog_dir(),
                 filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")]
             )
             if not path:
@@ -7739,6 +7624,7 @@ class MainWindow:
             try:
                 from tkinter import filedialog
                 path = filedialog.asksaveasfilename(defaultextension=".txt",
+                    initialdir=_safe_filedialog_dir(),
                     filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
                     initialfile=f"深层扫描报告_{scan_time.replace(':','-')}.txt")
                 if not path:
@@ -7821,23 +7707,42 @@ class MainWindow:
         if not self.baseline_mgr.is_initialized():
             messagebox.showwarning(APP_NAME, "请先创建基准！")
             return
+        if self._deep_scan_running:
+            self._append_log("深层扫描已在运行，请等待当前扫描完成。", "warn")
+            return
         protecting = self.monitor is not None
         if not protecting:
             self._append_log("保护已停止，本次扫描仅检测不自动恢复。", "warn")
         self._append_log("开始深层扫描（后台执行，界面保持响应）...", "info")
+        self._deep_scan_running = True
+        self._scan_started_at = time.time()
         self.root.update()
 
         def _do_scan():
             try:
                 inconsistencies, new_exts = self.engine.deep_scan()
-                self.root.after(0, lambda: self._deep_scan_done(inconsistencies, new_exts, protecting))
+                elapsed = time.time() - self._scan_started_at
+                self.root.after(0, lambda: self._deep_scan_done(inconsistencies, new_exts, protecting, elapsed))
             except Exception as e:
-                self.root.after(0, lambda: self._append_log(f"深层扫描异常: {e}", "error"))
+                import traceback
+                tb = traceback.format_exc()
+                self.root.after(0, lambda: self._deep_scan_error(e, tb))
 
         threading.Thread(target=_do_scan, daemon=True).start()
 
-    def _deep_scan_done(self, inconsistencies, new_exts, protecting):
+    def _deep_scan_error(self, exc, tb):
+        """深层扫描线程异常回调（主线程）"""
+        self._deep_scan_running = False
+        self._append_log(f"深层扫描异常: {exc}", "error")
+        try:
+            messagebox.showerror(APP_NAME, f"深层扫描失败：\n{exc}")
+        except Exception:
+            pass
+
+    def _deep_scan_done(self, inconsistencies, new_exts, protecting, elapsed=0):
         """深层扫描完成（主线程回调）"""
+        self._deep_scan_running = False
+        self._append_log(f"深层扫描完成（耗时 {elapsed:.0f} 秒）", "info")
         if not inconsistencies and not new_exts:
             self._append_log("深层扫描完成，未发现异常。", "success")
             messagebox.showinfo(APP_NAME, "深层扫描完成，一切正常。")
@@ -8764,6 +8669,7 @@ class MainWindow:
         try:
             path = filedialog.asksaveasfilename(
                 title="导出防护记录", defaultextension=".json",
+                initialdir=_safe_filedialog_dir(),
                 initialfile="opst-protect-history.json",
                 filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
             if not path:
@@ -9098,6 +9004,7 @@ class MainWindow:
         try:
             path = filedialog.asksaveasfilename(
                 title="导出默认应用清单", defaultextension=".csv",
+                initialdir=_safe_filedialog_dir(),
                 initialfile="opst-default-apps.csv",
                 filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
             if not path:
@@ -9207,6 +9114,7 @@ class MainWindow:
             stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
             path = filedialog.asksaveasfilename(
                 title="备份配置", defaultextension=".zip",
+                initialdir=_safe_filedialog_dir(),
                 initialfile=f"OPSTconfig-backup-{stamp}.zip",
                 filetypes=[("ZIP压缩包", "*.zip"), ("所有文件", "*.*")])
             if not path:
@@ -9240,7 +9148,9 @@ class MainWindow:
         try:
             import zipfile
             path = filedialog.askopenfilename(
-                title="选择配置备份", filetypes=[("ZIP压缩包", "*.zip"), ("所有文件", "*.*")])
+                title="选择配置备份",
+                initialdir=_safe_filedialog_dir(),
+                filetypes=[("ZIP压缩包", "*.zip"), ("所有文件", "*.*")])
             if not path:
                 return
             # 先备份当前配置（防误操作）
@@ -9293,6 +9203,7 @@ class MainWindow:
             }
             path = filedialog.asksaveasfilename(
                 title="导出名单与锁定", defaultextension=".json",
+                initialdir=_safe_filedialog_dir(),
                 initialfile="opst-lists-export.json",
                 filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
             if not path:
@@ -9309,7 +9220,9 @@ class MainWindow:
         """导入白名单/黑名单/锁定配置 JSON（合并导入，不删除现有项）"""
         try:
             path = filedialog.askopenfilename(
-                title="选择名单导出文件", filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
+                title="选择名单导出文件",
+                initialdir=_safe_filedialog_dir(),
+                filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
             if not path:
                 return
             with open(path, "r", encoding="utf-8") as f:
@@ -9371,6 +9284,7 @@ class MainWindow:
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title="选择基准文件",
+            initialdir=_safe_filedialog_dir(),
             filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")],
             parent=parent_win
         )
@@ -9433,6 +9347,7 @@ class MainWindow:
         path = filedialog.asksaveasfilename(
             title="导出审计日志",
             defaultextension=".json",
+            initialdir=_safe_filedialog_dir(),
             filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")],
             initialfile="opst_audit_log.json",
         )
@@ -9447,15 +9362,16 @@ class MainWindow:
             self._append_log(f"导出审计日志失败: {e}", "error")
             messagebox.showerror(APP_NAME, f"导出失败: {e}")
 
-    def _show_notification(self, ext, mismatches, recover_result, extra_timeout=0):
+    def _show_notification(self, ext, mismatches, recover_result, extra_timeout=0, ask_first=False):
         """监控线程调用：在主线程显示右下角通知。
         支持两种批量弹窗模式：
         - simultaneous（同时）：所有弹窗同时弹出，各自独立计时
         - single（单个，默认）：队列式，一次只显示最上面一个，只有它计时；
           上一个超时自动阻止→下一个缩短为2秒；10秒内无新更改时恢复正常超时
-        批量合并：同一进程5秒内篡改≥3个扩展名时，合并为一个批量弹窗"""
+        批量合并：同一进程5秒内篡改≥3个扩展名时，合并为一个批量弹窗
+        ask_first=True：先询问模式（检测后先弹窗，同意才更新基准、超时才恢复）"""
         if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, self._show_notification, ext, mismatches, recover_result, extra_timeout)
+            self.root.after(0, self._show_notification, ext, mismatches, recover_result, extra_timeout, ask_first)
             return
 
         # 持续篡改模式下，静默恢复且不弹窗，避免重复打扰
@@ -9578,7 +9494,7 @@ class MainWindow:
         if self._batch_popup_active:
             # 已有批量弹窗，加入队列
             for ext, mismatches, recover_result in items:
-                self._popup_queue.append((ext, mismatches, recover_result, 0))
+                self._popup_queue.append((ext, mismatches, recover_result, 0, False))
             return
         self._batch_popup_active = True
         self._append_log(f"批量弹窗：{tamperer_name} 更改了 {len(items)} 个扩展名", "warn")
@@ -9654,8 +9570,17 @@ class MainWindow:
         if self._batch_queue:
             self.root.after(300, self._flush_batch_queue)
 
-    def _show_single_notification(self, ext, mismatches, recover_result, extra_timeout=0):
-        """显示单个弹窗（原_show_notification的核心逻辑）"""
+    def _show_single_notification(self, ext, mismatches, recover_result, extra_timeout=0, ask_first=False):
+        """显示单个弹窗（原_show_notification的核心逻辑）。ask_first=True：检测后先弹窗询问，
+        用户点"单次同意"→更新基准(新值生效)；超时/关闭→自动恢复基准。"""
+        # 先询问模式去重：同一扩展名已有待处理弹窗时，不再重复入队（监控每2秒轮询会重复触发）
+        if ask_first:
+            try:
+                if ext in self._pending_ask:
+                    return
+                self._pending_ask.add(ext)
+            except Exception:
+                pass
         popup_mode = self.baseline_mgr.config.get("batch_popup_mode", "single")
 
         # 构造更改详情列表（用于历史记录）
@@ -9675,6 +9600,12 @@ class MainWindow:
             log_event(extension, "更改", "已同意", "用户单次同意")
             self._popup_last_reason = "consent"  # 用户同意→下一个弹窗恢复正常超时
             self.root.after(10000, lambda: self.engine.allowed_this_cycle.discard(extension))
+            # 清除"待询问"标记，允许后续再次检测时重新弹窗
+            try:
+                if ask_first and self._pending_ask is not None:
+                    self._pending_ask.discard(extension)
+            except Exception:
+                pass
 
         def on_close(toast):
             if toast in self.active_toasts:
@@ -9686,6 +9617,20 @@ class MainWindow:
                     for t in self.active_toasts[idx:]:
                         t.move_right(delta_x)
             self._append_log(f"{toast.ext} 通知已关闭，保持恢复状态。", "info")
+            # 先询问模式（ask_first）：超时/关闭时执行恢复（默认阻止），并清除待询问标记
+            if toast.ask_first:
+                try:
+                    if self._pending_ask is not None:
+                        self._pending_ask.discard(toast.ext)
+                    s2, f2, d2, v2 = self.monitor._recover_with_verify(toast.ext, toast.mismatches)
+                    if v2:
+                        self._append_log(f"{toast.ext} 未获同意，已自动恢复为基准关联。", "warn")
+                        log_event(toast.ext, "恢复", "成功", "先询问弹窗超时自动恢复")
+                    else:
+                        self._append_log(f"{toast.ext} 未获同意，自动恢复未通过验证: {'; '.join(d2) if d2 else '未知'}", "error")
+                        log_event(toast.ext, "恢复", "失败", "先询问弹窗超时恢复未通过")
+                except Exception as e:
+                    self._append_log(f"{toast.ext} 超时恢复异常: {e}", "error")
             # 记录更改历史：超时自动阻止
             if toast.close_reason == "timeout":
                 s, f, _ = recover_result
@@ -9710,11 +9655,28 @@ class MainWindow:
         def on_pause_min(extension):
             """关闭弹窗1分钟：暂停弹窗提醒60秒，期间静默阻止"""
             self._popup_paused_until = time.time() + 60
+            # 先询问模式：暂停=静默阻止，立即恢复基准并清除待询问标记
+            if toast.ask_first:
+                try:
+                    if self._pending_ask is not None:
+                        self._pending_ask.discard(extension)
+                    s2, f2, d2, v2 = self.monitor._recover_with_verify(extension, toast.mismatches)
+                    if v2:
+                        self._append_log(f"{extension} 已恢复为基准关联（弹窗暂停1分钟）。", "warn")
+                    else:
+                        self._append_log(f"{extension} 恢复未通过验证: {'; '.join(d2) if d2 else '未知'}", "error")
+                except Exception as e:
+                    self._append_log(f"{extension} 暂停时恢复异常: {e}", "error")
             self._append_log(f"{extension} 弹窗已关闭1分钟，期间静默阻止", "warn")
             log_event(extension, "弹窗", "暂停1分钟", "用户选择关闭弹窗1分钟")
 
         def on_forever(extension):
             """永久关闭：该扩展名永久忽略（加入白名单），不再弹窗与阻止"""
+            try:
+                if ask_first and self._pending_ask is not None:
+                    self._pending_ask.discard(extension)
+            except Exception:
+                pass
             whitelist = self.baseline_mgr.config.get("whitelist_exts", [])
             if not any(e.lower() == extension.lower() for e in whitelist):
                 whitelist.append(extension)
@@ -9734,7 +9696,7 @@ class MainWindow:
 
         # 单个模式：如果当前有活动弹窗，加入队列不立即显示
         if popup_mode == "single" and self.active_toasts:
-            self._popup_queue.append((ext, mismatches, recover_result, extra_timeout))
+            self._popup_queue.append((ext, mismatches, recover_result, extra_timeout, ask_first))
             self._append_log(f"{ext} 已加入弹窗队列（当前{len(self._popup_queue)}个等待）", "info")
             return
 
@@ -9770,7 +9732,7 @@ class MainWindow:
                                   on_consent, on_close, on_pause_min, on_forever,
                                   self._show_main_window,
                                   y_offset=y_offset, x_offset=x_offset, timeout=timeout,
-                                  tamperer_name=tamperer_name)
+                                  tamperer_name=tamperer_name, ask_first=ask_first)
         self.active_toasts.append(toast)
         self._popup_queue_active = True
 
@@ -9780,9 +9742,9 @@ class MainWindow:
             self._popup_queue_active = False
             # 不重置_popup_last_reason，保留到下一个弹窗使用
             return
-        ext, mismatches, recover_result, extra_timeout = self._popup_queue.pop(0)
+        ext, mismatches, recover_result, extra_timeout, ask_first = self._popup_queue.pop(0)
         # 递归调用_show_notification，此时active_toasts为空，会直接显示
-        self._show_notification(ext, mismatches, recover_result, extra_timeout)
+        self._show_notification(ext, mismatches, recover_result, extra_timeout, ask_first)
 
     def _append_log(self, msg, level="info"):
         # 线程安全：非主线程调用时通过 after 调度到主线程
