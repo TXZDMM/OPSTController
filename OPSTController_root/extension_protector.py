@@ -4915,6 +4915,21 @@ class MainWindow:
         self._wheel_active.clear()
         if key == "exts":
             self._refresh_ext_page()
+        if key == "settings":
+            # 切到设置页时强制重排基准按钮（覆盖容器未映射/事件未触发的场景）
+            rf = getattr(self, "_settings_flow_refresh", None)
+            if rf:
+                try:
+                    self.root.after_idle(rf)
+                except Exception:
+                    pass
+        # 页面切换后强制刷新所有滚动容器的滚动区域（覆盖 Configure 事件未触发的场景）
+        for c in getattr(self, "_scroll_canvases", []):
+            try:
+                if c.winfo_ismapped():
+                    c._sync_scroll()
+            except Exception:
+                pass
 
     def _set_selfprotect_label(self, ok, msg):
         """更新状态页的进程自我保护显示"""
@@ -5226,9 +5241,20 @@ class MainWindow:
         canvas.pack(side="left", fill="both", expand=True, padx=(24, 8), pady=8)
         content = tk.Frame(canvas, bg=self.C["bg"])
         cw = canvas.create_window((0, 0), window=content, anchor="nw")
-        def _sync_scroll(_e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _sync_scroll(_e=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
         content.bind("<Configure>", _sync_scroll)
+        # 保底同步：容器映射后强制刷新滚动区域（覆盖 Configure 事件未触发的场景，
+        # 避免内容被裁剪、视口外设置项不可见且无法滚动）
+        try:
+            canvas._sync_scroll = _sync_scroll
+            self.root.after(300, lambda: _sync_scroll(None))
+            self.root.after(600, lambda: _sync_scroll(None))
+        except Exception:
+            pass
         def _sync_width(_e):
             canvas.itemconfig(cw, width=_e.width)
         canvas.bind("<Configure>", _sync_width)
@@ -5321,7 +5347,12 @@ class MainWindow:
             try:
                 avail = parent.winfo_width()
                 if avail <= 1:
-                    return
+                    # 保底布局：窗口/容器尚未映射（如页面未显示、Configure 未触发）时，
+                    # 按估算宽度立即布局，确保按钮一定渲染出来；后续 Configure 触发再精确重排
+                    try:
+                        avail = max(parent.winfo_reqwidth(), 720)
+                    except Exception:
+                        avail = 720
                 widths = []
                 for w in widgets:
                     try:
@@ -5369,6 +5400,11 @@ class MainWindow:
         parent.bind("<Configure>", _relayout)
         try:
             self.root.after(50, _relayout)
+        except Exception:
+            pass
+        # 二次保底：页面显示后再布局一次，覆盖首次 after 时容器尚未映射的场景
+        try:
+            self.root.after(150, _relayout)
         except Exception:
             pass
         return _relayout
@@ -6222,7 +6258,7 @@ class MainWindow:
             self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root), small_adapt=True),
         ]
         # 换行适配：窗口窄时按钮自动换行，杜绝按钮被裁掉（“设置项消失”）
-        self._flow_wrap(b_ops, _base_btns, gap=8)
+        self._settings_flow_refresh = self._flow_wrap(b_ops, _base_btns, gap=8)
 
         # ===== 节3：权限 =====
         sec3, body3 = self._mk_card(content, "权限")
