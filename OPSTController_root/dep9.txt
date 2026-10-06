@@ -1,7 +1,0 @@
---- OPST procs ---
-  pid=10928 title='OPSTcontroller - 首次运行校准'
---- NSudo procs ---
---- _MEI temp ---
-  _MEI000031a42 16:20:54
---- config lock? ---
-config mtime=15:32:15 size=665

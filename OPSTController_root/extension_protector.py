@@ -2694,6 +2694,15 @@ class NotificationToast:
                                       padx=14, pady=5)
         self.forever_btn.pack(side="left")
 
+        # 不显眼的「打开主程序」按钮（小字灰底，靠右侧）
+        self.show_main_btn = tk.Button(btn_row1, text="打开主程序",
+                                       font=("微软雅黑", 8),
+                                       command=self._on_show_main, relief="flat",
+                                       bg="#5d6d7e", fg="#bdc3c7", activebackground="#5d6d7e",
+                                       activeforeground="#ecf0f1", cursor="hand2",
+                                       padx=8, pady=3)
+        self.show_main_btn.pack(side="right")
+
         # 提示行（按钮含义，自动换行避免超宽裁切）
         tk.Label(bottom, text="单次同意=允许这次更改；关闭1分钟=暂停提醒1分钟；永久关闭=该扩展名永久忽略",
                  font=("微软雅黑", 7), fg="#7f8c8d", bg="#34495e",
@@ -2842,7 +2851,7 @@ class BatchNotificationToast:
     TOAST_HEIGHT = 260
     MARGIN = 50
 
-    def __init__(self, parent, tamperer_name, items, on_block_all, on_allow_all, on_view_onebyone, on_pause, on_close):
+    def __init__(self, parent, tamperer_name, items, on_block_all, on_allow_all, on_view_onebyone, on_pause, on_close, on_show_main=None):
         self.tamperer_name = tamperer_name
         self.items = items
         self.on_block_all = on_block_all
@@ -2850,6 +2859,7 @@ class BatchNotificationToast:
         self.on_view_onebyone = on_view_onebyone
         self.on_pause = on_pause
         self.on_close = on_close
+        self.on_show_main = on_show_main
         self.remaining = 60
         self._closed = False
         self._build_ui(parent)
@@ -2895,6 +2905,8 @@ class BatchNotificationToast:
         btn_frame2.pack(fill="x", pady=(6, 0))
         tk.Button(btn_frame2, text="暂停弹窗5分钟", font=("微软雅黑", 8), bg="#7f8c8d", fg="white", relief="flat", cursor="hand2", padx=10, pady=3, command=self._on_pause).pack(side="left", padx=2)
         tk.Button(btn_frame2, text="关闭", font=("微软雅黑", 8), bg="#95a5a6", fg="white", relief="flat", cursor="hand2", padx=10, pady=3, command=self._on_close_btn).pack(side="right", padx=2)
+        # 不显眼的「打开主程序」按钮（小字灰底，居中）
+        tk.Button(btn_frame2, text="打开主程序", font=("微软雅黑", 8), bg="#5d6d7e", fg="#bdc3c7", relief="flat", cursor="hand2", padx=8, pady=3, command=self._on_show_main).pack(side="right", padx=(0, 10))
         self.progress = tk.Frame(self.win, bg="#e74c3c", height=2)
         self.progress.pack(fill="x", side="bottom")
 
@@ -2992,6 +3004,14 @@ class BatchNotificationToast:
         except Exception:
             pass
         self.on_close(self.tamperer_name, self.items)
+
+    def _on_show_main(self):
+        """打开主程序（不关闭通知）"""
+        try:
+            if self.on_show_main:
+                self.on_show_main()
+        except Exception:
+            pass
 
     def move_up(self, delta_y, delta_x=0):
         """通知关闭时，上方通知对角线上移（上+左）"""
@@ -6293,6 +6313,18 @@ class MainWindow:
             btn.configure(state="disabled")
             btn.pack(side="right")
             self._qc_labels[key] = (st, btn)
+        # 弹窗检测：功能测试行（依次触发批量/持续/多个/单个弹窗）
+        prow = tk.Frame(qc_body, bg=self.C["card"])
+        prow.pack(fill="x", pady=2)
+        tk.Label(prow, text="弹窗检测", width=12, font=("微软雅黑", 9),
+                 fg=self.C["text2"], bg=self.C["card"],
+                 anchor="w").pack(side="left")
+        pst = tk.Label(prow, text="未测试", font=("微软雅黑", 9),
+                       fg=self.C["text3"], bg=self.C["card"], anchor="w")
+        pst.pack(side="left", fill="x", expand=True)
+        pbtn = self._mk_button(prow, "测试", self._qc_popup_test, kind="default")
+        pbtn.pack(side="right")
+        self._qc_labels["popup"] = (pst, pbtn)
 
         def make_button(parent_w, text, command, height=1):
             # 统一配色：全部使用标准深色按钮风格（取消多色混杂）
@@ -8131,6 +8163,98 @@ class MainWindow:
         except Exception as e:
             self._repair_status_var.set(f"修复失败: {e}")
 
+    # ---------- 弹窗检测（依次测试四种弹窗场景） ----------
+    def _qc_popup_test(self):
+        """弹窗检测：点击后依次测试 批量更改→持续更改→多个弹窗→单个弹窗"""
+        try:
+            if getattr(self, "_qc_popup_testing", False):
+                self._repair_status_var.set("弹窗测试已在运行中，请先关闭已弹出的测试弹窗")
+                return
+            self._qc_popup_testing = True
+            self._qc_labels["popup"][0].config(text="测试中：批量更改弹窗…", fg=self.C["warn"])
+            self._append_log("弹窗检测开始：依次测试 批量更改→持续更改→多个弹窗→单个弹窗", "info")
+            self.root.after(0, self._qc_popup_step1)
+        except Exception as e:
+            self._qc_popup_testing = False
+            self._qc_labels["popup"][0].config(text=f"测试失败: {e}", fg=self.C["error"])
+
+    def _qc_popup_step1(self):
+        """场景1：批量更改（同一程序 3 个扩展名 → 批量弹窗）"""
+        try:
+            def mk(ext, prog):
+                return [("userchoice_progid", "系统默认", prog, 1)]
+            self._show_batch_popup(
+                "弹窗测试·批量更改",
+                [(e, mk(e, "TestApp"), (1, 0, "测试")) for e in (".bt1", ".bt2", ".bt3")])
+            self._append_log("弹窗检测(1/4)：批量更改弹窗已弹出", "info")
+            self.root.after(4000, self._qc_popup_step2)
+        except Exception as e:
+            self._qc_popup_step_err(1, e)
+
+    def _qc_popup_step2(self):
+        """场景2：持续更改（连续快速弹出多个单弹窗）"""
+        try:
+            self._qc_labels["popup"][0].config(text="测试中：持续更改弹窗…", fg=self.C["warn"])
+            def mk(ext, prog):
+                return [("userchoice_progid", "系统默认", prog, 1)]
+            for i in range(3):
+                self.root.after(i * 900, lambda i=i: self._show_single_notification(
+                    f".ct{i}", mk(f".ct{i}", "TestApp2"), (1, 0, "测试")))
+            self._append_log("弹窗检测(2/4)：持续更改弹窗序列已触发", "info")
+            self.root.after(4200, self._qc_popup_step3)
+        except Exception as e:
+            self._qc_popup_step_err(2, e)
+
+    def _qc_popup_step3(self):
+        """场景3：多个弹窗（同一时刻同时弹出 3 个单弹窗）"""
+        try:
+            self._qc_labels["popup"][0].config(text="测试中：多个弹窗…", fg=self.C["warn"])
+            def mk(ext, prog):
+                return [("userchoice_progid", "系统默认", prog, 1)]
+            for i in range(3):
+                self._show_single_notification(
+                    f".mt{i}", mk(f".mt{i}", "TestApp3"), (1, 0, "测试"))
+            self._append_log("弹窗检测(3/4)：多个弹窗已同时触发", "info")
+            self.root.after(4000, self._qc_popup_step4)
+        except Exception as e:
+            self._qc_popup_step_err(3, e)
+
+    def _qc_popup_step4(self):
+        """场景4：单个弹窗（最后单独弹出一个）"""
+        try:
+            self._qc_labels["popup"][0].config(text="测试中：单个弹窗…", fg=self.C["warn"])
+            self._show_single_notification(
+                ".st1", [("userchoice_progid", "系统默认", "TestApp4", 1)],
+                (1, 0, "测试"))
+            self._append_log("弹窗检测(4/4)：单个弹窗已弹出", "info")
+            self._qc_labels["popup"][0].config(
+                text="测试完成：四类弹窗已依次弹出", fg=self.C["success"])
+            self._repair_status_var.set(
+                "弹窗检测完成：批量/持续/多个/单个 四类弹窗已依次弹出，请观察显示是否正常")
+            self._qc_popup_testing = False
+            # 清理测试期间可能被写入基准的假扩展名（防止污染真实基准）
+            try:
+                bl = self.baseline_mgr.baseline
+                changed = False
+                for fake in (".bt1", ".bt2", ".bt3", ".ct0", ".ct1", ".ct2",
+                             ".mt0", ".mt1", ".mt2", ".st1"):
+                    if fake in bl:
+                        del bl[fake]
+                        changed = True
+                if changed:
+                    self.baseline_mgr.save()
+                    self._append_log("已清理弹窗测试产生的临时扩展名条目", "info")
+            except Exception as e:
+                self._append_log(f"清理测试扩展名失败: {e}", "warn")
+        except Exception as e:
+            self._qc_popup_step_err(4, e)
+
+    def _qc_popup_step_err(self, step, e):
+        """弹窗测试某步失败"""
+        self._qc_popup_testing = False
+        self._qc_labels["popup"][0].config(text=f"第{step}步失败: {e}", fg=self.C["error"])
+        self._append_log(f"弹窗检测第{step}步失败: {e}", "error")
+
     # ---------- 更新检查 ----------
     def _check_update(self, manual=False):
         """检查更新（后台线程联网）：读取 update.json 对比版本号，
@@ -9346,7 +9470,8 @@ class MainWindow:
             self._process_remaining_batch()
 
         toast = BatchNotificationToast(self.root, tamperer_name, items,
-                                       on_block_all, on_allow_all, on_view_onebyone, on_pause, on_close)
+                                       on_block_all, on_allow_all, on_view_onebyone, on_pause, on_close,
+                                       self._show_main_window)
 
     def _process_remaining_batch(self):
         """处理剩余的批量队列"""
