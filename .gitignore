@@ -65,3 +65,10 @@ OPSTController_root/cap_window.py
 OPSTController_root/ui14_check.py
 OPSTController_root/ui14_*.txt
 OPSTController_root/ui_shot*
+
+OPSTController_root/ui15*.py
+OPSTController_root/ui16*.py
+OPSTController_root/ui17*.py
+OPSTController_root/ui15_*.txt
+OPSTController_root/ui16_*.txt
+OPSTController_root/ui17_*.txt

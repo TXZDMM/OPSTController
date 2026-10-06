@@ -1156,15 +1156,19 @@ def identify_tamperer(prog_id):
             for root, base in [(HKCR, prog_id), (HKCU, f"Software\\Classes\\{prog_id}")]:
                 app_name, _ = reg_read_value(root, f"{base}\\Application", "ApplicationName")
                 if app_name:
-                    # ApplicationName可能是@{PackageFamilyName!Resource}格式，尝试提取
-                    import re
-                    m = re.search(r"//(.+?)$", app_name)
-                    if m:
-                        return m.group(1), "high"
-                    return app_name, "high"
+                    return _appx_friendly_name(app_name), "high"
                 aumid, _ = reg_read_value(root, f"{base}\\Application", "AppUserModelID")
                 if aumid:
-                    return f"商店应用({aumid.split('!')[0]})", "medium"
+                    fam = aumid.split("!")[0]
+                    fam_name = _appx_friendly_name(fam)
+                    if fam_name != fam:
+                        return fam_name, "medium"
+                    return f"商店应用({fam})", "medium"
+            # 动态 AppX ProgId（如 AppX43hn...）无类注册，注册表查不到；
+            # 用 Shell 的 AssocQueryString 查友好应用名（对 UWP 返回包显示名，如"照片"）
+            fname = assoc_friendly_name(prog_id)
+            if fname:
+                return fname, "medium"
             return "Windows商店应用", "low"
         except Exception:
             return "Windows商店应用", "low"
@@ -1188,6 +1192,134 @@ def identify_tamperer(prog_id):
     except Exception:
         pass
     return prog_id, "low"
+
+
+# Windows 商店应用（AppX/UWP）包族名 → 中文友好名
+_APPX_KNOWN = {
+    "microsoft.windows.photos": "照片",
+    "microsoft.windows.photos_8wekyb3d8bbwe": "照片",
+    "microsoft.windows.calculator": "计算器",
+    "microsoft.windows.notepad": "记事本",
+    "microsoft.paint": "画图",
+    "microsoft.zunevideo": "电影和电视",
+    "microsoft.windows.camera": "相机",
+    "microsoft.windows.terminal": "终端",
+    "microsoft.windows.terminal_8wekyb3d8bbwe": "终端",
+    "microsoft.windowsterminal": "终端",
+    "microsoft.windowsterminal_8wekyb3d8bbwe": "终端",
+    "microsoft.store": "Microsoft Store",
+    "microsoft.windowsstore": "Microsoft Store",
+    "microsoft.screen_sketch": "截图工具",
+    "microsoft.windows.mediaplayer": "Windows 媒体播放器",
+    "microsoft.windowsmaps": "地图",
+    "microsoft.bingweather": "天气",
+    "microsoft.windowscommunicationsapps": "邮件",
+    "microsoft.windowsalarms": "闹钟和时钟",
+    "microsoft.windows.clock": "时钟",
+    "microsoft.windows.clock_8wekyb3d8bbwe": "时钟",
+    "microsoft.microsoftedge": "Microsoft Edge",
+    "microsoft.windows.reader": "阅读器",
+    "microsoft.windows.powershell": "PowerShell",
+    "microsoft.windows.powershell_8wekyb3d8bbwe": "PowerShell",
+    "microsoft.windowsdefender": "Windows 安全中心",
+    "microsoft.windowsdefender_8wekyb3d8bbwe": "Windows 安全中心",
+    "microsoft.windows.voice_recorder": "录音机",
+    "microsoft.windows.voice_recorder_8wekyb3d8bbwe": "录音机",
+    "microsoft.windows.mixedreality": "混合现实门户",
+    "microsoft.windows.people": "人脉",
+    "microsoft.windows.skype": "Skype",
+    "microsoft.windows.xbox": "Xbox",
+    "microsoft.windows.mobile_mouse": "鼠标",
+    "microsoft.windows.holographic": "混合现实门户",
+    "microsoft.office.oneget": "Office",
+    "microsoft.office": "Office",
+    "microsoft.office.desktop": "Office",
+    "microsoft.onedrive": "OneDrive",
+    "microsoft.onedrivesync": "OneDrive",
+    "microsoft.onenote": "OneNote",
+    "microsoft.windows.tododo": "待办事项",
+    "microsoft.windows.tododo_8wekyb3d8bbwe": "待办事项",
+    "microsoft.windows.feedbackhub": "反馈中心",
+    "microsoft.windows.feedbackhub_8wekyb3d8bbwe": "反馈中心",
+    "microsoft.windows.gethelp": "获取帮助",
+    "microsoft.windows.getstarted": "提示",
+    "microsoft.windows.spotlight": "聚焦",
+    "microsoft.windows.sechealthui": "Windows 安全中心",
+    "microsoft.windows.sechealthui_8wekyb3d8bbwe": "Windows 安全中心",
+    "microsoft.windowsapps": "WindowsApps",
+    "microsoft.windows.fileexplorer": "文件资源管理器",
+    "microsoft.windows.fileexplorer_8wekyb3d8bbwe": "文件资源管理器",
+    "microsoft.windows.shell_experience_host": "系统体验",
+    "microsoft.bingnews": "新闻",
+    "microsoft.bing": "Bing",
+    "microsoft.skypeapp": "Skype",
+    "microsoft.teamsworkload": "Teams",
+    "microsoft.teams": "Teams",
+    "microsoft.windows.search": "搜索",
+    "microsoft.windows.immersivecontrolpanel": "设置",
+}
+
+
+def _appx_friendly_name(raw):
+    """将 AppX 的 ApplicationName / 包族名转成中文友好名。
+    输入形如 '@{Microsoft.Windows.Photos_8wekyb3d8bbwe!AppxManifest.xml}' 或
+    'Microsoft.Windows.Photos_8wekyb3d8bbwe' 或 'Microsoft.Windows.Photos'，
+    返回如 '照片'；无法识别时返回去除花括号/路径修饰后的原始包族名。"""
+    try:
+        import re
+        s = str(raw)
+        # 去 @{...!Resource} 壳
+        m = re.search(r"@\{(.+?)(?:!.*)?\}", s)
+        if m:
+            s = m.group(1)
+        else:
+            m = re.search(r"@\{(.+?)\}", s)
+            if m:
+                s = m.group(1)
+            else:
+                m = re.search(r"//(.+?)$", s)
+                if m:
+                    s = m.group(1)
+        # 去版本壳（尾部包短ID/长ID：_8wekyb3d8bbwe 或 _<13+字母数字>，非纯hex）
+        s2 = re.sub(r"_[A-Za-z0-9]{10,}$", "", s.strip(), flags=re.IGNORECASE)
+        s2 = s2.strip()
+        if not s2:
+            return s.strip()
+        low = s2.lower()
+        if low in _APPX_KNOWN:
+            return _APPX_KNOWN[low]
+        # 包族名尾段可读化（Microsoft.Windows.Photos → Photos）
+        tail = s2.split(".")[-1]
+        if tail and tail.lower() != s2.lower() and len(tail) > 2:
+            return f"{s2} (商店应用)"
+        return s2
+    except Exception:
+        return str(raw)
+
+
+def assoc_friendly_name(prog_id):
+    """用 Shell API AssocQueryString 查 ProgId 的友好应用名。
+    对动态 AppX ProgId（无类注册）返回包显示名（如"照片"）；
+    失败返回 None。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        _shlwapi = ctypes.WinDLL("shlwapi")
+        _AQ = _shlwapi.AssocQueryStringW
+        _AQ.argtypes = [
+            wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+            wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        _AQ.restype = ctypes.HRESULT
+        buf = ctypes.create_unicode_buffer(512)
+        length = wintypes.DWORD(512)  # 每次调用新建，避免 API 改写后长度被复用
+        # ASSOCF_NONE=0, ASSOCSTR_FRIENDLYAPPNAME=4
+        if _AQ(0, 4, prog_id, None, buf, ctypes.byref(length)) == 0:
+            name = buf.value.strip()
+            if name:
+                return _appx_friendly_name(name)
+        return None
+    except Exception:
+        return None
 
 
 def get_extension_paths(ext, prog_id=None):
@@ -2224,15 +2356,31 @@ class ProtectionEngine:
         success = 0
         fail = 0
         details = []
-        # 1) 删除 UserChoice
+        # 1) 删除 UserChoice（其 Hash 与锁定 ProgId 不匹配会失效，删除后系统回退到 HKCR 默认）
+        #    AppX 动态 ProgId 特例：若锁定目标就是当前 UserChoice 的 ProgId（如将 .png
+        #    锁定为照片应用），UserChoice 本身即有效激活项，删除反而可能使动态 AppX
+        #    ProgId 在无 UserChoice 时无法激活，故保留 UserChoice（锁定=保持现状）。
+        skip_del_uc = False
+        if str(lock_progid).lower().startswith("appx"):
+            try:
+                cur_uc = reg_read_value(
+                    HKCU, f"{USERCHOICE_BASE}\\{ext}\\UserChoice", "ProgId")[0]
+                if cur_uc and str(cur_uc).lower() == str(lock_progid).lower():
+                    skip_del_uc = True
+            except Exception:
+                pass
         try:
-            del_ok, del_method = force_delete_userchoice(ext)
-            if del_ok:
+            if skip_del_uc:
                 success += 1
-                details.append(f"UserChoice:已删除({del_method})")
+                details.append("UserChoice:保留(与锁定目标一致)")
             else:
-                fail += 1
-                details.append(f"UserChoice:删除失败({del_method})")
+                del_ok, del_method = force_delete_userchoice(ext)
+                if del_ok:
+                    success += 1
+                    details.append(f"UserChoice:已删除({del_method})")
+                else:
+                    fail += 1
+                    details.append(f"UserChoice:删除失败({del_method})")
         except Exception as e:
             fail += 1
             details.append(f"UserChoice:异常({e})")
@@ -5650,6 +5798,9 @@ class MainWindow:
             if path:
                 self._lock_full_path = path
                 self._lock_cur_path.config(text=self._lock_shorten(path))
+            elif str(progid).lower().startswith("appx"):
+                self._lock_full_path = ""
+                self._lock_cur_path.config(text="（商店应用，无文件路径）")
             else:
                 self._lock_full_path = ""
                 self._lock_cur_path.config(text=progid)
@@ -5767,7 +5918,10 @@ class MainWindow:
             self._lock_ext_status.config(
                 text=f"扩展名 {ext} 属于系统/可执行类，不支持锁定", fg=self.C["error"])
             return
-        if not os.path.isfile(path):
+        # 目标有效性检查：程序路径必须真实存在；ProgId（含 Windows 商店应用 AppX）
+        # 不是文件系统路径，跳过文件存在性检查（注册表写入由 _recover_locked 完成）
+        is_progid = (_lock_target_to_progid(path) == path)
+        if not is_progid and not os.path.isfile(path):
             self._lock_ext_status.config(text=f"程序文件不存在: {path}", fg=self.C["warn"])
             return
         try:
@@ -5776,7 +5930,8 @@ class MainWindow:
             is_update = ext in locked
             if is_update and str(locked[ext]).lower() == path.lower():
                 self._lock_ext_status.config(
-                    text=f"{ext} 已锁定为 {os.path.basename(path)}，无需重复锁定", fg=self.C["warn"])
+                    text=f"{ext} 已锁定为 {self._lock_target_name(path)}，无需重复锁定",
+                    fg=self.C["warn"])
                 return
             locked[ext] = path
             self.baseline_mgr.save_config()
@@ -5795,15 +5950,25 @@ class MainWindow:
             except Exception as e:
                 logger.warning(f"锁定 {ext} 立即应用异常: {e}")
             self._refresh_locked_ext_list()
-            name = os.path.splitext(os.path.basename(path))[0]
+            name = self._lock_target_name(path)
             verb = "已更新锁定目标" if is_update else "已锁定"
             self._lock_ext_status.config(
-                text=f"{verb} {ext} → {os.path.basename(path)}（{path}），配置已保存到文件",
+                text=f"{verb} {ext} → {name}（{path}），配置已保存到文件",
                 fg=self.C["success"])
             self._append_log(f"{verb}扩展名默认应用: {ext} → {path}", "success")
             self._lock_ext_refresh_info()
         except Exception as e:
             self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
+
+    def _lock_target_name(self, target):
+        """锁定目标的显示名：路径→程序文件名；ProgId/AppX→识别名"""
+        try:
+            if _lock_target_to_progid(target) != target:
+                return os.path.splitext(os.path.basename(target))[0]
+            name, _ = identify_tamperer(target)
+            return name or target
+        except Exception:
+            return str(target)
 
     def _lock_ext_on_select(self, _e=None):
         """列表选中：激活解除锁定按钮"""
@@ -5832,6 +5997,8 @@ class MainWindow:
                     name, _ = identify_tamperer(target)
                     disp_name = name or target
                     disp_path = progid_to_path(target) or target
+                    if str(target).lower().startswith("appx") and disp_path == target:
+                        disp_path = "（商店应用，无文件路径）"
                 status = ""
                 try:
                     cur = get_prog_id(ext)
