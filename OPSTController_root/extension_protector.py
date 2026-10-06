@@ -9475,18 +9475,23 @@ class MainWindow:
             self.root.after(0, self._append_log, msg, level)
             return
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{timestamp}] {msg}\n", level)
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-        # 主界面输出窗口（状态页"保护输出"）同步显示
-        so = getattr(self, "status_output", None)
-        if so is not None:
+        # 行数上限：防止长时间运行后 Text 控件无限增长导致界面卡顿
+        MAX_LOG_LINES = 1500
+        for box in (self.log_text, getattr(self, "status_output", None)):
+            if box is None:
+                continue
             try:
-                so.configure(state="normal")
-                so.insert("end", f"[{timestamp}] {msg}\n", level)
-                so.see("end")
-                so.configure(state="disabled")
+                box.configure(state="normal")
+                box.insert("end", f"[{timestamp}] {msg}\n", level)
+                try:
+                    line_count = int(box.index("end-1c").split(".")[0])
+                    if line_count > MAX_LOG_LINES:
+                        # 超出上限：删除最早的一行（O(1) 级删除，避免全量重建）
+                        box.delete("1.0", "2.0")
+                except Exception:
+                    pass
+                box.see("end")
+                box.configure(state="disabled")
             except Exception:
                 pass
 
