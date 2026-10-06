@@ -9675,20 +9675,29 @@ class MainWindow:
                     for t in self.active_toasts[idx:]:
                         t.move_right(delta_x)
             self._append_log(f"{toast.ext} 通知已关闭，保持恢复状态。", "info")
-            # 先询问模式（ask_first）：超时/关闭时执行恢复（默认阻止），并清除待询问标记
-            if toast.ask_first:
+            # 先询问模式（ask_first）：仅当用户超时未操作时才自动恢复基准（默认阻止）。
+            # 用户已点"单次同意"(consent)/"永久关闭"(forever)/"关闭1分钟"(pause_min)时
+            # 不得再恢复——否则"用户都同意了还恢复"（18:38:38同意→18:38:43误恢复实锤）。
+            if toast.ask_first and toast.close_reason == "timeout":
                 try:
                     if self._pending_ask is not None:
                         self._pending_ask.discard(toast.ext)
                     s2, f2, d2, v2 = self.monitor._recover_with_verify(toast.ext, toast.mismatches)
                     if v2:
-                        self._append_log(f"{toast.ext} 未获同意，已自动恢复为基准关联。", "warn")
+                        self._append_log(f"{toast.ext} 弹窗超时未处理，已自动恢复为基准关联。", "warn")
                         log_event(toast.ext, "恢复", "成功", "先询问弹窗超时自动恢复")
                     else:
-                        self._append_log(f"{toast.ext} 未获同意，自动恢复未通过验证: {'; '.join(d2) if d2 else '未知'}", "error")
+                        self._append_log(f"{toast.ext} 弹窗超时自动恢复未通过验证: {'; '.join(d2) if d2 else '未知'}", "error")
                         log_event(toast.ext, "恢复", "失败", "先询问弹窗超时恢复未通过")
                 except Exception as e:
                     self._append_log(f"{toast.ext} 超时恢复异常: {e}", "error")
+            elif toast.ask_first:
+                # 用户已操作（同意/暂停/永久关闭）：仅清除待询问标记，不恢复
+                try:
+                    if self._pending_ask is not None:
+                        self._pending_ask.discard(toast.ext)
+                except Exception:
+                    pass
             # 记录更改历史：超时自动阻止
             if toast.close_reason == "timeout":
                 s, f, _ = recover_result
