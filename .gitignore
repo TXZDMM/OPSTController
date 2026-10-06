@@ -53,3 +53,5 @@ OPSTController_root/rot_test.py
 .vscode/
 .DS_Store
 Thumbs.db
+
+OPSTController_root/debug_*.txt
