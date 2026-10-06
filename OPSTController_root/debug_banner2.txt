@@ -1,0 +1,5 @@
+banner: <tkinter.Frame object .!frame2.!frame2.!frame8.!frame> parent=.!frame2.!frame2.!frame8
+width before: 1280
+width after geo600: 840 mgr='' place={}
+manual place ok: mgr='place'
+after update: mgr='' place={}

@@ -1191,6 +1191,15 @@ def _lock_target_to_progid(target):
     return t
 
 
+# 不支持锁定的扩展名（系统/可执行/脚本类：锁定默认打开方式无意义或存在风险）
+LOCK_UNLOCKABLE_EXTS = frozenset({
+    ".sys", ".dll", ".exe", ".lnk", ".com", ".bat", ".cmd",
+    ".ps1", ".psm1", ".psd1", ".vbs", ".vbe", ".jse", ".wsf", ".wsh",
+    ".msc", ".ocx", ".msi", ".inf", ".reg", ".scr", ".pif", ".cpl",
+    ".drv", ".fon", ".mod", ".o", ".obj", ".lib",
+})
+
+
 def snapshot_extension(ext):
     """
     对单个扩展名拍摄保护项快照。
@@ -4564,7 +4573,8 @@ class MainWindow:
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("780x560")
         self.root.minsize(700, 500)
-        self.start_minimized = start_minimized  # -m/--minimized：启动后最小化到任务栏
+        self.start_minimized = start_minimized  # -m/--minimized/--background：纯后台运行
+        self._lock_unlockable_exts = LOCK_UNLOCKABLE_EXTS
         self.baseline_mgr = BaselineManager()
         self.change_history = ChangeHistoryManager(USERDATA_DIR)
         self.change_history.set_audit_level(self.baseline_mgr.config.get("audit_level", "normal"))
@@ -4797,7 +4807,7 @@ class MainWindow:
         self.ext_count_label.pack(side="right", padx=16)
 
         # 窗口缩放适配：设置页小尺寸按钮（文字→「过小」→隐藏）
-        self.root.bind("<Configure>", lambda e: self._apply_small_adapt(e.widget.winfo_width()))
+        self.root.bind("<Configure>", lambda e: self._apply_small_adapt(self.root.winfo_width()))
 
     # ---------- UI 基础组件 ----------
     def _setup_ttk_style(self):
@@ -4915,7 +4925,7 @@ class MainWindow:
         if kind == "primary":
             bg, hover, fg = self.C["accent"], self.C["accent_hover"], "#0B2B44"
         elif kind == "danger":
-            bg, hover, fg = "#C42B1C", "#D84A3B", "#FFFFFF"
+            bg, hover, fg = "#D84A3B", "#F0604F", "#FFFFFF"
         elif kind == "success":
             bg, hover, fg = "#3C8A3F", "#4CA34F", "#FFFFFF"
         else:
@@ -4937,19 +4947,21 @@ class MainWindow:
         return btn
 
     def _apply_small_adapt(self, root_width):
-        """窗口过小提示（通知横幅）：仅当窗口宽度小于阈值时，在设置页顶部
-        显示一条黄色通知横幅；不替换、不隐藏任何设置项。窗口恢复后自动消失。"""
-        notice_threshold = 700  # 仅极窄窗口才提示，避免正常缩放误报
+        """窗口过小提示（浮层通知）：仅当窗口宽度小于阈值时，在设置页顶部
+        以浮层（place）显示一条醒目通知，不占用布局空间、不隐藏任何设置项；
+        窗口恢复后自动消失。"""
+        notice_threshold = 860  # 接近窗口最小宽度(约840)，窗口缩到最小时提示；正常使用不误报
         banner = getattr(self, "_settings_banner", None)
         if banner is None:
             return
         try:
             if root_width <= notice_threshold:
                 if banner.winfo_manager() == "":
-                    banner.pack(fill="x", padx=24, pady=(0, 6))
+                    banner.place(relx=0.0, rely=0.0, x=24, y=58, anchor="nw")
+                    banner.lift()
             else:
                 if banner.winfo_manager() != "":
-                    banner.pack_forget()
+                    banner.place_forget()
         except Exception:
             pass
 
@@ -5468,8 +5480,11 @@ class MainWindow:
                                        anchor="w", justify="left")
         self._lock_cur_path.pack(fill="x", padx=10, pady=(2, 6))
         self._lock_full_path = ""
-        self._lock_cur_path.bind("<Enter>", lambda e: self._lock_show_full_path(True))
-        self._lock_cur_path.bind("<Leave>", lambda e: self._lock_show_full_path(False))
+        # 悬停显示完整路径：使用独立提示框（tooltip），不改变路径标签自身文字，
+        # 避免文字伸缩导致鼠标移出反复触发的抖动
+        self._lock_cur_path.bind("<Enter>", self._lock_tooltip_show)
+        self._lock_cur_path.bind("<Leave>", self._lock_tooltip_hide)
+        self._lock_tooltip_win = None
 
         # ---- ③ 底部：已锁定程序管理区 ----
         tk.Label(lock_cb, text="已锁定扩展名列表", font=("微软雅黑", 9, "bold"),
@@ -5554,12 +5569,67 @@ class MainWindow:
         except Exception:
             pass
 
+    def _lock_tooltip_show(self, event=None):
+        """鼠标悬停路径时显示完整路径提示框（不改变路径标签自身文字）"""
+        try:
+            if not self._lock_full_path:
+                return
+            self._lock_tooltip_hide()
+            tip = tk.Toplevel(self.root)
+            tip.wm_overrideredirect(True)
+            tip.attributes("-topmost", True)
+            tip.configure(bg="#3A3A3A")
+            lbl = tk.Label(tip, text=self._lock_full_path, font=("微软雅黑", 8),
+                           bg="#3A3A3A", fg="#FFFFFF", padx=10, pady=6,
+                           anchor="w", justify="left")
+            lbl.pack()
+            # 定位在鼠标附近（右下偏移，避免遮挡路径）
+            x = self.root.winfo_pointerx() + 14
+            y = self.root.winfo_pointery() + 14
+            tip.wm_geometry(f"+{x}+{y}")
+            self._lock_tooltip_win = tip
+        except Exception:
+            pass
+
+    def _lock_tooltip_hide(self, _event=None):
+        try:
+            if getattr(self, "_lock_tooltip_win", None) is not None:
+                try:
+                    self._lock_tooltip_win.destroy()
+                except Exception:
+                    pass
+                self._lock_tooltip_win = None
+        except Exception:
+            pass
+
     def _lock_ext_pick_current(self):
-        """锁定为当前程序：选择本机程序文件，设为该扩展名默认打开方式"""
-        self._lock_ext_pick_program("锁定为当前程序")
+        """锁定为当前程序：直接锁定该扩展名当前的默认打开方式（不弹窗）"""
+        try:
+            self._lock_ext_normalize()
+            ext = self._lock_ext_var.get().strip().lower()
+            if not ext.startswith("."):
+                self._lock_ext_status.config(text="请先输入目标扩展名（如 .txt）", fg=self.C["warn"])
+                return
+            if ext.lower() in self._lock_unlockable_exts:
+                self._lock_ext_status.config(
+                    text=f"扩展名 {ext} 属于系统/可执行类，不支持锁定", fg=self.C["error"])
+                return
+            progid = get_prog_id(ext)
+            if not progid:
+                self._lock_ext_status.config(
+                    text=f"扩展名 {ext} 当前为系统默认（无自定义打开方式），"
+                         f"请先在系统「设置→默认应用」中指定，或使用「锁定为其他程序」",
+                    fg=self.C["warn"])
+                return
+            # 优先用可解析的程序路径作为锁定目标（列表显示更友好），否则退回 ProgId
+            path = progid_to_path(progid)
+            target = path if path else progid
+            self._lock_ext_lock_path(ext, target)
+        except Exception as e:
+            self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
 
     def _lock_ext_pick_other(self):
-        """锁定为其他程序：选择备选程序，切换该扩展名默认打开方式"""
+        """锁定为其他程序：弹出本机文件选择窗口，选择备选程序切换默认打开方式"""
         self._lock_ext_pick_program("锁定为其他程序")
 
     def _lock_ext_pick_program(self, title):
@@ -5568,6 +5638,10 @@ class MainWindow:
             ext = self._lock_ext_var.get().strip().lower()
             if not ext.startswith("."):
                 self._lock_ext_status.config(text="请先输入目标扩展名（如 .txt）", fg=self.C["warn"])
+                return
+            if ext.lower() in self._lock_unlockable_exts:
+                self._lock_ext_status.config(
+                    text=f"扩展名 {ext} 属于系统/可执行类，不支持锁定", fg=self.C["error"])
                 return
             path = filedialog.askopenfilename(
                 title=title,
@@ -5579,10 +5653,14 @@ class MainWindow:
             self._lock_ext_status.config(text=f"选择程序失败: {e}", fg=self.C["error"])
 
     def _lock_ext_lock_path(self, ext, path):
-        """按程序路径锁定扩展名：写入文件配置、同步基准并立即应用"""
+        """按程序路径/ProgId 锁定扩展名：写入文件配置、同步基准并立即应用"""
         ext = ext.strip().lower()
         if not ext.startswith("."):
             self._lock_ext_status.config(text="扩展名格式错误（应以 . 开头）", fg=self.C["warn"])
+            return
+        if ext.lower() in self._lock_unlockable_exts:
+            self._lock_ext_status.config(
+                text=f"扩展名 {ext} 属于系统/可执行类，不支持锁定", fg=self.C["error"])
             return
         if not os.path.isfile(path):
             self._lock_ext_status.config(text=f"程序文件不存在: {path}", fg=self.C["warn"])
@@ -6019,12 +6097,13 @@ class MainWindow:
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["settings"] = page
         self._mk_page_header(page, "设置", "配置保护行为与运行选项")
-        # 顶部过小提示横幅（默认隐藏；窗口过窄时由 _apply_small_adapt 显示）
-        banner = tk.Frame(page, bg="#3D2F00", highlightbackground="#6B5700",
+        # 顶部过小提示（浮层通知：place 覆盖在页面顶部，不占用布局、不挤掉设置项；
+        # 窗口过窄时由 _apply_small_adapt 显示，窗口恢复自动消失）
+        banner = tk.Frame(page, bg="#8E1F1B", highlightbackground="#C0392B",
                           highlightthickness=1)
-        tk.Label(banner, text="窗口过小：部分设置项显示可能不全，建议放大窗口",
-                 font=("微软雅黑", 9), bg="#3D2F00", fg="#FFD66B",
-                 anchor="w").pack(fill="x", padx=12, pady=5)
+        tk.Label(banner, text="⚠ 窗口过小：部分设置项显示可能不全，建议放大窗口",
+                 font=("微软雅黑", 9, "bold"), bg="#8E1F1B", fg="#FFFFFF",
+                 anchor="w").pack(fill="x", padx=14, pady=7)
         self._settings_banner = banner
         content = self._mk_scroll_container(page)
 
@@ -6092,11 +6171,15 @@ class MainWindow:
         _row(body2, "基准保留版本数:", hist_spin)
         b_ops = tk.Frame(body2, bg=dark["card"])
         b_ops.pack(fill="x", pady=6)
-        self._mk_button(b_ops, "备份当前基准", self._backup_current, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(b_ops, "深层扫描", self._manual_deep_scan, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(b_ops, "历史版本管理", self._show_history, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(b_ops, "查看基准说明", self._open_baseline_download, small_adapt=True).pack(side="left", padx=(0, 8))
-        self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root), small_adapt=True).pack(side="left")
+        _base_btns = [
+            self._mk_button(b_ops, "备份当前基准", self._backup_current, small_adapt=True),
+            self._mk_button(b_ops, "深层扫描", self._manual_deep_scan, small_adapt=True),
+            self._mk_button(b_ops, "历史版本管理", self._show_history, small_adapt=True),
+            self._mk_button(b_ops, "查看基准说明", self._open_baseline_download, small_adapt=True),
+            self._mk_button(b_ops, "从文件加载基准", lambda: self._load_baseline_from_file(self.root), small_adapt=True),
+        ]
+        # 换行适配：窗口窄时按钮自动换行，杜绝按钮被裁掉（“设置项消失”）
+        self._flow_wrap(b_ops, _base_btns, gap=8)
 
         # ===== 节3：权限 =====
         sec3, body3 = self._mk_card(content, "权限")
@@ -7684,6 +7767,7 @@ class MainWindow:
         self._mk_button(ops, "刷新", self._refresh_history_table, width=8).pack(side="left", padx=(0, 8))
         self._mk_button(ops, "清空记录", self._history_clear, width=10, kind="danger").pack(side="left", padx=(0, 8))
         self._mk_button(ops, "导出记录", self._history_export, width=10).pack(side="left", padx=(0, 8))
+        self._mk_button(ops, "撤销选中", self._history_revoke, width=10, kind="primary").pack(side="left", padx=(0, 8))
         self._mk_button(ops, "检查当前状态", self._history_check_status, width=12).pack(side="left")
         tree.bind("<ButtonRelease-1>", lambda _e: self._history_show_detail())
         tree.bind("<Double-Button-1>", lambda _e: self._history_check_status())
@@ -7813,6 +7897,54 @@ class MainWindow:
                 txt.delete("1.0", tk.END)
                 txt.insert(tk.END, f"检查失败: {e}")
                 txt.configure(state="disabled")
+
+    def _history_revoke(self):
+        """撤销至选中记录：即同意该次操作（同步基准为当前实际关联，
+        如有锁定则解除该扩展名锁定，恢复普通保护）。二次确认后执行。"""
+        sel = self._hist_tree.selection()
+        if not sel:
+            self._hist_stat_var.set("撤销失败：请先选中一条记录")
+            return
+        try:
+            idx = int(sel[0]) if str(sel[0]).isdigit() else -1
+            rows = self._history_rows()
+            if idx < 0 or idx >= len(rows):
+                self._hist_stat_var.set("撤销失败：记录已失效，请刷新列表")
+                return
+            rec = rows[idx]
+            ext = str(rec.get("ext", ""))
+            tam = str(rec.get("tamperer") or "未知")
+            if not ext.startswith("."):
+                self._hist_stat_var.set("撤销失败：该记录无有效扩展名")
+                return
+            if not messagebox.askyesno(
+                    "撤销记录",
+                    f"即将撤销至选中项，即同意此次操作\n\n"
+                    f"扩展名: {ext}\n"
+                    f"关联程序: {tam}\n\n"
+                    f"将同步基准，并（如有锁定）解除该扩展名锁定，是否继续？"):
+                return
+            # 1) 如有锁定 → 解除（恢复普通保护）
+            cfg = self.baseline_mgr.config
+            locked = cfg.get("locked_defaults", {}) or {}
+            if ext in locked:
+                del locked[ext]
+                self.baseline_mgr.save_config()
+                self._append_log(f"撤销记录: 已解除 {ext} 的锁定", "info")
+            # 2) 同步基准为当前实际关联（同意此次操作）
+            self.baseline_mgr.update_extension(ext, reason="撤销记录-同意")
+            # 3) 记录一次同意操作
+            try:
+                self.change_history.add_record(ext, tam, rec.get("changes") or {},
+                                               "user_consent", "同意(撤销至记录)",
+                                               source=rec.get("source"))
+            except Exception as e:
+                logger.warning(f"撤销记录后写入历史失败: {e}")
+            self._refresh_history_table()
+            self._hist_stat_var.set(f"已撤销至 {ext}（同意 {tam}），基准已同步")
+            self._append_log(f"撤销记录: {ext} → {tam}（同意）", "success")
+        except Exception as e:
+            self._hist_stat_var.set(f"撤销失败: {e}")
 
     def _history_clear(self):
         """清空全部防护记录"""
