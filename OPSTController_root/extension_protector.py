@@ -47,12 +47,27 @@ def _final_exit(code=0):
     try:
         mei = getattr(sys, "_MEIPASS", None)
         if mei and os.path.isdir(mei):
-            _script = ('Start-Sleep -Seconds 6; try { Remove-Item -LiteralPath "{}" '
-                       '-Recurse -Force -ErrorAction Stop } catch {{}}').format(
-                mei.replace('"', '""'))
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script],
-                creationflags=0x08000000)  # CREATE_NO_WINDOW
+            _q = mei.replace('"', '""')
+            # 第一路：普通令牌延迟删除（普通实例创建的 _MEI 可直接删）
+            try:
+                _script1 = ('Start-Sleep -Seconds 6; try {{ Remove-Item -LiteralPath "{}" '
+                            '-Recurse -Force -ErrorAction Stop }} catch {{}}').format(_q)
+                subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script1],
+                                 creationflags=0x08000000)
+            except Exception:
+                pass
+            # 第二路（仅高权限实例）：管理员令牌延迟删除回退——
+            # TI/SYSTEM 实例创建的 _MEI 普通令牌删除被 DACL 拒绝，需管理员权限；
+            # UAC 关闭时 RunAs 静默成功；普通用户实例不启用以免弹出 UAC 确认
+            try:
+                if ctypes.windll.shell32.IsUserAnAdmin():
+                    _script2 = ('Start-Sleep -Seconds 8; try {{ Start-Process powershell -Verb RunAs '
+                                '-ArgumentList "-NoProfile","-Command",\'Remove-Item -LiteralPath "{}" '
+                                '-Recurse -Force -ErrorAction SilentlyContinue\' -Wait }} catch {{}}').format(_q)
+                    subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script2],
+                                     creationflags=0x08000000)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
