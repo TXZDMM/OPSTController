@@ -1156,6 +1156,41 @@ def get_extension_paths(ext, prog_id=None):
     return paths
 
 
+def progid_to_path(prog_id):
+    """从 ProgId 读取关联程序的 exe 路径（解析 shell\\open\\command 命令）。
+    返回空串表示无法定位可执行文件。"""
+    if not prog_id:
+        return ""
+    for root, base in [(HKCR, prog_id), (HKCU, f"Software\\Classes\\{prog_id}")]:
+        try:
+            cmd, _ = reg_read_value(root, f"{base}\\shell\\open\\command", "")
+            if not cmd:
+                cmd, _ = reg_read_value(root, f"{base}\\shell\\open\\command", "DelegateExecute")
+            if cmd:
+                m = re.match(r'^\s*"([^"]+\.exe)"', cmd, re.I)
+                if not m:
+                    m = re.match(r'^\s*([^\s"]+\.exe)', cmd, re.I)
+                if m:
+                    return m.group(1)
+        except Exception:
+            continue
+    return ""
+
+
+def _lock_target_to_progid(target):
+    """把锁定目标转换为可写注册表的 ProgId 串：
+    - 已是 ProgId（如 WMP11.AssocFile.M4A）→ 原样返回
+    - 是程序路径（如 C:\\Apps\\foo.exe）→ 返回 Applications\\foo.exe（Windows 应用关联格式）
+    - 无法识别 → 原样返回"""
+    if not target:
+        return target
+    t = str(target)
+    if (t.lower().endswith((".exe", ".bat", ".cmd", ".lnk"))
+            and (os.path.sep in t or t.count("/"))):
+        return r"Applications\%s" % os.path.basename(t)
+    return t
+
+
 def snapshot_extension(ext):
     """
     对单个扩展名拍摄保护项快照。
@@ -2104,6 +2139,22 @@ class ProtectionEngine:
         4) 同步基准为该扩展名当前态，保证后续验证与监控口径一致
         返回 (success_count, fail_count, details)
         """
+        # 0) 锁定目标兼容：支持直接程序路径（C:\\Apps\\foo.exe），
+        #    转换为 Applications\\foo.exe 并确保其 shell\\open\\command 指向该程序
+        raw_target = lock_progid
+        progid_target = _lock_target_to_progid(lock_progid)
+        if progid_target != raw_target:
+            try:
+                app_cmd = rf"Applications\{os.path.basename(raw_target)}\shell\open\command"
+                with winreg.CreateKeyEx(HKCR, app_cmd, 0, KEY_SET_VALUE_64) as k:
+                    winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
+                                      f'"{raw_target}" "%1"')
+                with winreg.CreateKeyEx(HKCU, f"Software\\Classes\\{app_cmd}", 0, KEY_SET_VALUE_64) as k:
+                    winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
+                                      f'"{raw_target}" "%1"')
+            except OSError as e:
+                logger.warning(f"锁定 {ext} 注册 Applications 命令失败: {e}")
+        lock_progid = progid_target
         success = 0
         fail = 0
         details = []
@@ -4552,11 +4603,11 @@ class MainWindow:
         # 关闭按钮改为后台常驻，不退出
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_background)
         self._init_app()
-        # -m/--minimized：开机自启动场景，启动后最小化到任务栏后台常驻
+        # -m/--minimized/--background：开机自启动场景，纯后台运行（隐藏窗口，
+        # 不出现在任务栏，不打扰用户；需唤出时再次运行本程序即可显示窗口）
         if self.start_minimized:
             try:
                 self.root.withdraw()
-                self.root.after(1500, self._minimize_to_taskbar)
             except Exception:
                 pass
         # 启动退出信号检查（每500ms检查一次）
@@ -4886,38 +4937,21 @@ class MainWindow:
         return btn
 
     def _apply_small_adapt(self, root_width):
-        """设置页小尺寸按钮适配：窗口缩小时文字替换为「过小」，继续缩小直接隐藏。
-        禁止出现按钮裁切/显示一半的异常情况。"""
-        if not hasattr(self, "_settings_buttons"):
+        """窗口过小提示（通知横幅）：仅当窗口宽度小于阈值时，在设置页顶部
+        显示一条黄色通知横幅；不替换、不隐藏任何设置项。窗口恢复后自动消失。"""
+        notice_threshold = 700  # 仅极窄窗口才提示，避免正常缩放误报
+        banner = getattr(self, "_settings_banner", None)
+        if banner is None:
             return
-        hide_threshold = 880   # 小于此宽度直接隐藏
-        shrink_threshold = 1000  # 小于此宽度文字替换为「过小」
-        for btn in self._settings_buttons:
-            try:
-                if root_width <= hide_threshold:
-                    if btn.winfo_manager() == "pack":
-                        try:
-                            btn._pack_info = btn.pack_info()
-                        except Exception:
-                            btn._pack_info = {}
-                        btn.pack_forget()
-                    btn.configure(text="过小")
-                elif root_width <= shrink_threshold:
-                    if btn.winfo_manager() == "" and getattr(btn, "_pack_info", None):
-                        try:
-                            btn.pack(**btn._pack_info)
-                        except Exception:
-                            pass
-                    btn.configure(text="过小")
-                else:
-                    if btn.winfo_manager() == "" and getattr(btn, "_pack_info", None):
-                        try:
-                            btn.pack(**btn._pack_info)
-                        except Exception:
-                            pass
-                    btn.configure(text=getattr(btn, "_orig_text", "设置"))
-            except Exception:
-                pass
+        try:
+            if root_width <= notice_threshold:
+                if banner.winfo_manager() == "":
+                    banner.pack(fill="x", padx=24, pady=(0, 6))
+            else:
+                if banner.winfo_manager() != "":
+                    banner.pack_forget()
+        except Exception:
+            pass
 
     def _mk_page_header(self, page, title, subtitle=None):
         """创建页面标题区"""
@@ -5378,58 +5412,259 @@ class MainWindow:
                  fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left"
                  ).pack(fill="x", pady=2)
 
-        # 单扩展名锁定：锁定某个扩展名的默认打开方式（配置保存在文件中）
+        # ============ 单扩展名锁定工具（三区布局） ============
         lock_card, lock_cb = self._mk_card(
-            body, "单扩展名锁定",
-            "锁定后该扩展名的默认打开方式不再随其他软件篡改而改变，配置自动保存在文件中")
-        lock_row = tk.Frame(lock_cb, bg=self.C["card"])
-        lock_row.pack(fill="x", pady=(2, 4))
-        self._lock_ext_entry = tk.Entry(lock_row, font=("微软雅黑", 9), width=14,
-                                        bg=self.C["btn"], fg=self.C["text"],
-                                        relief="flat", highlightthickness=0,
-                                        insertbackground=self.C["text"])
-        self._lock_ext_entry.pack(side="left", padx=(0, 6))
-        self._mk_button(lock_row, "读取当前", self._lock_ext_read_current, width=10).pack(side="left", padx=(0, 6))
-        self._mk_button(lock_row, "锁定当前默认应用", self._lock_ext_default, kind="primary").pack(side="left", padx=(0, 6))
-        self._lock_ext_status = tk.Label(lock_cb, text="", font=("微软雅黑", 9),
-                                         fg=self.C["text2"], bg=self.C["card"], anchor="w", justify="left")
-        self._lock_ext_status.pack(fill="x", pady=(0, 4))
+            body, "单扩展名锁定工具",
+            "锁定扩展名的默认打开方式，防止被其他软件篡改；配置自动保存在文件中")
+
+        # ---- ① 顶部：扩展名配置区 ----
+        ext_cfg = tk.Frame(lock_cb, bg=self.C["card"])
+        ext_cfg.pack(fill="x", pady=(2, 6))
+        tk.Label(ext_cfg, text="目标扩展名", font=("微软雅黑", 9), fg=self.C["text2"],
+                 bg=self.C["card"], anchor="w").pack(side="left", padx=(0, 10))
+        _common_exts = [".txt", ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls",
+                        ".ppt", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                        ".mp3", ".wav", ".flac", ".m4a", ".mp4", ".mkv", ".avi",
+                        ".mov", ".wmv", ".zip", ".rar", ".7z", ".tar", ".gz",
+                        ".exe", ".msi", ".bat", ".cmd", ".html", ".htm", ".md",
+                        ".csv", ".json", ".xml", ".py", ".js", ".css"]
+        self._lock_ext_var = tk.StringVar()
+        self._lock_ext_entry = ttk.Combobox(ext_cfg, textvariable=self._lock_ext_var,
+                                            values=_common_exts, font=("微软雅黑", 9))
+        try:
+            self._lock_ext_entry.configure(
+                background=self.C["btn"], foreground=self.C["text"],
+                fieldbackground=self.C["btn"], arrowcolor=self.C["text"])
+        except Exception:
+            pass
+        self._lock_ext_entry.pack(side="left", fill="x", expand=True)
+        self._lock_ext_entry.bind("<FocusOut>", lambda e: self._lock_ext_normalize())
+        self._lock_ext_entry.bind("<Return>", lambda e: self._lock_ext_normalize())
+        self._lock_ext_entry.bind("<<ComboboxSelected>>", lambda e: self._lock_ext_refresh_info())
+        self._lock_ext_var.trace_add("write", lambda *a: self._lock_ext_refresh_info())
+
+        # ---- ② 中部：核心操作与信息区（左右分栏） ----
+        core = tk.Frame(lock_cb, bg=self.C["card"])
+        core.pack(fill="x", pady=4)
+        # 左栏：竖向操作按钮组（等宽等高）
+        left_ops = tk.Frame(core, bg=self.C["card"])
+        left_ops.pack(side="left", padx=(0, 12))
+        self._mk_button(left_ops, "锁定为当前程序", self._lock_ext_pick_current,
+                        kind="primary").pack(fill="x", pady=2)
+        self._mk_button(left_ops, "锁定为其他程序", self._lock_ext_pick_other).pack(fill="x", pady=2)
+        # 右栏：当前程序信息展示区（与按钮组水平对齐）
+        info = tk.Frame(core, bg=self.C["card"], highlightbackground=self.C["card_border"],
+                        highlightthickness=1)
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text="当前选中程序", font=("微软雅黑", 8), fg=self.C["text3"],
+                 bg=self.C["card"], anchor="w").pack(fill="x", padx=10, pady=(6, 0))
+        self._lock_cur_name = tk.Label(info, text="未选择程序", font=("微软雅黑", 11, "bold"),
+                                       fg=self.C["text"], bg=self.C["card"], anchor="w")
+        self._lock_cur_name.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Label(info, text="程序路径", font=("微软雅黑", 8), fg=self.C["text3"],
+                 bg=self.C["card"], anchor="w").pack(fill="x", padx=10)
+        self._lock_cur_path = tk.Label(info, text="", font=("微软雅黑", 8),
+                                       fg=self.C["text2"], bg=self.C["card"],
+                                       anchor="w", justify="left")
+        self._lock_cur_path.pack(fill="x", padx=10, pady=(2, 6))
+        self._lock_full_path = ""
+        self._lock_cur_path.bind("<Enter>", lambda e: self._lock_show_full_path(True))
+        self._lock_cur_path.bind("<Leave>", lambda e: self._lock_show_full_path(False))
+
+        # ---- ③ 底部：已锁定程序管理区 ----
+        tk.Label(lock_cb, text="已锁定扩展名列表", font=("微软雅黑", 9, "bold"),
+                 fg=self.C["text"], bg=self.C["card"], anchor="w").pack(fill="x", pady=(8, 2))
         lk_list_frame = tk.Frame(lock_cb, bg=self.C["card"])
-        lk_list_frame.pack(fill="x", pady=4)
-        self._locked_ext_listbox = tk.Listbox(lk_list_frame, font=("微软雅黑", 9), height=4,
-                                              bg=self.C["btn"], fg=self.C["text"],
-                                              selectbackground=self.C["nav_sel"],
-                                              relief="flat", highlightthickness=0)
+        lk_list_frame.pack(fill="x", pady=2)
+        self._locked_ext_listbox = tk.Listbox(
+            lk_list_frame, font=("微软雅黑", 9), height=5,
+            bg=self.C["btn"], fg=self.C["text"], selectbackground=self.C["nav_sel"],
+            relief="flat", highlightthickness=0, activestyle="none")
         self._locked_ext_listbox.pack(side="left", fill="x", expand=True)
-        tk.Scrollbar(lk_list_frame, orient="vertical",
-                     command=self._locked_ext_listbox.yview).pack(side="right", fill="y")
-        self._locked_ext_listbox.config(yscrollcommand=lambda *a: None)
+        _sb = tk.Scrollbar(lk_list_frame, orient="vertical",
+                           command=self._locked_ext_listbox.yview)
+        _sb.pack(side="right", fill="y")
+        self._locked_ext_listbox.config(yscrollcommand=_sb.set)
+        self._locked_ext_listbox.bind("<<ListboxSelect>>", self._lock_ext_on_select)
         lk_ops = tk.Frame(lock_cb, bg=self.C["card"])
-        lk_ops.pack(fill="x")
-        self._mk_button(lk_ops, "解锁选中", self._lock_ext_unlock, width=10).pack(side="left", padx=(0, 8))
-        self._mk_button(lk_ops, "解锁全部", self._lock_ext_unlock_all, width=10).pack(side="left", padx=(0, 8))
-        self._mk_button(lk_ops, "刷新状态", self._refresh_locked_ext_list, width=10).pack(side="left")
+        lk_ops.pack(fill="x", pady=(4, 0))
+        # 右下角：解除锁定（仅选中后激活）
+        self._lock_unlock_btn = self._mk_button(lk_ops, "解除锁定", self._lock_ext_unlock,
+                                                width=10, kind="danger")
+        self._lock_unlock_btn.configure(state="disabled")
+        self._lock_unlock_btn.pack(side="right")
+        self._mk_button(lk_ops, "刷新状态", self._refresh_locked_ext_list,
+                        width=10).pack(side="right", padx=(0, 8))
+        self._lock_ext_status = tk.Label(lock_cb, text="", font=("微软雅黑", 9),
+                                         fg=self.C["text2"], bg=self.C["card"],
+                                         anchor="w", justify="left")
+        self._lock_ext_status.pack(fill="x", pady=(0, 4))
+        self._lock_row_map = {}
         self._refresh_locked_ext_list()
 
+    def _lock_ext_normalize(self):
+        """扩展名规范化：自动补 . 前缀 + 统一小写"""
+        v = self._lock_ext_var.get().strip().lower()
+        if v and not v.startswith("."):
+            self._lock_ext_var.set("." + v)
+
+    def _lock_ext_refresh_info(self):
+        """输入扩展名后实时刷新右栏当前程序信息"""
+        try:
+            ext = self._lock_ext_var.get().strip().lower()
+            if not ext.startswith("."):
+                self._lock_cur_name.config(text="未选择程序")
+                self._lock_cur_path.config(text="")
+                self._lock_full_path = ""
+                return
+            progid = get_prog_id(ext)
+            if not progid:
+                self._lock_cur_name.config(text="未选择程序")
+                self._lock_cur_path.config(text="系统默认打开方式（未锁定）")
+                self._lock_full_path = ""
+                return
+            name, _ = identify_tamperer(progid)
+            path = progid_to_path(progid)
+            display = name or progid
+            self._lock_cur_name.config(text=display)
+            if path:
+                self._lock_full_path = path
+                self._lock_cur_path.config(text=self._lock_shorten(path))
+            else:
+                self._lock_full_path = ""
+                self._lock_cur_path.config(text=progid)
+        except Exception:
+            pass
+
+    def _lock_shorten(self, p, maxlen=56):
+        p = str(p)
+        if len(p) <= maxlen:
+            return p
+        half = maxlen // 2 - 1
+        return f"{p[:half]}…{p[-half:]}"
+
+    def _lock_show_full_path(self, show):
+        try:
+            if show and self._lock_full_path:
+                self._lock_cur_path.config(text=self._lock_full_path, fg=self.C["accent"])
+            else:
+                self._lock_cur_path.config(
+                    text=self._lock_shorten(self._lock_full_path) if self._lock_full_path else "",
+                    fg=self.C["text2"])
+        except Exception:
+            pass
+
+    def _lock_ext_pick_current(self):
+        """锁定为当前程序：选择本机程序文件，设为该扩展名默认打开方式"""
+        self._lock_ext_pick_program("锁定为当前程序")
+
+    def _lock_ext_pick_other(self):
+        """锁定为其他程序：选择备选程序，切换该扩展名默认打开方式"""
+        self._lock_ext_pick_program("锁定为其他程序")
+
+    def _lock_ext_pick_program(self, title):
+        try:
+            self._lock_ext_normalize()
+            ext = self._lock_ext_var.get().strip().lower()
+            if not ext.startswith("."):
+                self._lock_ext_status.config(text="请先输入目标扩展名（如 .txt）", fg=self.C["warn"])
+                return
+            path = filedialog.askopenfilename(
+                title=title,
+                filetypes=[("程序文件", "*.exe *.bat *.cmd"), ("所有文件", "*.*")])
+            if not path:
+                return
+            self._lock_ext_lock_path(ext, path)
+        except Exception as e:
+            self._lock_ext_status.config(text=f"选择程序失败: {e}", fg=self.C["error"])
+
+    def _lock_ext_lock_path(self, ext, path):
+        """按程序路径锁定扩展名：写入文件配置、同步基准并立即应用"""
+        ext = ext.strip().lower()
+        if not ext.startswith("."):
+            self._lock_ext_status.config(text="扩展名格式错误（应以 . 开头）", fg=self.C["warn"])
+            return
+        if not os.path.isfile(path):
+            self._lock_ext_status.config(text=f"程序文件不存在: {path}", fg=self.C["warn"])
+            return
+        try:
+            cfg = self.baseline_mgr.config
+            locked = cfg.setdefault("locked_defaults", {})
+            is_update = ext in locked
+            if is_update and str(locked[ext]).lower() == path.lower():
+                self._lock_ext_status.config(
+                    text=f"{ext} 已锁定为 {os.path.basename(path)}，无需重复锁定", fg=self.C["warn"])
+                return
+            locked[ext] = path
+            self.baseline_mgr.save_config()
+            try:
+                self.baseline_mgr.update_extension(ext, reason="锁定设置")
+            except Exception as e:
+                logger.warning(f"锁定 {ext} 后同步基准失败: {e}")
+                self._lock_ext_status.config(
+                    text=f"配置已保存，但基准同步失败（{e}），下次扫描将按新基准比对", fg=self.C["warn"])
+            # 立即应用锁定（恢复目标=所选程序；失败不阻塞，监控线程会持续保障）
+            try:
+                _ok, fcnt, det = self._recover_locked(ext, path)
+                if fcnt:
+                    logger.warning(f"锁定 {ext} 立即应用部分失败: "
+                                   f"{'; '.join(d for d in det if '失败' in d or '异常' in d)}")
+            except Exception as e:
+                logger.warning(f"锁定 {ext} 立即应用异常: {e}")
+            self._refresh_locked_ext_list()
+            name = os.path.splitext(os.path.basename(path))[0]
+            verb = "已更新锁定目标" if is_update else "已锁定"
+            self._lock_ext_status.config(
+                text=f"{verb} {ext} → {os.path.basename(path)}（{path}），配置已保存到文件",
+                fg=self.C["success"])
+            self._append_log(f"{verb}扩展名默认应用: {ext} → {path}", "success")
+            self._lock_ext_refresh_info()
+        except Exception as e:
+            self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
+
+    def _lock_ext_on_select(self, _e=None):
+        """列表选中：激活解除锁定按钮"""
+        try:
+            sel = self._locked_ext_listbox.curselection()
+            if sel and hasattr(self, "_lock_unlock_btn"):
+                self._lock_unlock_btn.configure(state="normal")
+            elif hasattr(self, "_lock_unlock_btn"):
+                self._lock_unlock_btn.configure(state="disabled")
+        except Exception:
+            pass
+
     def _refresh_locked_ext_list(self):
-        """刷新锁定扩展名列表（数据来自 config['locked_defaults']，保存在文件中）"""
+        """刷新锁定扩展名列表（每行：扩展名 | 关联程序名称 | 程序路径）"""
         try:
             locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
             self._locked_ext_listbox.delete(0, tk.END)
+            self._lock_row_map = {}
+            idx = 0
             for ext in sorted(locked.keys()):
-                target = locked[ext]
+                target = str(locked[ext])
+                if _lock_target_to_progid(target) != target:
+                    disp_name = os.path.splitext(os.path.basename(target))[0]
+                    disp_path = target
+                else:
+                    name, _ = identify_tamperer(target)
+                    disp_name = name or target
+                    disp_path = progid_to_path(target) or target
                 status = ""
                 try:
                     cur = get_prog_id(ext)
-                    if cur and cur.lower() == target.lower():
-                        status = "  ✓ 一致"
+                    if cur and cur.lower() == _lock_target_to_progid(target).lower():
+                        status = "  ✓"
                     elif cur:
                         status = f"  ✗ 当前={cur}"
                     else:
-                        status = "  ○ 系统默认(待落实)"
-                except Exception as e:
-                    status = f"  ? 查询失败({e})"
-                self._locked_ext_listbox.insert(tk.END, f"{ext} → {target}{status}")
+                        status = "  ○"
+                except Exception:
+                    status = "  ?"
+                self._locked_ext_listbox.insert(
+                    tk.END, f"{ext} | {disp_name} | {self._lock_shorten(disp_path, 40)}{status}")
+                self._lock_row_map[idx] = ext
+                idx += 1
+            self._lock_ext_on_select()
         except Exception:
             pass
 
@@ -5493,13 +5728,15 @@ class MainWindow:
             self._lock_ext_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
 
     def _lock_ext_unlock(self):
-        """解锁选中的扩展名锁定项"""
+        """解除选中的扩展名锁定项"""
         sel = self._locked_ext_listbox.curselection()
         if not sel:
-            self._lock_ext_status.config(text="请先在列表中选中要解锁的扩展名", fg=self.C["warn"])
+            self._lock_ext_status.config(text="请先在列表中选中要解除锁定的扩展名", fg=self.C["warn"])
             return
-        line = self._locked_ext_listbox.get(sel[0])
-        ext = line.split("→")[0].strip()
+        ext = self._lock_row_map.get(sel[0])
+        if not ext:
+            self._lock_ext_status.config(text="无法解析选中的锁定项，请刷新列表后重试", fg=self.C["warn"])
+            return
         try:
             cfg = self.baseline_mgr.config
             locked = cfg.get("locked_defaults", {}) or {}
@@ -5516,8 +5753,8 @@ class MainWindow:
                     self._refresh_locked_ext_list()
                     return
             self._refresh_locked_ext_list()
-            self._lock_ext_status.config(text=f"已解锁 {ext}，配置已保存到文件", fg=self.C["text2"])
-            self._append_log(f"已解锁扩展名: {ext}", "info")
+            self._lock_ext_status.config(text=f"已解除 {ext} 的锁定，恢复普通保护", fg=self.C["success"])
+            self._append_log(f"已解除扩展名锁定: {ext}", "info")
         except Exception as e:
             self._lock_ext_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
 
@@ -5782,6 +6019,13 @@ class MainWindow:
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["settings"] = page
         self._mk_page_header(page, "设置", "配置保护行为与运行选项")
+        # 顶部过小提示横幅（默认隐藏；窗口过窄时由 _apply_small_adapt 显示）
+        banner = tk.Frame(page, bg="#3D2F00", highlightbackground="#6B5700",
+                          highlightthickness=1)
+        tk.Label(banner, text="窗口过小：部分设置项显示可能不全，建议放大窗口",
+                 font=("微软雅黑", 9), bg="#3D2F00", fg="#FFD66B",
+                 anchor="w").pack(fill="x", padx=12, pady=5)
+        self._settings_banner = banner
         content = self._mk_scroll_container(page)
 
         cfg = self.baseline_mgr.config
@@ -7685,7 +7929,7 @@ class MainWindow:
         self._diag_write("[5] 开机自启动")
         try:
             if is_autostart_set():
-                self._diag_write("    - 已设置（带 -m 最小化启动）")
+                self._diag_write("    - 已设置（--background 后台启动）")
             else:
                 self._diag_write("    - 未设置")
         except Exception:
@@ -8550,8 +8794,8 @@ def add_to_autostart():
         else:
             exe_path = os.path.abspath(sys.argv[0])
         key = winreg.OpenKey(HKCU, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE | KEY_READ_64)
-        # 开机自启动带 -m 最小化参数：后台常驻，不打扰
-        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}" -m')
+        # 开机自启动带 --background 后台参数：纯后台运行（隐藏窗口，不出现任务栏）
+        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}" --background')
         winreg.CloseKey(key)
         return True
     except OSError as e:
@@ -8564,7 +8808,7 @@ def add_to_autostart():
                 exe_path = sys.executable
             r = subprocess.run(
                 ["reg", "add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                 "/v", APP_NAME, "/d", f'\\"{exe_path}\\" -m', "/f"],
+                 "/v", APP_NAME, "/d", f'\\"{exe_path}\\" --background', "/f"],
                 capture_output=True, text=True)
             return r.returncode == 0
         except Exception as e2:
@@ -8573,15 +8817,15 @@ def add_to_autostart():
 
 
 def is_autostart_set():
-    """检查是否已添加自启动（值必须带 -m 最小化参数才算有效）"""
+    """检查是否已添加自启动（值必须带 --background 或旧版 -m 后台参数才算有效）"""
     try:
         key = winreg.OpenKey(HKCU, AUTOSTART_KEY, 0, KEY_READ_64)
         val, _ = winreg.QueryValueEx(key, APP_NAME)
         winreg.CloseKey(key)
         if not val:
             return False
-        # 旧版本写入的裸路径（不带 -m）视为未设置，启动时自动升级为带 -m 的启动项
-        if "-m" not in str(val):
+        # 旧版本写入的裸路径（不带后台参数）视为未设置，启动时自动升级为带 --background 的启动项
+        if "--background" not in str(val) and "-m" not in str(val):
             return False
         return True
     except OSError:
@@ -9432,9 +9676,10 @@ def enable_all_privileges():
 # 主入口
 # ============================================================
 def main():
-    # -m/--minimized：开机自启动最小化启动（须在提权分支之前检测，
-    # 通过环境变量 OPST_MINIMIZED 让 NSudo 子进程(TI实例)同样最小化）
-    _start_minimized = ("-m" in sys.argv) or ("--minimized" in sys.argv)
+    # -m/--minimized/--background：开机自启动后台启动（隐藏窗口，不出现任务栏）。
+    # 须在提权分支之前检测，通过环境变量 OPST_MINIMIZED 让 NSudo 子进程(TI实例)同样后台。
+    _start_minimized = (("-m" in sys.argv) or ("--minimized" in sys.argv)
+                        or ("--background" in sys.argv))
     if _start_minimized:
         try:
             os.environ["OPST_MINIMIZED"] = "1"
