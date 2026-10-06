@@ -39,6 +39,28 @@ import io
 from ctypes import wintypes
 from tkinter import filedialog
 
+
+def _final_exit(code=0):
+    """统一退出入口：先调度独立进程延迟删除自身 _MEI 临时目录（避免 PyInstaller
+    bootloader 下次启动清理旧 _MEI 失败弹出 'Failed to remove temporary directory'
+    警告），再立即 os._exit 跳过 bootloader 退出清理（防安全软件锁 _MEI 弹窗）。"""
+    try:
+        mei = getattr(sys, "_MEIPASS", None)
+        if mei and os.path.isdir(mei):
+            _script = ('Start-Sleep -Seconds 6; try { Remove-Item -LiteralPath "{}" '
+                       '-Recurse -Force -ErrorAction Stop } catch {{}}').format(
+                mei.replace('"', '""'))
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script],
+                creationflags=0x08000000)  # CREATE_NO_WINDOW
+    except Exception:
+        pass
+    try:
+        os._exit(code)
+    except Exception:
+        pass
+
+
 # 隐藏窗口的subprocess.run封装（避免弹cmd/powershell黑窗）
 _HIDDEN_SI = subprocess.STARTUPINFO()
 _HIDDEN_SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -4689,7 +4711,7 @@ class MainWindow:
         except Exception:
             pass
         try:
-            os._exit(0)
+            _final_exit(0)
         except Exception:
             pass
 
@@ -6426,7 +6448,7 @@ class MainWindow:
                     self.root.destroy()
                 except Exception:
                     pass
-                os._exit(0)
+                _final_exit(0)
                 return "break"
             elif content == "LOG" or content.startswith("LOG"):
                 try:
@@ -6527,7 +6549,7 @@ class MainWindow:
                 import subprocess
                 exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
                 subprocess.Popen([exe_path, '--restart'], shell=False)
-                os._exit(0)
+                _final_exit(0)
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"重启失败: {e}\n请手动重启程序。")
 
@@ -6806,7 +6828,7 @@ class MainWindow:
                 except Exception:
                     pass
                 time.sleep(1)
-                os._exit(1)
+                _final_exit(1)
                 break
             # 监控线程心跳检查：保护静默失效检测
             mon = self.monitor
@@ -6921,7 +6943,7 @@ class MainWindow:
                         pass
             except Exception:
                 pass
-            os._exit(0)
+            _final_exit(0)
         self.root.after(3500, _force_exit)
 
     def _backup_current(self):
@@ -9940,7 +9962,7 @@ def main():
                     pass
         except Exception:
             pass
-        os._exit(0)
+        _final_exit(0)
     if "--stop" in sys.argv or "/stop" in sys.argv:
         signaled = signal_exit()
         if signaled:
@@ -10040,7 +10062,7 @@ def main():
             pass
         # os._exit 跳过 PyInstaller bootloader 退出清理，
         # 彻底消除安全软件锁文件导致的"Failed to remove temporary directory"弹窗
-        os._exit(0)
+        _final_exit(0)
 
     # 单实例检测（--restart参数时跳过）
     is_restart = "--restart" in sys.argv
@@ -10095,7 +10117,7 @@ def main():
         if not is_admin():
             kernel32.CloseHandle(mutex)
             run_as_admin()
-            os._exit(0)
+            _final_exit(0)
 
         allowed_modes = {"t", "system", "administrator"}
         if default_perm not in allowed_modes:
@@ -10120,7 +10142,7 @@ def main():
                 log_event("SYSTEM", "提权", "成功", "NSudo已按SYSTEM模式发起重启")
                 time.sleep(2)
                 # os._exit 跳过 bootloader 清理，避免安全软件锁 _MEI 文件弹 Warning
-                os._exit(0)
+                _final_exit(0)
             # 提权失败，保持真实权限，不造假
             log_event("SYSTEM", "提权", "失败", "NSudo SYSTEM提权未成功发起新实例")
             ti_status = actual_status
@@ -10134,7 +10156,7 @@ def main():
                 log_event("SYSTEM", "提权", "成功", "NSudo已按TI模式发起重启")
                 time.sleep(2)
                 # os._exit 跳过 bootloader 清理，避免安全软件锁 _MEI 文件弹 Warning
-                os._exit(0)
+                _final_exit(0)
             # 提权失败，保持真实权限，不造假
             log_event("SYSTEM", "提权", "失败", "NSudo TI提权未成功发起新实例")
             ti_status = actual_status
@@ -10161,7 +10183,7 @@ def main():
     kernel32.CloseHandle(mutex)
     # os._exit 跳过 bootloader 退出清理，避免安全软件锁 _MEI 文件弹 Warning；
     # 残留 _MEI 目录由下次启动时的空目录清理兜底
-    os._exit(0)
+    _final_exit(0)
 
 
 def _global_excepthook(exc_type, exc_value, exc_traceback):
