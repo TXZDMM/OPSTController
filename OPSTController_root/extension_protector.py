@@ -4589,6 +4589,12 @@ class MainWindow:
         self.ti_status = ti_status
         self.privilege_failure_detail = privilege_failure_detail
         self.exit_event = create_exit_event()  # 跨进程退出信号事件
+        # 启动时重置退出事件：清除上一次 --stop 遗留的 signaled 状态，
+        # 否则新实例看门狗线程一启动就收到旧信号立即退出
+        try:
+            _ResetEvent(self.exit_event)
+        except Exception:
+            pass
         self.show_event = create_show_event()  # 跨进程显示窗口信号事件
         self._exiting = False
         # 看门狗（无响应监测）

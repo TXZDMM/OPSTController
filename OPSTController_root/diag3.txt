@@ -1,0 +1,12 @@
+page=.!frame2.!frame2.!frame8 h=866
+btns(5):
+  备份当前基准 mapped=1 y=743 w=103
+  深层扫描 mapped=1 y=743 w=79
+  历史版本管理 mapped=1 y=743 w=103
+  查看基准说明 mapped=1 y=743 w=103
+  从文件加载基准 mapped=1 y=743 w=115
+radios(4):
+  极简 mapped=1 y=958
+  普通 mapped=1 y=958
+  详细 mapped=1 y=958
+  完整 mapped=1 y=958
