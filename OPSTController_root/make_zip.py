@@ -13,6 +13,9 @@ os.makedirs(TMP)
 for f in ("README.md", "LICENSE", "CHANGELOG.md", "停止OPSTcontroller.bat", "OPSTcontroller.exe"):
     shutil.copy2(os.path.join(REL, f), os.path.join(TMP, f))
 shutil.copytree(os.path.join(REL, "runtime"), os.path.join(TMP, "runtime"))
+# onedir 模式：依赖目录 _internal 必须一并打包，否则 exe 无法运行
+if os.path.isdir(os.path.join(REL, "_internal")):
+    shutil.copytree(os.path.join(REL, "_internal"), os.path.join(TMP, "_internal"))
 os.makedirs(os.path.join(TMP, "userdata"))
 shutil.copy2(os.path.join(REL, "userdata", "program_names.json"),
              os.path.join(TMP, "userdata", "program_names.json"))

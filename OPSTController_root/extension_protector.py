@@ -43,10 +43,15 @@ from tkinter import filedialog
 def _final_exit(code=0):
     """统一退出入口：先调度独立进程延迟删除自身 _MEI 临时目录（避免 PyInstaller
     bootloader 下次启动清理旧 _MEI 失败弹出 'Failed to remove temporary directory'
-    警告），再立即 os._exit 跳过 bootloader 退出清理（防安全软件锁 _MEI 弹窗）。"""
+    警告），再立即 os._exit 跳过 bootloader 退出清理（防安全软件锁 _MEI 弹窗）。
+    onedir 模式（_MEIPASS 为程序目录下 _internal）不做任何清理，避免误删依赖。"""
+    # 仅 onefile 模式的 _MEI 临时目录需要清理（目录名以 _MEI 开头且在临时目录下）；
+    # onedir 模式的 _internal 是程序固定依赖目录，严禁删除
+    mei = getattr(sys, "_MEIPASS", None)
+    mei_name = os.path.basename(mei) if mei else ""
+    is_onefile_tmp = bool(mei) and mei_name.startswith("_MEI")
     try:
-        mei = getattr(sys, "_MEIPASS", None)
-        if mei and os.path.isdir(mei):
+        if is_onefile_tmp and os.path.isdir(mei):
             _q = mei.replace('"', '""')
             # 第一路：普通令牌延迟删除（普通实例创建的 _MEI 可直接删）。
             # 循环重试 10 次（每次间隔 5 秒），覆盖安全软件锁定/延迟扫描导致的删除失败，
@@ -76,9 +81,9 @@ def _final_exit(code=0):
         # onefile 下 bootloader 父进程可能卡在"Failed to remove temporary directory"
         # 模态弹窗等待用户，即使子进程已退出也不释放 _MEI 占用，导致延迟删除永远失败。
         # 子进程退出前调度独立进程延迟 kill 父进程（同权限可杀），弹窗随之关闭，
-        # _MEI 释放后由上面两路延迟删除完成清理。仅 frozen 启用（源码运行时父进程
-        # 是用户终端，严禁误杀）。
-        if getattr(sys, "frozen", False):
+        # _MEI 释放后由上面两路延迟删除完成清理。仅 frozen 且 onefile 时启用
+        # （源码运行时父进程是用户终端，严禁误杀；onedir 无 _MEI 弹窗问题，无需 kill）。
+        if getattr(sys, "frozen", False) and is_onefile_tmp:
             try:
                 _ppid = os.getppid()
                 if _ppid and _ppid > 4:
