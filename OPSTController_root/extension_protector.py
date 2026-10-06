@@ -5030,7 +5030,7 @@ class MainWindow:
         tk.Label(nav_bottom, text="关闭窗口 = 后台常驻",
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["nav"],
                  anchor="w", padx=16).pack(fill="x")
-        tk.Label(nav_bottom, text="完全退出：--stop",
+        tk.Label(nav_bottom, text="完全退出：设置页底部「完全退出程序」按钮",
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["nav"],
                  anchor="w", padx=16).pack(fill="x")
 
@@ -5658,6 +5658,14 @@ class MainWindow:
         tk.Label(cb, text=protect_info, font=("微软雅黑", 8), fg=self.C["text3"],
                  bg=self.C["card"], anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
+        # 实时状态提示行：弹窗开关 / 弹窗暂停 / 全局锁定 / 保护已停止 等关键状态
+        # （避免用户误以为"弹窗开着"或"保护还在跑"）
+        self._home_hints = tk.Label(cb, text="", font=("微软雅黑", 8, "bold"),
+                                    fg=self.C["warn"], bg=self.C["card"],
+                                    anchor="w", justify="left")
+        self._home_hints.pack(fill="x", pady=(6, 0))
+        self._refresh_home_hints()
+
         # 卡片2：主界面输出窗口（原版风格，实时输出保护事件与状态）
         out_card = tk.Frame(body, bg=self.C["card"],
                             highlightbackground=self.C["card_border"],
@@ -5695,12 +5703,15 @@ class MainWindow:
         for text, cmd, kind in [
             ("备份当前基准", self._backup_current, "default"),
             ("深层扫描", self._manual_deep_scan, "default"),
-            ("全局锁定 / 解除锁定", self._toggle_global_lock, "default"),
             ("历史版本管理", self._show_history, "default"),
             ("检查更新", self._check_update, "primary"),
         ]:
             # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
             op_btns.append(self._mk_button(op_col, text, cmd, kind=kind))
+        # 全局锁定按钮单独创建：文字随锁定状态实时切换（避免固定文字误导）
+        self._global_lock_btn = self._mk_button(
+            op_col, "全局锁定", self._toggle_global_lock, kind="default")
+        op_btns.append(self._global_lock_btn)
         self._flow_wrap(op_col, op_btns, gap=6)
 
     # ---------- 页面：扩展名 ----------
@@ -6852,7 +6863,9 @@ class MainWindow:
             _save_timeout = block_var.get()
             if _save_timeout < 1: _save_timeout = 1
             elif _save_timeout > 180: _save_timeout = 180
-            cfg["block_timeout"] = 1 if not popup_var.get() else _save_timeout
+            cfg["block_timeout"] = _save_timeout
+            # 弹窗开关只控制是否显示弹窗，不销毁用户设置的等待时长；
+            # （旧逻辑在关闭弹窗时把超时写死为1秒，重开弹窗后变成1秒的bug）
             cfg["clear_log_on_start"] = clearlog_var.get()
             cfg["persistent_no_kill"] = nokill_var.get()
             cfg["batch_popup_mode"] = batch_popup_var.get()
@@ -7099,6 +7112,32 @@ class MainWindow:
         self.ext_count_label.config(text=f"保护扩展名：{count}")
         self.bottom_label.config(text=f"基准模式: {mode_text} | 基准时间: {btime}")
 
+    def _refresh_home_hints(self):
+        """刷新状态页实时提示：弹窗开关/暂停、全局锁定、保护状态"""
+        try:
+            hints = []
+            cfg = self.baseline_mgr.config
+            if not cfg.get("show_popup", True):
+                hints.append("⚠ 弹窗已关闭：更改将静默阻止，不弹出确认")
+            try:
+                if time.time() < self._popup_paused_until:
+                    left = int(self._popup_paused_until - time.time())
+                    hints.append(f"⏸ 弹窗暂停中（剩余约 {left} 秒）")
+            except Exception:
+                pass
+            if getattr(self, "_global_lock_mode", False):
+                hints.append("🔒 全局锁定已启用（ACL 保护全部扩展名）")
+            elif self.monitor is None or not self.monitor.is_alive():
+                hints.append("⏹ 实时保护已停止：仅记录不阻止，请点击「启动保护」")
+            txt = "；".join(hints)
+            if txt != self._home_hints.cget("text"):
+                self._home_hints.config(text=txt)
+            # 定时自刷新（暂停倒计时、状态变化等随时间推进），避免陈旧提示
+            if not getattr(self, "_exiting", False):
+                self.root.after(10000, self._refresh_home_hints)
+        except Exception:
+            pass
+
     def _start_protection(self):
         if not self.baseline_mgr.is_initialized():
             messagebox.showwarning(APP_NAME, "请先创建基准！")
@@ -7118,6 +7157,7 @@ class MainWindow:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self._append_log("实时保护已启动。", "success")
+        self._refresh_home_hints()
 
     def _stop_protection(self):
         if self.monitor:
@@ -7132,6 +7172,7 @@ class MainWindow:
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self._append_log("实时保护已停止。", "warn")
+        self._refresh_home_hints()
 
     def _heartbeat(self):
         """主线程心跳：每2秒更新一次时间戳，证明主线程响应正常"""
@@ -7714,9 +7755,20 @@ class MainWindow:
         protecting = self.monitor is not None
         if not protecting:
             self._append_log("保护已停止，本次扫描仅检测不自动恢复。", "warn")
-        self._append_log("开始深层扫描...", "info")
+        self._append_log("开始深层扫描（后台执行，界面保持响应）...", "info")
         self.root.update()
-        inconsistencies, new_exts = self.engine.deep_scan()
+
+        def _do_scan():
+            try:
+                inconsistencies, new_exts = self.engine.deep_scan()
+                self.root.after(0, lambda: self._deep_scan_done(inconsistencies, new_exts, protecting))
+            except Exception as e:
+                self.root.after(0, lambda: self._append_log(f"深层扫描异常: {e}", "error"))
+
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _deep_scan_done(self, inconsistencies, new_exts, protecting):
+        """深层扫描完成（主线程回调）"""
         if not inconsistencies and not new_exts:
             self._append_log("深层扫描完成，未发现异常。", "success")
             messagebox.showinfo(APP_NAME, "深层扫描完成，一切正常。")
@@ -7789,6 +7841,8 @@ class MainWindow:
             self._global_lock_mode = False
             self._append_log("全局锁定已解除", "success")
             self._update_status("正常监控中")
+            self._refresh_global_lock_btn()
+            self._refresh_home_hints()
         else:
             # 未锁定 → 进入锁定模式
             if not messagebox.askyesno(APP_NAME,
@@ -7800,13 +7854,36 @@ class MainWindow:
                 return
             locked_count = self._lock_all_extensions()
             self._global_lock_mode = True
-            self._append_log(f"全局锁定已启用，共锁定 {locked_count} 个扩展名", "success")
+            _fail, _fexts = getattr(self, "_lock_fail_count", (0, []))
+            _suffix = f"（{_fail} 个失败: {'、'.join(_fexts[:5])}…）" if _fail else ""
+            self._append_log(f"全局锁定已启用，共锁定 {locked_count} 个扩展名{_suffix}", "success" if not _fail else "warn")
             self._update_status("全局锁定中")
+            self._refresh_global_lock_btn()
+            self._refresh_home_hints()
+
+    def _refresh_global_lock_btn(self):
+        """全局锁定按钮文字/配色随当前状态实时切换"""
+        try:
+            btn = getattr(self, "_global_lock_btn", None)
+            if btn is None:
+                return
+            if self._global_lock_mode:
+                btn.config(text="解除全局锁定",
+                           bg="#c0392b", fg="white",
+                           activebackground="#e74c3c", activeforeground="white")
+            else:
+                btn.config(text="全局锁定",
+                           bg=self.C["btn"], fg=self.C["text"],
+                           activebackground=self.C["nav_sel"], activeforeground=self.C["text"])
+        except Exception:
+            pass
 
     def _lock_all_extensions(self):
         """锁定所有基准中的扩展名注册表键，返回锁定数量"""
         exts = list(self.baseline_mgr.baseline.keys())
         locked = 0
+        failed = 0
+        failed_exts = []
         for ext in exts:
             try:
                 prog_id = None
@@ -7816,7 +7893,13 @@ class MainWindow:
                 lock_all_protected_keys(ext, prog_id)
                 locked += 1
             except Exception as e:
+                failed += 1
+                if len(failed_exts) < 8:
+                    failed_exts.append(ext)
                 logger.error(f"锁定 {ext} 失败: {e}")
+        if failed:
+            logger.warning(f"全局锁定完成：成功 {locked}，失败 {failed}（{','.join(failed_exts)}…）")
+        self._lock_fail_count = (failed, failed_exts)
         return locked
 
     def _unlock_all_extensions(self):
@@ -9563,7 +9646,7 @@ class MainWindow:
                 whitelist.append(extension)
                 self.baseline_mgr.config["whitelist_exts"] = whitelist
                 try:
-                    self.baseline_mgr.save()
+                    self.baseline_mgr.save_config()  # 白名单属 config，必须落盘 config.json
                 except Exception:
                     pass
             self.baseline_mgr.update_extension(extension)
@@ -10736,7 +10819,19 @@ def main():
                 _sweep_mei("30s")
                 time.sleep(60)
                 _sweep_mei("90s")
-            threading.Thread(target=_delayed_mei_cleanup, daemon=True).start()
+            # onedir 模式不再产生 _MEI 临时目录：仅当临时目录下确实存在 _MEI*
+            # 残留（如旧 onefile 版本遗留）时才启动清扫线程，避免无意义的磁盘扫描
+            import glob as _glob
+            _has_mei_left = False
+            try:
+                for _r in _mei_roots():
+                    if _glob.glob(os.path.join(_r, "_MEI*")):
+                        _has_mei_left = True
+                        break
+            except Exception:
+                _has_mei_left = False
+            if _has_mei_left:
+                threading.Thread(target=_delayed_mei_cleanup, daemon=True).start()
         except Exception:
             pass
 
