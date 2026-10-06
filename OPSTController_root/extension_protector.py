@@ -30,7 +30,14 @@ import shutil
 import glob
 import tempfile
 import subprocess
+import collections
+import zipfile
+import posixpath
+import traceback
+import re
+import io
 from ctypes import wintypes
+from tkinter import filedialog
 
 # 隐藏窗口的subprocess.run封装（避免弹cmd/powershell黑窗）
 _HIDDEN_SI = subprocess.STARTUPINFO()
@@ -5798,14 +5805,17 @@ class MainWindow:
             row.pack(fill="x", pady=3)
             tk.Label(row, text=text, font=("微软雅黑", 9), fg=dark["text2"],
                      bg=dark["card"], anchor="w").pack(side="left")
-            widget.pack(side="right")
+            # 关键：widget 的父容器是 parent_w（创建时指定），此处用 in_=row
+            # 将其 pack 到本行容器右侧，否则会掉到 parent_w 独立一行造成错位
+            widget.pack(in_=row, side="right")
             return row
 
         def _check(parent_w, text, var):
             chk = tk.Checkbutton(parent_w, text=text, variable=var,
                                  font=("微软雅黑", 9), bg=dark["card"], fg=dark["text2"],
                                  selectcolor=dark["card"], activebackground=dark["card"],
-                                 activeforeground=dark["text"], highlightthickness=0, bd=0)
+                                 activeforeground=dark["text"], highlightthickness=0, bd=0,
+                                 anchor="w")
             chk.pack(fill="x", pady=3, anchor="w")
             return chk
 
