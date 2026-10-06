@@ -1,0 +1,10 @@
+=== LICENSE 文件前5行 ===
+  MIT License
+  
+  Copyright (c) 2026 OPSTcontroller
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+=== 源码 LICENSE ===
+=== program_names.json 条目数 ===
+count=8
+=== data_dir 定义 ===

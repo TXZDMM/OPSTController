@@ -6918,7 +6918,10 @@ class MainWindow:
                  bg=self.C["card"], anchor="w").pack(fill="x", pady=(0, 4))
         audit_var = getattr(self, "_audit_level_var", None)
         if audit_var is None:
-            audit_var = tk.StringVar(value=self.baseline_mgr.config.get("audit_level", "normal"))
+            _cfg_lv = self.baseline_mgr.config.get("audit_level", "normal")
+            if _cfg_lv not in ("minimal", "normal", "detailed", "full"):
+                _cfg_lv = "normal"
+            audit_var = tk.StringVar(value=_cfg_lv)
             self._audit_level_var = audit_var
         _row_about = tk.Frame(body2, bg=self.C["card"])
         _row_about.pack(fill="x", pady=4)
@@ -6931,7 +6934,8 @@ class MainWindow:
             "detailed": "追加进程路径与命令行",
             "full": "追加数字签名、父进程与完整注册表新旧值",
         }
-        tk.Label(body2, text=level_desc.get(audit_var.get(), ""),
+        _cur_lv = audit_var.get() if audit_var.get() in level_desc else "normal"
+        tk.Label(body2, text=level_desc.get(_cur_lv, ""),
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
                  anchor="w", justify="left").pack(fill="x", pady=(2, 0))
         audit_var.trace_add("write", lambda *a: self._on_audit_level_changed(audit_var, level_desc, body2))
@@ -6954,7 +6958,8 @@ class MainWindow:
             if os.path.exists(_lib_path):
                 with open(_lib_path, "r", encoding="utf-8") as _f:
                     _lib_data = json.load(_f)
-                    if isinstance(_lib_data, dict):
+                    # 结构兼容：嵌套 list [[进程名, 显示名],...] 或 dict {进程名: 显示名}
+                    if isinstance(_lib_data, (dict, list)):
                         _lib_count = len(_lib_data)
         except Exception:
             pass
@@ -6970,7 +6975,6 @@ class MainWindow:
         # ===== 节4：许可说明 =====
         sec4, body4 = self._mk_card(content, "许可")
         tk.Label(body4, text="本项目以开源形式发布，禁止用于任何非法用途。\n"
-                             "程序内置数字签名，首次运行时请允许通过（已签名可信）。\n"
                              "使用 TI(TrustedInstaller) 特权需要系统管理员支持。",
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
                  anchor="w", justify="left").pack(fill="x")
