@@ -60,3 +60,8 @@ OPSTController_root/diag*.txt
 OPSTController_root/shot_log.txt
 
 OPSTController_root/ui1*_out.txt
+
+OPSTController_root/cap_window.py
+OPSTController_root/ui14_check.py
+OPSTController_root/ui14_*.txt
+OPSTController_root/ui_shot*

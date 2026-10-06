@@ -48,10 +48,13 @@ def _final_exit(code=0):
         mei = getattr(sys, "_MEIPASS", None)
         if mei and os.path.isdir(mei):
             _q = mei.replace('"', '""')
-            # 第一路：普通令牌延迟删除（普通实例创建的 _MEI 可直接删）
+            # 第一路：普通令牌延迟删除（普通实例创建的 _MEI 可直接删）。
+            # 循环重试 10 次（每次间隔 5 秒），覆盖安全软件锁定/延迟扫描导致的删除失败，
+            # 确保下次启动 bootloader 清理旧 _MEI 时不再弹出 Warning 弹窗
             try:
-                _script1 = ('Start-Sleep -Seconds 6; try {{ Remove-Item -LiteralPath "{}" '
-                            '-Recurse -Force -ErrorAction Stop }} catch {{}}').format(_q)
+                _script1 = ('Start-Sleep -Seconds 6; $q="{}"; $n=0; while($n -lt 10) {{ try {{ '
+                            'Remove-Item -LiteralPath $q -Recurse -Force -ErrorAction Stop; break }} '
+                            'catch {{ Start-Sleep 5; $n++ }} }}').format(_q)
                 subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script1],
                                  creationflags=0x08000000)
             except Exception:
@@ -61,10 +64,27 @@ def _final_exit(code=0):
             # UAC 关闭时 RunAs 静默成功；普通用户实例不启用以免弹出 UAC 确认
             try:
                 if ctypes.windll.shell32.IsUserAnAdmin():
-                    _script2 = ('Start-Sleep -Seconds 8; try {{ Start-Process powershell -Verb RunAs '
-                                '-ArgumentList "-NoProfile","-Command",\'Remove-Item -LiteralPath "{}" '
-                                '-Recurse -Force -ErrorAction SilentlyContinue\' -Wait }} catch {{}}').format(_q)
+                    _script2 = ('Start-Sleep -Seconds 8; $q="{}"; $n=0; while($n -lt 10) {{ try {{ '
+                                'Start-Process powershell -Verb RunAs -Wait -ArgumentList '
+                                '"-NoProfile","-Command",\'Remove-Item -LiteralPath $q -Recurse '
+                                '-Force -ErrorAction SilentlyContinue\'; break }} catch {{ Start-Sleep 5; $n++ }} }}').format(_q)
                     subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _script2],
+                                     creationflags=0x08000000)
+            except Exception:
+                pass
+        # 根治"弹窗卡死 → 锁 _MEI → 下次启动必弹 Warning"循环：
+        # onefile 下 bootloader 父进程可能卡在"Failed to remove temporary directory"
+        # 模态弹窗等待用户，即使子进程已退出也不释放 _MEI 占用，导致延迟删除永远失败。
+        # 子进程退出前调度独立进程延迟 kill 父进程（同权限可杀），弹窗随之关闭，
+        # _MEI 释放后由上面两路延迟删除完成清理。仅 frozen 启用（源码运行时父进程
+        # 是用户终端，严禁误杀）。
+        if getattr(sys, "frozen", False):
+            try:
+                _ppid = os.getppid()
+                if _ppid and _ppid > 4:
+                    _sk = ('Start-Sleep -Seconds 4; Stop-Process -Id {} -Force '
+                           '-ErrorAction SilentlyContinue').format(_ppid)
+                    subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", _sk],
                                      creationflags=0x08000000)
             except Exception:
                 pass
@@ -4683,9 +4703,28 @@ class MainWindow:
                     self._append_log("收到退出信号(看门狗线程)，正在关闭...", "warn")
                     self._threadsafe_exit()
                     return
+                # 显示窗口信号（第二实例双击/运行时唤出时触发）。
+                # TI 实例若缺少 tk after 主循环，_check_exit_event 不执行，
+                # 由本线程兜底用 Win32 直接显示窗口
+                if self.show_event and check_exit_event(self.show_event):
+                    self._show_main_window_win32()
             except Exception:
                 pass
             time.sleep(0.5)
+
+    def _show_main_window_win32(self):
+        """线程内用 Win32 直接显示主窗口（不依赖 tk mainloop / 跨线程安全）"""
+        try:
+            hwnd = self.root.winfo_id()
+            if not hwnd:
+                return
+            _user32 = ctypes.WinDLL("user32", use_last_error=True)
+            _user32.ShowWindow.restype = ctypes.c_int
+            _user32.SetForegroundWindow.restype = ctypes.c_int
+            _user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            _user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
     def _threadsafe_exit(self):
         """线程安全的强制退出：停监控→解锁→保存→立即退出进程。
@@ -5332,13 +5371,9 @@ class MainWindow:
 
     def _flow_wrap(self, parent, widgets, gap=8, anchor="left"):
         """Flow 布局：容器宽度不足时按钮自动换行（窗口缩放适配）。
-        预建固定行容器 + 重入保护，避免 <Configure> 触发重排造成死循环。"""
+        使用 grid 直接管理（按钮 master=parent），避免 pack(in_=行容器)
+        在部分会话/环境下静默失败导致按钮完全不显示。"""
         state = {"busy": False, "pending": False}
-        rows = []
-        for _i in range(max(1, len(widgets))):
-            rf = tk.Frame(parent, bg=parent["bg"])
-            rf.pack(fill="x", pady=2)
-            rows.append(rf)
         def _relayout(_e=None):
             if state["busy"]:
                 state["pending"] = True
@@ -5360,35 +5395,26 @@ class MainWindow:
                         widths.append(w.winfo_reqwidth())
                     except Exception:
                         widths.append(0)
-                # 贪心分行
-                assignment = [[]]
-                total = 0
-                for w, rw in zip(widgets, widths):
-                    if total + rw + gap > avail and assignment[-1]:
-                        assignment.append([])
-                        total = 0
-                    assignment[-1].append(w)
-                    total += rw + gap
                 for w in widgets:
                     try:
-                        w.pack_forget()
+                        w.grid_forget()
                     except Exception:
                         pass
-                for ri, rw_list in enumerate(assignment):
-                    if ri >= len(rows):
-                        break
-                    for w in rw_list:
-                        try:
-                            w.pack(in_=rows[ri], side="left", padx=(0, gap))
-                        except Exception:
-                            pass
-                # 清理未使用的行容器
-                for ri in range(len(assignment), len(rows)):
-                    for c in list(rows[ri].winfo_children()):
-                        try:
-                            c.pack_forget()
-                        except Exception:
-                            pass
+                # 贪心分行后逐行放置（grid 行/列，按钮仍归属 parent，无需 in_）
+                row_i = 0
+                col_i = 0
+                total = 0
+                for w, rw in zip(widgets, widths):
+                    if col_i > 0 and total + rw + gap > avail:
+                        row_i += 1
+                        col_i = 0
+                        total = 0
+                    try:
+                        w.grid(row=row_i, column=col_i, sticky="w", padx=(0, gap), pady=2)
+                    except Exception:
+                        pass
+                    col_i += 1
+                    total += rw + gap
             finally:
                 state["busy"] = False
                 if state["pending"]:
@@ -6202,15 +6228,20 @@ class MainWindow:
         elif _loaded_timeout > 180: _loaded_timeout = 180
         block_var = tk.IntVar(value=_loaded_timeout)
 
-        def _row(parent_w, text, widget):
+        def _row(parent_w, text, create_widget):
             row = tk.Frame(parent_w, bg=dark["card"])
             row.pack(fill="x", pady=3)
             tk.Label(row, text=text, font=("微软雅黑", 9), fg=dark["text2"],
                      bg=dark["card"], anchor="w").pack(side="left")
-            # 关键：widget 的父容器是 parent_w（创建时指定），此处用 in_=row
-            # 将其 pack 到本行容器右侧，否则会掉到 parent_w 独立一行造成错位
-            widget.pack(in_=row, side="right")
-            return row
+            # 控件在行容器内创建（master=row），避免 pack(in_=row) 在部分
+            # 会话/环境下静默失败导致右侧控件完全不显示
+            w = create_widget(row)
+            if w is not None:
+                try:
+                    w.pack(side="right")
+                except Exception:
+                    pass
+            return w
 
         def _check(parent_w, text, var):
             chk = tk.Checkbutton(parent_w, text=text, variable=var,
@@ -6223,17 +6254,16 @@ class MainWindow:
 
         _check(body, "开机自启", autostart_var)
         _check(body, "检测到更改时弹窗通知（取消则静默阻止）", popup_var)
-        block_spin = tk.Spinbox(body, from_=1, to=180,
+        block_spin = _row(body, "弹窗等待时间（秒）:", lambda r: tk.Spinbox(r, from_=1, to=180,
              textvariable=block_var, width=6, bg=dark["btn"], fg=dark["text"],
-             buttonbackground=dark["btn"], relief="flat", highlightthickness=0)
-        _row(body, "弹窗等待时间（秒）:", block_spin)
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
         tk.Label(body, text="范围 1-180 秒；关闭弹窗时此值强制为 1 秒",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w").pack(fill="x")
-        _row(body, "批量弹窗模式:", self._mk_radio_row(body, batch_popup_var,
+        _row(body, "批量弹窗模式:", lambda r: self._mk_radio_row(r, batch_popup_var,
              [("single", "单个(队列)"), ("simultaneous", "同时(堆叠)")]))
         tk.Label(body, text="单个：一次弹一个，超时自动阻止后下一个缩短为6秒；同时：所有弹窗同时弹出",
                  font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
-        _row(body, "运行模式:", self._mk_radio_row(body, mode_var,
+        _row(body, "运行模式:", lambda r: self._mk_radio_row(r, mode_var,
              [("normal", "正常"), ("quiet", "临时免打扰"), ("game", "游戏模式"),
               ("demo", "演示模式"), ("silent", "静默模式"), ("paused", "临时暂停")]))
         tk.Label(body, text="正常：默认弹窗；免打扰/游戏/演示/静默：关闭或压制提醒；暂停：短时停用检测",
@@ -6244,10 +6274,9 @@ class MainWindow:
         # ===== 节2：基准 =====
         sec2, body2 = self._mk_card(content, "基准")
         hist_var = tk.IntVar(value=cfg.get("history_versions", MAX_HISTORY_VERSIONS))
-        hist_spin = tk.Spinbox(body2, from_=1, to=20,
+        hist_spin = _row(body2, "基准保留版本数:", lambda r: tk.Spinbox(r, from_=1, to=20,
              textvariable=hist_var, width=6, bg=dark["btn"], fg=dark["text"],
-             buttonbackground=dark["btn"], relief="flat", highlightthickness=0)
-        _row(body2, "基准保留版本数:", hist_spin)
+             buttonbackground=dark["btn"], relief="flat", highlightthickness=0))
         b_ops = tk.Frame(body2, bg=dark["card"])
         b_ops.pack(fill="x", pady=6)
         _base_btns = [
@@ -6264,11 +6293,11 @@ class MainWindow:
         sec3, body3 = self._mk_card(content, "权限")
         perm_var = tk.StringVar(value=cfg.get("default_permission", "t"))
         audit_level_var = tk.StringVar(value=cfg.get("audit_level", "normal"))
-        _row(body3, "默认权限级别:", self._mk_radio_row(body3, perm_var,
+        _row(body3, "默认权限级别:", lambda r: self._mk_radio_row(r, perm_var,
              [("user", "普通用户"), ("administrator", "管理员"), ("system", "SYSTEM"), ("t", "TI(推荐)")]))
         tk.Label(body3, text="低于 TI 权限可能导致 UserChoice 恢复失败，保护不生效",
                  font=("微软雅黑", 8), fg=dark["error"], bg=dark["card"], anchor="w").pack(fill="x")
-        _row(body3, "记录级别:", self._mk_radio_row(body3, audit_level_var,
+        _row(body3, "记录级别:", lambda r: self._mk_radio_row(r, audit_level_var,
              [("minimal", "极简"), ("normal", "普通"), ("detailed", "详细"), ("full", "完整")]))
         a_ops = tk.Frame(body3, bg=dark["card"])
         a_ops.pack(fill="x", pady=6)
