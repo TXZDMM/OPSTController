@@ -9463,6 +9463,13 @@ class MainWindow:
                 break
         tamperer_key = tamperer_name if tamperer_name else "__unknown__"
 
+        # ask_first 先询问模式：立即显示单个弹窗，不进批量队列。
+        # 否则弹窗延迟5秒，监控下一轮重复检测会先判"持续篡改"并静默恢复，
+        # 用户来不及点"单次同意"（18:29:35→18:29:37 BH3 实锤）。
+        if ask_first:
+            self._show_single_notification(ext, mismatches, recover_result, extra_timeout, ask_first)
+            return
+
         # 批量合并：加入队列
         if tamperer_key not in self._batch_queue:
             self._batch_queue[tamperer_key] = []
