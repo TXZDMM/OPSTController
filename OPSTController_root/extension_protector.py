@@ -4980,10 +4980,10 @@ class MainWindow:
 
         self._nav_buttons = {}
         self._nav_sel = None
-        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 诊断 / 设置（日志页保留但不再出现在导航，从设置页进入）
+        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 默认应用 / 配置与备份 / 设置（日志页保留但不再出现在导航，从设置页进入）
         for key, text in [("home", "状态"), ("exts", "扩展名"),
                           ("history", "防护记录"), ("tools", "异常修复"),
-                          ("diag", "诊断"), ("config", "配置与备份"), ("settings", "设置")]:
+                          ("defapps", "默认应用"), ("config", "配置与备份"), ("settings", "设置")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -5009,7 +5009,7 @@ class MainWindow:
         self._build_page_exts(content)
         self._build_page_history(content)
         self._build_page_tools(content)
-        self._build_page_diag(content)
+        self._build_page_defapps(content)
         self._build_page_config(content)
         self._build_page_log(content)
         self._build_page_settings(content)
@@ -8255,162 +8255,347 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror(APP_NAME, f"导出失败: {e}")
 
-    def _build_page_diag(self, parent):
-        """页面：系统诊断 —— 一键体检报告（权限/提权链/基准/锁定/自启动/运行健康）"""
+    def _build_page_defapps(self, parent):
+        """页面：默认应用 —— 受保护扩展名 × 当前默认打开程序总览，
+        发现异常关联后可直接锁定/解除锁定（替代原诊断页）"""
         page = tk.Frame(parent, bg=self.C["bg"])
-        self._pages["diag"] = page
-        self._mk_page_header(page, "系统诊断", "一键检查权限、提权链、基准、锁定、自启动与运行健康")
+        self._pages["defapps"] = page
+        self._mk_page_header(page, "默认应用",
+                             "查看每个扩展名当前由哪款软件打开，异常关联一键锁定")
         body = self._mk_scroll_container(page)
-        card, cb = self._mk_card(body, "一键诊断",
-            "点击「开始诊断」逐项检查并生成报告；报告可复制或保存为 txt 文件")
+        # 统计 + 操作卡
+        card, cb = self._mk_card(body, "受保护扩展名的默认应用",
+            "选择列表任意行，用下方按钮锁定/解除锁定默认打开方式；搜索框可按扩展名过滤")
+        self._defapps_stats = {}
+        stats = tk.Frame(cb, bg=self.C["card"])
+        stats.pack(fill="x", pady=(0, 8))
+        for label in ["受保护总数", "已锁定", "商店应用", "关联异常"]:
+            f = tk.Frame(stats, bg=self.C["card"])
+            f.pack(side="left", padx=(0, 14))
+            tk.Label(f, text=label, font=("微软雅黑", 8), fg=self.C["text3"],
+                     bg=self.C["card"]).pack(anchor="w")
+            v = tk.Label(f, text="—", font=("微软雅黑", 11, "bold"),
+                         fg=self.C["accent"], bg=self.C["card"])
+            v.pack(anchor="w")
+            self._defapps_stats[label] = v
+        # 工具栏：搜索 / 筛选 / 刷新
+        bar = tk.Frame(cb, bg=self.C["card"])
+        bar.pack(fill="x", pady=(0, 6))
+        tk.Label(bar, text="搜索扩展名:", font=("微软雅黑", 9),
+                 fg=self.C["text2"], bg=self.C["card"]).pack(side="left")
+        self._defapps_search = tk.Entry(bar, font=("微软雅黑", 9), width=16,
+                                        bg=self.C["btn"], fg=self.C["text"],
+                                        insertbackground=self.C["text"], relief="flat")
+        self._defapps_search.pack(side="left", padx=(6, 10))
+        self._defapps_search.bind("<Return>", lambda e: self._defapps_load())
+        self._defapps_search.bind("<KeyRelease>", self._defapps_search_key)
+        tk.Label(bar, text="筛选:", font=("微软雅黑", 9),
+                 fg=self.C["text2"], bg=self.C["card"]).pack(side="left")
+        self._defapps_filter = tk.StringVar(value="全部")
+        for opt in ["全部", "已锁定", "商店应用", "正常"]:
+            tk.Radiobutton(bar, text=opt, variable=self._defapps_filter, value=opt,
+                           command=self._defapps_load, font=("微软雅黑", 9),
+                           fg=self.C["text2"], bg=self.C["card"],
+                           selectcolor=self.C["card"], activebackground=self.C["card"],
+                           highlightthickness=0).pack(side="left", padx=(0, 6))
+        self._mk_button(bar, "刷新", self._defapps_load, kind="primary").pack(side="right")
+        self._mk_button(bar, "导出清单", self._defapps_export).pack(side="right", padx=(0, 8))
+        # 列表（Treeview：高效承载 1283 行）
+        from tkinter import ttk
+        tv_style = ttk.Style(self.root)
+        try:
+            tv_style.theme_use("clam")
+            tv_style.configure("Defapps.Treeview",
+                               background=self.C["btn"], fieldbackground=self.C["btn"],
+                               foreground=self.C["text"], rowheight=24,
+                               bordercolor=self.C["line"], lightcolor=self.C["line"],
+                               darkcolor=self.C["line"])
+            tv_style.configure("Defapps.Treeview.Heading",
+                               background=self.C["btn"], foreground=self.C["text2"],
+                               relief="flat", font=("微软雅黑", 9, "bold"))
+            tv_style.map("Defapps.Treeview",
+                         background=[("selected", self.C["accent"])],
+                         foreground=[("selected", "#ffffff")])
+        except Exception:
+            pass
+        tv_frame = tk.Frame(cb, bg=self.C["card"])
+        tv_frame.pack(fill="both", expand=True)
+        cols = ("prog", "name", "path", "status")
+        self._defapps_tv = ttk.Treeview(tv_frame, columns=cols, show="headings",
+                                        style="Defapps.Treeview", height=18)
+        for cid, (txt, w) in {"prog": ("扩展名", 110), "name": ("默认程序", 230),
+                              "path": ("程序路径", 420), "status": ("状态", 110)}.items():
+            self._defapps_tv.heading(cid, text=txt)
+            self._defapps_tv.column(cid, width=w, anchor="w", stretch=(cid != "path"))
+        self._defapps_tv.tag_configure("locked", foreground="#7ee787")
+        self._defapps_tv.tag_configure("appx", foreground="#58a6ff")
+        self._defapps_tv.tag_configure("abnormal", foreground="#ffa657")
+        vsb = ttk.Scrollbar(tv_frame, orient="vertical", command=self._defapps_tv.yview)
+        self._defapps_tv.configure(yscrollcommand=vsb.set)
+        self._defapps_tv.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._defapps_tv.bind("<<TreeviewSelect>>", self._defapps_select)
+        self._defapps_tv.bind("<Double-1>", self._defapps_goto_detail)
+        self._defapps_tv.bind("<MouseWheel>", self._defapps_wheel)
+        # 行操作按钮
         ops = tk.Frame(cb, bg=self.C["card"])
-        ops.pack(fill="x", pady=(0, 6))
-        self._mk_button(ops, "开始诊断", self._diag_run, kind="primary").pack(side="left", padx=(0, 8))
-        self._mk_button(ops, "复制报告", self._diag_copy).pack(side="left", padx=(0, 8))
-        self._mk_button(ops, "保存报告", self._diag_save).pack(side="left")
-        text = tk.Text(cb, font=("Consolas", 9), height=22, wrap="word",
-                       bg=self.C["btn"], fg=self.C["text"], relief="flat",
-                       highlightthickness=0, state="disabled")
-        text.pack(fill="x")
-        self._diag_text = text
-        text.configure(state="normal")
-        text.insert(tk.END, "尚未诊断。点击「开始诊断」生成体检报告。\n")
-        text.configure(state="disabled")
+        ops.pack(fill="x", pady=(8, 0))
+        self._defapps_btns = {}
+        specs = [("lockcur", "锁定为当前程序", self._defapps_lock_current, "primary"),
+                 ("lockoth", "锁定为其他程序", self._defapps_lock_other, ""),
+                 ("unlock", "解除锁定", self._defapps_unlock, ""),
+                 ("goto", "打开扩展名页", self._defapps_goto_detail, "")]
+        for k, t, cmd, kind in specs:
+            b = self._mk_button(ops, t, cmd, kind=kind)
+            b.configure(state="disabled")
+            b.pack(side="left", padx=(0, 8))
+            self._defapps_btns[k] = b
+        self._defapps_row = None
+        self._defapps_status = tk.Label(cb, text="加载中…", font=("微软雅黑", 9),
+                                        fg=self.C["text3"], bg=self.C["card"],
+                                        anchor="w")
+        self._defapps_status.pack(fill="x", pady=(6, 0))
+        self.root.after(80, self._defapps_load)
 
-    def _diag_write(self, line):
-        """向诊断报告追加一行（自动滚到底部）"""
-        txt = self._diag_text
-        txt.configure(state="normal")
-        txt.insert(tk.END, line + "\n")
-        txt.see(tk.END)
-        txt.configure(state="disabled")
-
-    def _diag_run(self):
-        """执行一键诊断并输出报告"""
-        txt = self._diag_text
-        txt.configure(state="normal")
-        txt.delete("1.0", tk.END)
-        txt.configure(state="disabled")
-        self._diag_write(f"===== {APP_NAME} v{APP_VERSION} 诊断报告 =====")
-        self._diag_write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self._diag_write("")
-        # 1) 权限与提权
-        self._diag_write("[1] 权限状态")
-        priv_txt = self.ti_status if self.ti_status else "未知"
-        self._diag_write(f"    - 界面权限显示: {priv_txt}")
+    def _defapps_wheel(self, event):
+        """列表滚轮：直接滚动列表（主内容区大列表）"""
         try:
-            import ctypes
-            elev = bool(ctypes.windll.shell32.IsUserAnAdmin())
-            self._diag_write(f"    - 进程管理员令牌: {'是' if elev else '否'}")
+            delta = -1 if event.delta > 0 else 1
+            self._defapps_tv.yview_scroll(delta, "units")
         except Exception:
-            self._diag_write("    - 进程管理员令牌: 无法判断")
-        self._diag_write("")
-        # 2) 提权链
-        self._diag_write("[2] 提权链（TrustedInstaller）")
-        self._diag_write(f"    - 提权模式: {getattr(self, '_ti_mode_text', 'TI(SYSTEM)')}")
-        self._diag_write(f"    - 自我保护: {'已启用' if self._process_protected else '未启用'}")
-        self._diag_write("")
-        # 3) 基准
-        self._diag_write("[3] 基准状态")
-        cfg = self.baseline_mgr.config
-        bl = self.baseline_mgr.baseline
-        self._diag_write(f"    - 保护扩展名: {len(bl)}")
-        self._diag_write(f"    - 基准模式: {cfg.get('baseline_mode', '—')}")
-        self._diag_write(f"    - 基准时间: {cfg.get('baseline_time', '—')}")
-        self._diag_write("")
-        # 4) 单扩展名锁定
-        self._diag_write("[4] 单扩展名锁定")
-        locked = cfg.get("locked_defaults", {}) or {}
-        if locked:
-            for ext, target in sorted(locked.items()):
+            pass
+        return "break"
+
+    def _defapps_search_key(self, _e=None):
+        """搜索框输入实时过滤（防抖）"""
+        try:
+            self.root.after_cancel(getattr(self, "_defapps_search_after", None))
+        except Exception:
+            pass
+        self._defapps_search_after = self.root.after(300, self._defapps_load)
+
+    def _defapps_load(self, _e=None):
+        """按搜索/筛选重建列表行（后台线程扫描，避免阻塞 UI）"""
+        try:
+            q = self._defapps_search.get().strip().lower() if hasattr(self, "_defapps_search") else ""
+            flt = self._defapps_filter.get() if hasattr(self, "_defapps_filter") else "全部"
+            self._defapps_status.config(text="加载中…（后台扫描全部受保护扩展名）")
+            import threading
+            threading.Thread(target=self._defapps_build_rows, args=(q, flt),
+                             daemon=True).start()
+        except Exception as e:
+            self._defapps_status.config(text=f"加载失败: {e}", fg=self.C["error"])
+
+    def _defapps_build_rows(self, q, flt):
+        """后台线程：扫描扩展名默认应用并收集行数据"""
+        try:
+            bl = self.baseline_mgr.baseline
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            if not hasattr(self, "_defapps_name_cache"):
+                self._defapps_name_cache = {}
+            cache = self._defapps_name_cache
+            rows = []
+            n_lock = n_appx = n_abn = 0
+            for ext in sorted(bl.keys()):
+                if q and q not in ext.lower():
+                    continue
                 try:
-                    cur = get_prog_id(ext)
-                    mark = "一致" if cur and cur.lower() == target.lower() else ("待落实" if not cur else f"当前={cur}")
+                    prog = get_prog_id(ext) or ""
                 except Exception:
-                    mark = "无法读取"
-                self._diag_write(f"    - {ext} → {target}  [{mark}]")
-        else:
-            self._diag_write("    - 未设置任何锁定")
-        self._diag_write("")
-        # 5) 自启动
-        self._diag_write("[5] 开机自启动")
+                    prog = ""
+                is_locked = ext in locked
+                is_appx = prog.lower().startswith("appx") if prog else False
+                abn = False
+                if is_locked:
+                    want = str(locked[ext])
+                    if not prog or prog.lower() != want.lower():
+                        abn = True
+                        n_abn += 1
+                if is_locked:
+                    n_lock += 1
+                if is_appx:
+                    n_appx += 1
+                status = "已锁定" if is_locked else ("商店应用" if is_appx else "正常")
+                if flt == "已锁定" and not is_locked:
+                    continue
+                if flt == "商店应用" and not is_appx:
+                    continue
+                if flt == "正常" and (is_locked or is_appx):
+                    continue
+                if prog:
+                    name = cache.get(prog)
+                    if name is None:
+                        nm, _ = identify_tamperer(prog)
+                        name = nm or prog
+                        cache[prog] = name
+                    path = progid_to_path(prog)
+                    if is_appx:
+                        path = "（商店应用，无文件路径）"
+                else:
+                    name, path = "系统默认", ""
+                tag = "locked" if is_locked else ("appx" if is_appx else ("abnormal" if abn else ""))
+                path_short = path if len(path) <= 60 else path[:28] + "…" + path[-28:]
+                rows.append((ext, name, path_short, status, tag))
+            total = len(bl)
+            shown = len(rows)
+            self.root.after(0, lambda: self._defapps_apply_rows(
+                rows, total, shown, n_lock, n_appx, n_abn))
+        except Exception as e:
+            self.root.after(0, lambda e=e: self._defapps_status.config(
+                text=f"加载失败: {e}", fg=self.C["error"]))
+
+    def _defapps_apply_rows(self, rows, total, shown, n_lock, n_appx, n_abn):
+        """主线程：应用扫描结果到 Treeview（数据量 1000+ 时逐批插入避免卡顿）"""
         try:
-            if is_autostart_set():
-                self._diag_write("    - 已设置（--background 后台启动）")
-            else:
-                self._diag_write("    - 未设置")
-        except Exception:
-            self._diag_write("    - 无法读取")
-        self._diag_write("")
-        # 6) 日志与运行健康
-        self._diag_write("[6] 日志与运行健康")
+            tv = self._defapps_tv
+            tv.delete(*tv.get_children())
+            step = 200
+            for i in range(0, len(rows), step):
+                batch = rows[i:i + step]
+                for ext, name, path_short, status, tag in batch:
+                    tv.insert("", "end", values=(ext, name, path_short, status), tags=(tag,))
+                if i + step < len(rows):
+                    self.root.update_idletasks()
+            self._defapps_stats["受保护总数"].config(text=str(total))
+            self._defapps_stats["已锁定"].config(text=str(n_lock))
+            self._defapps_stats["商店应用"].config(text=str(n_appx))
+            self._defapps_stats["关联异常"].config(
+                text=str(n_abn), fg=(self.C["error"] if n_abn else self.C["accent"]))
+            self._defapps_status.config(
+                text=f"共 {total} 个扩展名受保护，当前显示 {shown} 行；双击行可跳转扩展名页")
+            self._defapps_row = None
+            for b in self._defapps_btns.values():
+                b.configure(state="disabled")
+        except Exception as e:
+            self._defapps_status.config(text=f"加载失败: {e}", fg=self.C["error"])
+
+    def _defapps_select(self, _e=None):
+        """选中行：记录扩展名/ProgId，激活操作按钮"""
         try:
-            log_path = os.path.join(USERDATA_DIR, "protector.log")
-            if os.path.exists(log_path):
-                sz = os.path.getsize(log_path)
-                self._diag_write(f"    - 监控日志: {sz/1024:.1f} KB（超过 2MB 自动轮转）")
-            else:
-                self._diag_write("    - 监控日志: 尚未生成")
-        except Exception:
-            self._diag_write("    - 监控日志: 无法读取")
-        try:
-            import tempfile
-            meis = [d for d in os.listdir(tempfile.gettempdir()) if d.startswith("_MEI")]
-            self._diag_write(f"    - 临时 _MEI 目录: {len(meis)} 个（30s 自动清扫）")
+            sel = self._defapps_tv.selection()
+            if not sel:
+                return
+            vals = self._defapps_tv.item(sel[0], "values")
+            if not vals:
+                return
+            ext = vals[0]
+            prog = get_prog_id(ext) or ""
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            self._defapps_row = (ext, prog, ext in locked)
+            self._defapps_btns["lockcur"].configure(state="normal" if prog else "disabled")
+            self._defapps_btns["lockoth"].configure(state="normal")
+            self._defapps_btns["unlock"].configure(state="normal" if ext in locked else "disabled")
+            self._defapps_btns["goto"].configure(state="normal")
         except Exception:
             pass
-        self._diag_write("")
-        # 7) 识别库
-        self._diag_write("[7] 软件识别库")
-        try:
-            if os.path.exists(PROGRAM_NAMES_FILE):
-                with open(PROGRAM_NAMES_FILE, "r", encoding="utf-8") as f:
-                    names = json.load(f)
-                self._diag_write(f"    - 内置名称库条目: {len(names)}")
-            else:
-                self._diag_write("    - 识别库文件缺失")
-        except Exception:
-            self._diag_write("    - 识别库读取失败")
-        self._diag_write("")
-        # 8) 防护记录
-        self._diag_write("[8] 防护记录")
-        try:
-            recs = self.change_history.get_records(limit=100000)
-            self._diag_write(f"    - 历史记录: {len(recs)} 条（上限 {self.change_history.MAX_RECORDS}）")
-        except Exception:
-            self._diag_write("    - 历史记录: 无法读取")
-        self._diag_write("")
-        self._diag_write("===== 诊断完成 =====")
 
-    def _diag_copy(self):
-        """复制诊断报告到剪贴板"""
+    def _defapps_lock_current(self):
+        """锁定选中扩展名为当前默认程序"""
         try:
-            txt = self._diag_text.get("1.0", tk.END).strip()
-            if not txt:
+            if not self._defapps_row:
                 return
-            self.root.clipboard_clear()
-            self.root.clipboard_append(txt)
-            self._append_log("诊断报告已复制到剪贴板", "info")
+            ext, prog, _ = self._defapps_row
+            if not prog:
+                self._defapps_status.config(text=f"{ext} 当前为系统默认（无自定义程序），"
+                                                 f"请用「锁定为其他程序」选择", fg=self.C["warn"])
+                return
+            if ext.lower() in self._lock_unlockable_exts:
+                self._defapps_status.config(text=f"{ext} 属于系统/可执行类，不支持锁定",
+                                            fg=self.C["error"])
+                return
+            path = progid_to_path(prog)
+            target = path if path else prog
+            self._lock_ext_lock_path(ext, target)
+            self._defapps_status.config(
+                text=f"{ext} 已锁定为 {self._lock_target_name(target)}", fg=self.C["success"])
+            self._defapps_load()
+        except Exception as e:
+            self._defapps_status.config(text=f"锁定失败: {e}", fg=self.C["error"])
+
+    def _defapps_lock_other(self):
+        """锁定选中扩展名为其他程序（文件选择）"""
+        try:
+            if not self._defapps_row:
+                return
+            ext = self._defapps_row[0]
+            self._lock_ext_var.set(ext)
+            self._lock_ext_pick_program("锁定为其他程序")
+            self.root.after(600, self._defapps_load)
+        except Exception as e:
+            self._defapps_status.config(text=f"操作失败: {e}", fg=self.C["error"])
+
+    def _defapps_unlock(self):
+        """解除选中扩展名的锁定"""
+        try:
+            if not self._defapps_row:
+                return
+            ext, _, _ = self._defapps_row
+            cfg = self.baseline_mgr.config
+            locked = cfg.get("locked_defaults", {}) or {}
+            if ext not in locked:
+                self._defapps_status.config(text=f"{ext} 当前未锁定", fg=self.C["warn"])
+                return
+            del locked[ext]
+            self.baseline_mgr.save_config()
+            try:
+                self.baseline_mgr.update_extension(ext, reason="默认应用解锁")
+            except Exception as e:
+                logger.warning(f"默认应用解锁 {ext} 基准同步失败: {e}")
+            self._append_log(f"默认应用解除锁定: {ext}", "info")
+            self._defapps_status.config(text=f"已解除 {ext} 锁定，恢复普通保护", fg=self.C["success"])
+            self._defapps_load()
+        except Exception as e:
+            self._defapps_status.config(text=f"解锁失败: {e}", fg=self.C["error"])
+
+    def _defapps_goto_detail(self, _e=None):
+        """跳转到扩展名页并预填锁定工具扩展名"""
+        try:
+            sel = self._defapps_tv.selection()
+            ext = None
+            if sel:
+                vals = self._defapps_tv.item(sel[0], "values")
+                if vals:
+                    ext = vals[0]
+            if not ext and self._defapps_row:
+                ext = self._defapps_row[0]
+            if not ext:
+                return
+            self._show_page("exts")
+            self._lock_ext_var.set(ext)
+            self._lock_ext_refresh_info()
         except Exception:
             pass
 
-    def _diag_save(self):
-        """保存诊断报告为 txt 文件"""
+    def _defapps_export(self):
+        """导出默认应用清单为 CSV"""
         try:
-            txt = self._diag_text.get("1.0", tk.END).strip()
-            if not txt:
-                return
             path = filedialog.asksaveasfilename(
-                title="保存诊断报告", defaultextension=".txt",
-                initialfile="opst-diag-report.txt",
-                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+                title="导出默认应用清单", defaultextension=".csv",
+                initialfile="opst-default-apps.csv",
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
             if not path:
                 return
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(txt + "\n")
-            messagebox.showinfo(APP_NAME, f"诊断报告已保存到:\n{path}")
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            bl = self.baseline_mgr.baseline
+            rows = []
+            for ext in sorted(bl.keys()):
+                try:
+                    prog = get_prog_id(ext) or ""
+                except Exception:
+                    prog = ""
+                name = "系统默认"
+                path_s = ""
+                if prog:
+                    name, _ = identify_tamperer(prog)
+                    name = name or prog
+                    path_s = progid_to_path(prog)
+                rows.append(f'"{ext}","{name}","{path_s}","{"已锁定" if ext in locked else ""}"')
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write("\ufeff扩展名,默认程序,程序路径,锁定状态\n")
+                f.write("\n".join(rows))
+            messagebox.showinfo(APP_NAME, f"已导出 {len(rows)} 条默认应用清单到:\n{path}")
         except Exception as e:
-            messagebox.showerror(APP_NAME, f"保存失败: {e}")
+            messagebox.showerror(APP_NAME, f"导出失败: {e}")
 
     # =====================================================================
     # 页面：配置与备份 —— 一键备份/恢复配置、导出导入黑白名单
