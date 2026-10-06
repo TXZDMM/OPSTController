@@ -131,6 +131,9 @@ from tkinter import ttk, scrolledtext, messagebox
 # ============================================================
 APP_NAME = "OPSTcontroller"
 APP_VERSION = "0.8.1"
+# 更新检查地址：update.json 结构 {"version":"0.9.0","url":"下载链接","notes":"更新说明"}
+# 可在配置文件中用 update_url 字段覆盖
+UPDATE_URL = "https://raw.githubusercontent.com/TXZDMM/OPSTController/main/update.json"
 MUTEX_NAME = "OPSTcontroller_SingleInstance_Mutex"
 EXIT_EVENT_NAME = "OPSTcontroller_Exit_Event"
 SHOW_EVENT_NAME = "OPSTcontroller_Show_Window_Event"
@@ -5659,6 +5662,7 @@ class MainWindow:
             ("深层扫描", self._manual_deep_scan, "default"),
             ("全局锁定 / 解除锁定", self._toggle_global_lock, "default"),
             ("历史版本管理", self._show_history, "default"),
+            ("检查更新", self._check_update, "primary"),
         ]:
             # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
             op_btns.append(self._mk_button(op_col, text, cmd, kind=kind))
@@ -6250,6 +6254,35 @@ class MainWindow:
         status_bar.pack_propagate(False)
         tk.Label(status_bar, textvariable=self._repair_status_var, font=("微软雅黑", 9),
                  fg=self.C["text2"], bg=self.C["card"], anchor="w").pack(fill="x", padx=12)
+
+        # ============ 一键检测常见异常（提权 / 基准 / 锁定） ============
+        qc = tk.LabelFrame(content, text="", bg=self.C["card"], bd=0,
+                           highlightbackground=self.C["card_border"], highlightthickness=1)
+        qc.pack(fill="x", pady=(6, 2))
+        qhead = tk.Frame(qc, bg=self.C["card"])
+        qhead.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(qhead, text="一键检测常见异常（提权 / 基准 / 锁定）",
+                 font=("微软雅黑", 10, "bold"),
+                 fg=self.C["text"], bg=self.C["card"]).pack(side="left")
+        self._mk_button(qhead, "开始检测", self._repair_quick_check,
+                        kind="primary").pack(side="right")
+        self._qc_labels = {}
+        qc_body = tk.Frame(qc, bg=self.C["card"])
+        qc_body.pack(fill="x", padx=12, pady=(2, 10))
+        for key, title in [("priv", "提权与监控"), ("base", "基准完整性"),
+                           ("lock", "锁定有效性")]:
+            row = tk.Frame(qc_body, bg=self.C["card"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=title, width=12, font=("微软雅黑", 9),
+                     fg=self.C["text2"], bg=self.C["card"],
+                     anchor="w").pack(side="left")
+            st = tk.Label(row, text="未检测", font=("微软雅黑", 9),
+                          fg=self.C["text3"], bg=self.C["card"], anchor="w")
+            st.pack(side="left", fill="x", expand=True)
+            btn = self._mk_button(row, "修复", None, kind="default")
+            btn.configure(state="disabled")
+            btn.pack(side="right")
+            self._qc_labels[key] = (st, btn)
 
         def make_button(parent_w, text, command, height=1):
             # 统一配色：全部使用标准深色按钮风格（取消多色混杂）
@@ -7978,6 +8011,186 @@ class MainWindow:
         self._repair_set_status("全部修复完成！")
         self._append_log("=== 一键全部修复完成 ===", "success")
         messagebox.showinfo(APP_NAME, "一键全部修复完成！\n\n全部 20 项状态已重置，保护已恢复正常。")
+
+    # ---------- 一键检测常见异常（提权 / 基准 / 锁定） ----------
+    def _repair_quick_check(self):
+        """一键检测三类常见异常（后台线程，避免阻塞 UI）"""
+        try:
+            self._repair_status_var.set("正在检测…（提权 / 基准 / 锁定）")
+            import threading
+            threading.Thread(target=self._qc_scan, daemon=True).start()
+        except Exception as e:
+            self._repair_status_var.set(f"检测启动失败: {e}")
+
+    def _qc_scan(self):
+        """后台：扫描三类异常状态"""
+        res = {}
+        # 1) 提权与监控
+        try:
+            priv_txt = getattr(self, "ti_status", "") or ""
+            priv_ok = bool(priv_txt) and "未知" not in priv_txt
+            mon = getattr(self, "monitor", None)
+            mon_ok = bool(mon) and getattr(mon, "is_alive", lambda: False)()
+            res["priv"] = priv_ok and mon_ok
+        except Exception:
+            res["priv"] = False
+        # 2) 基准完整性
+        try:
+            bl = self.baseline_mgr.baseline
+            res["base"] = bool(bl) and len(bl) >= 50
+        except Exception:
+            res["base"] = False
+        # 3) 锁定有效性
+        try:
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            bad = []
+            for ext, target in locked.items():
+                try:
+                    cur = get_prog_id(ext)
+                    if not cur or cur.lower() != str(target).lower():
+                        bad.append(ext)
+                except Exception:
+                    bad.append(ext)
+            res["lock"] = (not bad, bad)
+        except Exception:
+            locked = self.baseline_mgr.config.get("locked_defaults", {}) or {}
+            res["lock"] = (False, list(locked.keys()))
+        self.root.after(0, lambda: self._qc_apply(res))
+
+    def _qc_apply(self, res):
+        """主线程：更新检测结果 UI"""
+        try:
+            texts = {"priv": (lambda ok: ("TI/SYSTEM 提权 + 监控运行正常"
+                                          if ok else "提权未生效或监控线程未运行")),
+                     "base": (lambda ok: ("基准完整（%d 项）" % len(self.baseline_mgr.baseline)
+                                          if ok else "基准缺失或过少（需重建）"))}
+            for key in ("priv", "base"):
+                st, btn = self._qc_labels[key]
+                ok = res[key]
+                st.config(text=texts[key](ok), fg=(self.C["success"] if ok else self.C["error"]))
+                btn.configure(state="disabled" if ok else "normal",
+                              command=lambda k=key: self._repair_quick_fix(k, None))
+            st, btn = self._qc_labels["lock"]
+            ok, bad = res["lock"]
+            if ok:
+                st.config(text="全部锁定项与当前关联一致", fg=self.C["success"])
+            else:
+                shown = "、".join(bad[:6]) + ("…" if len(bad) > 6 else "")
+                st.config(text=f"{len(bad)} 项锁定失效：{shown}", fg=self.C["error"])
+            btn.configure(state="disabled" if ok else "normal",
+                          command=lambda: self._repair_quick_fix("lock", bad))
+            self._repair_status_var.set(
+                "检测完成：异常项右侧「修复」按钮一键处理；修复后自动复查")
+        except Exception as e:
+            self._repair_status_var.set(f"检测结果展示失败: {e}")
+
+    def _repair_quick_fix(self, key, bad=None):
+        """执行对应异常的一键修复"""
+        try:
+            if key == "priv":
+                self._restart_monitor("异常修复：监控重启")
+                self._repair_status_var.set(
+                    "已重启监控线程；若界面权限仍非 TI/SYSTEM，请重启程序重新提权")
+            elif key == "base":
+                self._repair_status_var.set("正在重建基准（当前方式）…")
+                self.root.update_idletasks()
+                self.baseline_mgr.create_baseline(mode="current")
+                self._repair_status_var.set(
+                    f"基准已重建（{len(self.baseline_mgr.baseline)} 项）")
+                self._append_log("异常修复：重建基准完成", "info")
+            elif key == "lock" and bad:
+                cfg = self.baseline_mgr.config
+                locked = cfg.get("locked_defaults", {}) or {}
+                n_ok = 0
+                for ext in bad:
+                    target = locked.get(ext)
+                    if not target:
+                        continue
+                    try:
+                        _ok, fcnt, det = self._recover_locked(ext, target)
+                        if not fcnt:
+                            n_ok += 1
+                    except Exception as e:
+                        logger.warning(f"恢复锁定 {ext} 失败: {e}")
+                self._repair_status_var.set(f"已恢复 {n_ok}/{len(bad)} 项失效锁定")
+                self._append_log(f"异常修复：恢复失效锁定 {n_ok}/{len(bad)}", "info")
+            self._repair_quick_check()  # 自动复查
+        except Exception as e:
+            self._repair_status_var.set(f"修复失败: {e}")
+
+    # ---------- 更新检查 ----------
+    def _check_update(self, manual=False):
+        """检查更新（后台线程联网）：读取 update.json 对比版本号，
+        有新版时提示并可跳转下载页；失败/无新版静默（手动检查时给出反馈）"""
+        try:
+            def _worker():
+                try:
+                    import urllib.request
+                    import json as _json
+                    cfg = self.baseline_mgr.config
+                    url = str(cfg.get("update_url") or UPDATE_URL).strip()
+                    req = urllib.request.Request(url, headers={"User-Agent": "%s/%s" % (APP_NAME, APP_VERSION)})
+                    with urllib.request.urlopen(req, timeout=6) as r:
+                        data = _json.loads(r.read().decode("utf-8"))
+                    remote = str(data.get("version", "")).strip()
+                    if not remote:
+                        self.root.after(0, lambda: self._update_result(None, "更新清单缺少版本号", manual))
+                        return
+                    new = self._version_gt(remote, APP_VERSION)
+                    if new:
+                        self.root.after(0, lambda: self._update_result(
+                            (remote, str(data.get("url", "")), str(data.get("notes", ""))),
+                            None, manual))
+                    else:
+                        self.root.after(0, lambda: self._update_result(False, None, manual))
+                except Exception as e:
+                    self.root.after(0, lambda: self._update_result(None, str(e), manual))
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as e:
+            if manual:
+                messagebox.showwarning(APP_NAME, f"检查更新失败: {e}")
+
+    @staticmethod
+    def _version_gt(a, b):
+        """版本号比较：'0.9.2' > '0.8.1' → True"""
+        import re
+        try:
+            def _v(s):
+                return [int(x) for x in re.findall(r"\d+", s)][:4]
+            return _v(a) > _v(b)
+        except Exception:
+            return False
+
+    def _update_result(self, info, err, manual):
+        """主线程处理更新检查结果"""
+        try:
+            if err:
+                if manual:
+                    messagebox.showwarning(
+                        APP_NAME,
+                        f"无法检查更新：\n{err}\n\n（离线或无更新源时可忽略；"
+                        f"更新地址可在配置 update_url 中调整）")
+                return
+            if info is False:
+                if manual:
+                    messagebox.showinfo(APP_NAME, f"当前已是最新版本（v{APP_VERSION}）")
+                return
+            if not info:
+                return
+            remote, url, notes = info
+            msg = (f"发现新版本 v{remote}（当前 v{APP_VERSION}）\n\n"
+                   f"更新内容：\n{notes or '（未提供）'}\n\n"
+                   f"点击「确定」前往下载页面。")
+            if messagebox.showinfo(APP_NAME, msg) and url:
+                try:
+                    import webbrowser
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+            self._append_log(f"发现新版本 v{remote}，可前往下载", "info")
+        except Exception:
+            pass
 
     def _build_page_history(self, parent):
         """页面：防护记录 —— 历史更改审计（统计概览 + 可搜索记录表格 + 详情/状态检查）"""
