@@ -22,3 +22,7 @@ none_check*.txt
 build_out.txt
 zip_out.txt
 dep*.txt
+td*.txt
+btn_test_report.txt
+dep_*.txt
+rc*.txt
