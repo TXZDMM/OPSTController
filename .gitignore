@@ -58,3 +58,5 @@ OPSTController_root/debug_*.txt
 
 OPSTController_root/diag*.txt
 OPSTController_root/shot_log.txt
+
+OPSTController_root/ui1*_out.txt

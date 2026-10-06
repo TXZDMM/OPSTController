@@ -1,5 +1,0 @@
-flow_refresh handler: True
-flow_refresh call ok
-scroll sync ok: 7/7
-switch settings ok, flow handler still callable
-refresh after switch ok
