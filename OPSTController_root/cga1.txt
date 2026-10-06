@@ -1,4 +1,0 @@
-KEY=原神 | loc=E:\miHoYo Launcher | cmd=E:\miHoYo Launcher\launcher.exe --uninstall_game=hk4e_cn
-KEY=云·原神 | loc=C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame | cmd=C:\Users\TXZDM\AppData\Local\Programs\miHoYo\GenshinImpactCloudGame\Launcher.exe --uninstall
-=== 常见路径检查 ===
-DIR: E:\miHoYo Launcher

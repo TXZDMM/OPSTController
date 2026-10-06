@@ -1,7 +1,0 @@
-proc=1
-2026-10-06 17:57:38 [INFO] .m4a:更新基准:成功:用户单次同意|2026-10-06 17:57:38 [INFO] .m4a:更改:已同意:用户单次同意
-dest_ready=yes
-=== AweSun 检查 ===
-AweSun.exe exists size=152244160
-SunloginService=Stopped start=Automatic
-binPath="E:\APPS\txzdmm_app\AweSun\AweSun.exe" --mod=service
