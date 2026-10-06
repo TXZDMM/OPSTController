@@ -4996,10 +4996,11 @@ class MainWindow:
 
         self._nav_buttons = {}
         self._nav_sel = None
-        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 默认应用 / 配置与备份 / 设置（日志页保留但不再出现在导航，从设置页进入）
+        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 默认应用 / 配置与备份 / 设置 / 关于（日志页保留但不再出现在导航，从设置页进入）
         for key, text in [("home", "状态"), ("exts", "扩展名"),
                           ("history", "防护记录"), ("tools", "异常修复"),
-                          ("defapps", "默认应用"), ("config", "配置与备份"), ("settings", "设置")]:
+                          ("defapps", "默认应用"), ("config", "配置与备份"),
+                          ("settings", "设置"), ("about", "关于")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -5029,6 +5030,7 @@ class MainWindow:
         self._build_page_config(content)
         self._build_page_log(content)
         self._build_page_settings(content)
+        self._build_page_about(content)
         # 所有页面构建完成后，统一收集可滚动小项并绑定“单击激活”滚轮逻辑
         # （延迟收集：小项控件在 _mk_scroll_container 之后才创建）
         for _name, _page in self._pages.items():
@@ -6534,8 +6536,7 @@ class MainWindow:
              [("user", "普通用户"), ("administrator", "管理员"), ("system", "SYSTEM"), ("t", "TI(推荐)")]))
         tk.Label(body3, text="低于 TI 权限可能导致 UserChoice 恢复失败，保护不生效",
                  font=("微软雅黑", 8), fg=dark["error"], bg=dark["card"], anchor="w").pack(fill="x")
-        _row(body3, "记录级别:", lambda r: self._mk_radio_row(r, audit_level_var,
-             [("minimal", "极简"), ("normal", "普通"), ("detailed", "详细"), ("full", "完整")]))
+        # （记录级别已移至「关于」大菜单：audit_level_var 仍在设置页定义，供自动保存绑定使用）
         a_ops = tk.Frame(body3, bg=dark["card"])
         a_ops.pack(fill="x", pady=6)
         self._mk_button(a_ops, "导出审计日志", self._export_audit_log, small_adapt=True).pack(side="left", padx=(0, 8))
@@ -6803,13 +6804,6 @@ class MainWindow:
         self._mk_button(h_ops, "清空记录", clear_history, width=8, small_adapt=True).pack(side="left")
         refresh_history()
 
-        # ===== 节6：关于 =====
-        sec6, body6 = self._mk_card(content, "关于")
-        tk.Label(body6, text=f"{APP_NAME} v{APP_VERSION}\n阻止第三方软件私自篡改文件扩展名默认打开方式\n保护7项注册表位置，支持基准校准与自动恢复",
-                 font=("微软雅黑", 9), fg=dark["text2"], bg=dark["card"], anchor="w", justify="left").pack(fill="x")
-        tk.Label(body6, text="GitHub: https://github.com/TXZDMM/OPSTController",
-                 font=("微软雅黑", 9), fg=dark["info"], bg=dark["card"], anchor="w").pack(fill="x", pady=(4, 0))
-
         # ===== 底部：设置自动保存（无保存/放弃按钮，修改即生效） =====
         save_row = tk.Frame(content, bg=dark["bg"])
         save_row.pack(fill="x", pady=10)
@@ -6889,6 +6883,8 @@ class MainWindow:
         # ===== 自动保存绑定：任何设置修改立即写入文件（无需点击保存） =====
         self._auto_save_fn = save_settings
         self._settings_page_ready = True
+        # 记录级别变量共享给「关于」大菜单（同一变量，双向同步自动保存）
+        self._audit_level_var = audit_level_var
         for _v in (autostart_var, popup_var, clearlog_var, nokill_var,
                    batch_popup_var, mode_var, audit_level_var):
             _v.trace_add("write", lambda *a: save_settings(ask_perm=False))
@@ -6898,6 +6894,93 @@ class MainWindow:
 
         tk.Label(save_row, text="* 设置修改后自动保存；运行权限更改需重启生效", font=("微软雅黑", 8),
                  fg=dark["text3"], bg=dark["bg"]).pack(side="right")
+
+    # ---------- 页面：关于（新增大菜单：程序信息/保护级别/识别库/许可） ----------
+    def _build_page_about(self, parent):
+        page = tk.Frame(parent, bg=self.C["bg"])
+        self._pages["about"] = page
+        self._mk_page_header(page, "关于", "程序信息、保护级别与许可说明")
+
+        content = tk.Frame(page, bg=self.C["bg"])
+        content.pack(fill="x", padx=24, pady=(8, 0))
+
+        # ===== 节1：程序信息 =====
+        sec1, body1 = self._mk_card(content, "程序信息")
+        tk.Label(body1, text=f"{APP_NAME} v{APP_VERSION}",
+                 font=("微软雅黑", 12, "bold"), fg=self.C["text"],
+                 bg=self.C["card"], anchor="w").pack(fill="x")
+        tk.Label(body1, text="扩展名保护卫士：阻止第三方软件私自篡改文件扩展名默认打开方式。\n"
+                             "保护扩展名相关的注册表键（HKCR/HKCU UserChoice/HKLM 等 7 项位置），\n"
+                             "支持基准校准、自动恢复与全局锁定。",
+                 font=("微软雅黑", 9), fg=self.C["text2"], bg=self.C["card"],
+                 anchor="w", justify="left").pack(fill="x", pady=(6, 0))
+        tk.Label(body1, text="项目主页：https://github.com/TXZDMM/OPSTController",
+                 font=("微软雅黑", 9), fg=self.C["info"], bg=self.C["card"],
+                 anchor="w", cursor="hand2").pack(fill="x", pady=(4, 0))
+
+        # ===== 节2：保护级别（记录级别） =====
+        sec2, body2 = self._mk_card(content, "保护级别")
+        tk.Label(body2, text="记录级别：决定审计日志中每条记录的详细程度",
+                 font=("微软雅黑", 9, "bold"), fg=self.C["text2"],
+                 bg=self.C["card"], anchor="w").pack(fill="x", pady=(0, 4))
+        audit_var = getattr(self, "_audit_level_var", None)
+        if audit_var is None:
+            audit_var = tk.StringVar(value=self.baseline_mgr.config.get("audit_level", "normal"))
+            self._audit_level_var = audit_var
+        _row_about = tk.Frame(body2, bg=self.C["card"])
+        _row_about.pack(fill="x", pady=4)
+        self._mk_radio_row(_row_about, audit_var,
+                           [("minimal", "极简"), ("normal", "普通"),
+                            ("detailed", "详细"), ("full", "完整")])
+        level_desc = {
+            "minimal": "仅记录扩展名、操作与结果（最少信息）",
+            "normal": "追加篡改程序名称（默认推荐）",
+            "detailed": "追加进程路径与命令行",
+            "full": "追加数字签名、父进程与完整注册表新旧值",
+        }
+        tk.Label(body2, text=level_desc.get(audit_var.get(), ""),
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
+                 anchor="w", justify="left").pack(fill="x", pady=(2, 0))
+        audit_var.trace_add("write", lambda *a: self._on_audit_level_changed(audit_var, level_desc, body2))
+
+        # ===== 节3：软件识别库 =====
+        sec3, body3 = self._mk_card(content, "软件识别库")
+        _lib_count = 0
+        try:
+            _lib_path = os.path.join(self.baseline_mgr.data_dir, "program_names.json")
+            if os.path.exists(_lib_path):
+                with open(_lib_path, "r", encoding="utf-8") as _f:
+                    _lib_data = json.load(_f)
+                    if isinstance(_lib_data, dict):
+                        _lib_count = len(_lib_data)
+        except Exception:
+            pass
+        tk.Label(body3, text=f"内置识别库：{_lib_count} 条程序名称记录",
+                 font=("微软雅黑", 9, "bold"), fg=self.C["text2"],
+                 bg=self.C["card"], anchor="w").pack(fill="x")
+        tk.Label(body3, text="当检测到关联被修改时，程序会解析篡改者的进程名/ProgId，\n"
+                             "从识别库中匹配主流软件（浏览器、播放器、办公软件等），\n"
+                             "直接告诉你「是哪款软件改了什么」。",
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
+                 anchor="w", justify="left").pack(fill="x", pady=(4, 0))
+
+        # ===== 节4：许可说明 =====
+        sec4, body4 = self._mk_card(content, "许可")
+        tk.Label(body4, text="本项目以开源形式发布，禁止用于任何非法用途。\n"
+                             "程序内置数字签名，首次运行时请允许通过（已签名可信）。\n"
+                             "使用 TI(TrustedInstaller) 特权需要系统管理员支持。",
+                 font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
+                 anchor="w", justify="left").pack(fill="x")
+
+    def _on_audit_level_changed(self, var, desc_map, body):
+        """关于页记录级别变化：更新说明文字（自动保存由设置页共享变量 trace 完成）"""
+        try:
+            for w in body.winfo_children():
+                if isinstance(w, tk.Label) and w.cget("text") in desc_map.values():
+                    w.config(text=desc_map.get(var.get(), ""))
+        except Exception:
+            pass
+
     def _mk_radio_row(self, parent, var, options):
         """创建横向单选按钮组，返回容器 frame"""
         frame = tk.Frame(parent, bg=self.C["card"])
