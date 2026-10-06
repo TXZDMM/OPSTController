@@ -5629,14 +5629,7 @@ class MainWindow:
         self.btn_selfprotect = btn_selfprotect
         self._protect_btns += [btn_start, btn_stop, btn_selfprotect]
         self._flow_wrap(cb, self._protect_btns, gap=8)
-        # 保护级说明（BH0-BH5 + 红名单），原扩展名页迁入状态页"保护状态"分类
-        protect_info = (
-            "BH0：仅检测不阻止 | BH1：自动恢复基准值并验证 | BH2：ACL锁定UserChoice键\n"
-            "BH3：ACL锁定+System完整性标签 | BH4：强锁定+进程降为Untrusted\n"
-            "BH5：强锁定+Untrusted降权+NtSuspendProcess冻结 | 红名单：进程永久拒绝注册表操作"
-        )
-        tk.Label(cb, text=protect_info, font=("微软雅黑", 8), fg=self.C["text3"],
-                 bg=self.C["card"], anchor="w", justify="left").pack(fill="x", pady=(8, 0))
+        # （BH0-BH5 保护级说明已移至「关于」大菜单，状态页保持简洁）
 
         # 实时状态提示行：弹窗开关 / 弹窗暂停 / 全局锁定 / 保护已停止 等关键状态
         # （避免用户误以为"弹窗开着"或"保护还在跑"）
@@ -6942,6 +6935,16 @@ class MainWindow:
                  font=("微软雅黑", 8), fg=self.C["text3"], bg=self.C["card"],
                  anchor="w", justify="left").pack(fill="x", pady=(2, 0))
         audit_var.trace_add("write", lambda *a: self._on_audit_level_changed(audit_var, level_desc, body2))
+
+        # 保护级说明（BH0-BH5 + 红名单），自状态页迁入
+        bh_info = (
+            "保护强度分级（针对注册表键的防护深度）：\n"
+            "BH0：仅检测不阻止 | BH1：自动恢复基准值并验证 | BH2：ACL锁定UserChoice键\n"
+            "BH3：ACL锁定 + System完整性标签 | BH4：强锁定 + 进程降为Untrusted\n"
+            "BH5：强锁定 + Untrusted降权 + NtSuspendProcess冻结 | 红名单：进程永久拒绝注册表操作"
+        )
+        tk.Label(body2, text=bh_info, font=("微软雅黑", 8), fg=self.C["text3"],
+                 bg=self.C["card"], anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
         # ===== 节3：软件识别库 =====
         sec3, body3 = self._mk_card(content, "软件识别库")
@@ -8858,13 +8861,16 @@ class MainWindow:
         self._defapps_btns = {}
         specs = [("lockcur", "锁定为当前程序", self._defapps_lock_current, "primary"),
                  ("lockoth", "锁定为其他程序", self._defapps_lock_other, ""),
-                 ("unlock", "解除锁定", self._defapps_unlock, ""),
-                 ("goto", "打开扩展名页", self._defapps_goto_detail, "")]
+                 ("unlock", "解除锁定", self._defapps_unlock, "")]
         for k, t, cmd, kind in specs:
             b = self._mk_button(ops, t, cmd, kind=kind)
             b.configure(state="disabled")
             b.pack(side="left", padx=(0, 8))
             self._defapps_btns[k] = b
+        # 「打开扩展名页」是跳转按钮：始终可用，不依赖选中行
+        b = self._mk_button(ops, "打开扩展名页", self._defapps_goto_detail, kind="")
+        b.pack(side="left", padx=(0, 8))
+        self._defapps_btns["goto"] = b
         self._defapps_row = None
         self._defapps_status = tk.Label(cb, text="加载中…", font=("微软雅黑", 9),
                                         fg=self.C["text3"], bg=self.C["card"],
@@ -9073,11 +9079,13 @@ class MainWindow:
                     ext = vals[0]
             if not ext and self._defapps_row:
                 ext = self._defapps_row[0]
-            if not ext:
-                return
             self._show_page("exts")
-            self._lock_ext_var.set(ext)
-            self._lock_ext_refresh_info()
+            if ext:
+                self._lock_ext_var.set(ext)
+                self._lock_ext_refresh_info()
+            else:
+                # 无选中行也正常跳转（不预填扩展名）
+                pass
         except Exception:
             pass
 
