@@ -3638,6 +3638,7 @@ class ProtectionEngine:
             # （软件卸载/未安装的残留键视为正常状态，不报无效关联——
             #  用户原则：当前没有实际关联=正常；只有“关联被改成其他程序”才算异常）
             continue
+        return issues
 
 
 # ============================================================
@@ -4289,6 +4290,30 @@ class MonitorThread(threading.Thread):
         self._last_lock_stats_log = 0
         self._notify_extra_seconds = 0  # 批量篡改触发后弹窗额外时长（秒）
         self.last_cycle_ts = time.time()  # 监控周期心跳：主线程看门狗据此检测监控线程是否卡死/死亡
+        # 程序自身写入吸收：恢复/写回会触发注册表通知→再次被检测为"更改"，
+        # 且 UWP 动态 ProgId 会被系统归一成新 ProgId、Hash 必然重算——
+        # 若不做吸收，同一篡改会在恢复后反复弹窗（"我就改了一次，弹这么多"）。
+        # _self_write_until: ext -> 程序写入后的吸收窗口到期时间
+        # _absorbed: ext -> (time, mismatch签名)，恢复被系统归一后的已接受状态（值再变才清除）
+        self._self_write_until = {}
+        self._absorbed = {}
+
+    def mark_self_write(self, ext, seconds=30):
+        """标记程序自身刚写入过该扩展名：写入会触发注册表通知，且系统可能随后
+        归一 UWP 动态 ProgId / 重算 Hash。30 秒吸收窗口内检测到"不一致"且值未再
+        变化时视为程序写入后果，静默吸收（不弹窗、不恢复、不累计篡改计数）。"""
+        try:
+            self._self_write_until[ext] = time.time() + seconds
+        except Exception:
+            pass
+
+    @staticmethod
+    def _mismatch_signature(mismatches):
+        """将不一致列表压缩为稳定签名（key+基准值+当前值），用于吸收状态比对"""
+        try:
+            return tuple(sorted((k, str(b), str(c)) for k, b, c, _ in mismatches))
+        except Exception:
+            return None
 
     def _verify_hkcu_mapping(self):
         """运行时验证HKCU是否正确映射到用户配置单元，失败则自动重映射。
@@ -4537,6 +4562,22 @@ class MonitorThread(threading.Thread):
             checked_count += 1
             mismatches = self.engine.check_extension(ext)
             if mismatches:
+                # 程序自身写入吸收：恢复/写回后系统归一 UWP 动态 ProgId、重算 Hash，
+                # 检测结果与基准仍不一致。只要"不一致签名"未再变化，即视为程序写入
+                # 的后果而非新篡改——静默吸收，避免"改一次弹多次"的恢复循环。
+                try:
+                    _sig = self._mismatch_signature(mismatches)
+                    _abs = self._absorbed.get(ext)
+                    if _sig is not None and _abs is not None and _abs[1] == _sig:
+                        # 值未再变化：仍是程序恢复/系统归一后的已接受状态
+                        continue
+                    if time.time() < self._self_write_until.get(ext, 0):
+                        # 程序刚写入（吸收窗口内）：吸收当前签名，不弹窗不恢复
+                        if _sig is not None:
+                            self._absorbed[ext] = (time.time(), _sig)
+                        continue
+                except Exception:
+                    pass
                 if in_grace:
                     # 宽限期：只日志记录，不恢复，每个扩展名只报一次
                     if ext not in self._grace_logged_exts:
@@ -4678,6 +4719,14 @@ class MonitorThread(threading.Thread):
             else:
                 log_event(ext, "恢复", "二次检测",
                           "独立进程派发失败/超时(已由本地读回验证兜底)")
+        except Exception:
+            pass
+
+        # 程序自身写入标记：恢复写注册表会触发通知→再次被检测为"更改"。
+        # 标记吸收窗口，_monitor_cycle 对未再变化的同一签名静默吸收，
+        # 消除"恢复→系统归一→又弹窗→又恢复"的循环（UWP 动态 ProgId / Hash 重算）。
+        try:
+            self.mark_self_write(ext)
         except Exception:
             pass
 
@@ -7099,11 +7148,16 @@ class MainWindow:
             ("备份当前基准", self._backup_current, "default"),
             ("深层扫描", self._manual_deep_scan, "default"),
             ("历史版本管理", self._show_history, "default"),
-            # 手动检查更新：必须传 manual=True，否则失败/无新版时静默无反馈
-            ("检查更新", lambda: self._check_update(True), "primary"),
         ]:
             # 不设固定宽度：按钮按文字自适应大小（窗口缩放时自动伸展/换行）
             op_btns.append(self._mk_button(op_col, text, cmd, kind=kind))
+        # 检查更新：更新源为 GitHub raw（国内常不可达/需代理），禁用入口避免误导
+        _chk_btn = self._mk_button(op_col, "检查更新", lambda: self._check_update(True), kind="primary")
+        try:
+            _chk_btn.config(state="disabled")
+        except Exception:
+            pass
+        op_btns.append(_chk_btn)
         # 全局锁定按钮单独创建：文字随锁定状态实时切换（避免固定文字误导）
         self._global_lock_btn = self._mk_button(
             op_col, "全局锁定", self._toggle_global_lock, kind="default")
@@ -7910,6 +7964,22 @@ class MainWindow:
         self.log_text.tag_config("success", foreground="#6CCB5F")
 
     # ---------- 页面：设置 ----------
+    def _merge_keep_cfg(self, lb, cfg_list):
+        """合并 Listbox 当前内容与 config 已有白名单：保留弹窗「永久关闭」新增但页面尚未刷新的项，
+        避免保存设置时把新加的白名单冲掉。去重保序。"""
+        seen = []
+        try:
+            for i in range(lb.size()):
+                v = lb.get(i)
+                if v and v not in seen:
+                    seen.append(v)
+        except Exception:
+            pass
+        for v in (cfg_list or []):
+            if v and v not in seen:
+                seen.append(v)
+        return seen
+
     def _build_page_settings(self, parent):
         page = tk.Frame(parent, bg=self.C["bg"])
         self._pages["settings"] = page
@@ -8031,6 +8101,8 @@ class MainWindow:
         ext_listbox.pack(side="left", fill="x", expand=True)
         tk.Scrollbar(ext_list_frame, orient="vertical", command=ext_listbox.yview).pack(side="right", fill="y")
         ext_listbox.config(yscrollcommand=lambda *a: None)
+        # 保存 Listbox 引用：弹窗「永久关闭」新增白名单后实时刷新（不重建页面）
+        self._wl_ext_listbox = ext_listbox
         for e in cfg.get("whitelist_exts", []):
             ext_listbox.insert(tk.END, e)
         ext_entry = tk.Entry(body4, font=("微软雅黑", 9), bg=dark["btn"], fg=dark["text"],
@@ -8179,7 +8251,7 @@ class MainWindow:
             cfg["clear_log_on_start"] = clearlog_var.get()
             cfg["persistent_no_kill"] = nokill_var.get()
             cfg["batch_popup_mode"] = batch_popup_var.get()
-            cfg["whitelist_exts"] = [ext_listbox.get(i) for i in range(ext_listbox.size())]
+            cfg["whitelist_exts"] = _merge_keep_cfg(ext_listbox, cfg.get("whitelist_exts", []))
             cfg["whitelist_programs"] = [prog_listbox.get(i) for i in range(prog_listbox.size())]
             self.baseline_mgr.save_config()
             if autostart_var.get():
@@ -9189,6 +9261,12 @@ class MainWindow:
                 refresh_file_associations()
                 recover_count += 1
                 self._append_log(f"  {ext}: 已恢复", "success" if f==0 else "warn")
+                # 程序恢复会触发注册表通知：标记吸收窗口，避免同一篡改被恢复动作再次弹窗
+                if self.monitor is not None:
+                    try:
+                        self.monitor.mark_self_write(ext)
+                    except Exception:
+                        pass
             elif act == "update":
                 self.baseline_mgr.update_extension(ext)
                 update_count += 1
@@ -11305,6 +11383,15 @@ class MainWindow:
                     self.baseline_mgr.save_config()  # 白名单属 config，必须落盘 config.json
                 except Exception:
                     pass
+                # 实时刷新设置页白名单 Listbox（若已构建），不重建页面
+                try:
+                    lb = getattr(self, "_wl_ext_listbox", None)
+                    if lb is not None and lb.winfo_exists():
+                        existing = [lb.get(i).lower() for i in range(lb.size())]
+                        if extension.lower() not in existing:
+                            lb.insert(tk.END, extension)
+                except Exception:
+                    pass
             self.baseline_mgr.update_extension(extension)
             self.engine.clear_cooldown(extension)
             self.engine.allowed_this_cycle.add(extension)
@@ -11322,7 +11409,7 @@ class MainWindow:
                 except Exception as e:
                     self._append_log(f"解除 {extension} 锁定失败: {e}", "error")
             self.change_history.add_record(extension, tamperer_name, changes_for_history, "forever_ignore", "success")
-            self._append_log(f"已永久关闭 {extension} 的弹窗提醒（已加入白名单，不再阻止）。如需恢复，请到「异常修复→白名单」删除该扩展名", "warn")
+            self._append_log(f"已永久关闭 {extension} 的弹窗提醒（已加入白名单，不再阻止）。如需恢复，请到「设置→白名单」删除该扩展名", "warn")
             log_event(extension, "更改", "永久忽略", "用户永久关闭弹窗")
 
         # 单个模式：如果当前有活动弹窗，加入队列不立即显示
