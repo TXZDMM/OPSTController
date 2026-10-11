@@ -72,3 +72,23 @@ OPSTController_root/ui17*.py
 OPSTController_root/ui15_*.txt
 OPSTController_root/ui16_*.txt
 OPSTController_root/ui17_*.txt
+
+# 2026-10-11 调试/诊断残留（本机路径与调试输出，不推送）
+OPSTController_root/*_out.txt
+OPSTController_root/*_out2.txt
+OPSTController_root/check_lock_now.py
+OPSTController_root/chk_*.py
+OPSTController_root/chk_*_out.txt
+OPSTController_root/deploy_*.py
+OPSTController_root/enum_handles.py
+OPSTController_root/find_*.py
+OPSTController_root/fve_verify.py
+OPSTController_root/mk_test*.txt
+OPSTController_root/prochit*
+OPSTController_root/qer_test.txt
+OPSTController_root/rm_lock.py
+OPSTController_root/ti_del.txt
+OPSTController_root/tl_out.txt
+OPSTController_root/wmic_out.txt
+OPSTController_root/wtest*.txt
+OPSTController_root/*_test.txt

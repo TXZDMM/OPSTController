@@ -36,6 +36,7 @@ import posixpath
 import traceback
 import re
 import io
+import base64
 from ctypes import wintypes
 from tkinter import filedialog
 
@@ -422,6 +423,7 @@ REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
 REG_NOTIFY_CHANGE_SECURITY = 0x00000008
 REG_NOTIFY_FILTER = (REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET
                      | REG_NOTIFY_CHANGE_ATTRIBUTES | REG_NOTIFY_CHANGE_SECURITY)
+KEY_NOTIFY = 0x0010  # 注册表通知权限（winreg 模块未提供，自行定义）
 
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0x00000000
@@ -522,6 +524,31 @@ ROOT_MAP = {
 ROOT_NAME_MAP = {v: k for k, v in ROOT_MAP.items()}
 
 
+def _key_root_name(key):
+    """按保护项 key 名推导注册表根名称（key 名是权威，不依赖句柄反查）。
+    快照/检测/恢复统一使用：HKCU 在 TI 提权重映射后全局句柄变化，
+    ROOT_NAME_MAP 反查（模块加载时缓存旧句柄）会失效导致 root 存成 '?'，
+    使 hkcu_ext / userchoice_* / hkcu_command 成为保护盲区（12:15:13 日志
+    "HKCU打开命令:root无效(?)" 实锤）。"""
+    if key.startswith("hkcr"):
+        return "HKCR"
+    if key.startswith("hkcu") or key.startswith("userchoice"):
+        return "HKCU"
+    if key.startswith("hklm"):
+        return "HKLM"
+    return None
+
+
+def _get_root(root_name):
+    """返回当前有效的注册表根句柄。
+    HKCU 必须用全局 HKCU 变量（remap 后指向当前用户配置单元），
+    不能用 ROOT_MAP 里模块加载时缓存的原始句柄——TI 进程下 HKEY_CURRENT_USER
+    是 SYSTEM 的配置单元，读到的用户关联全是假值。"""
+    if root_name == "HKCU":
+        return HKCU
+    return ROOT_MAP.get(root_name)
+
+
 def reg_open(root, path, access=KEY_READ_64):
     """打开注册表项，失败返回 None"""
     try:
@@ -542,6 +569,212 @@ def reg_read_value(root, path, name=""):
         return None, None
     finally:
         winreg.CloseKey(key)
+
+
+def reg_probe_value(root, path, name=""):
+    """读取注册表值并区分三种状态（解决"空值"与"读取失败"混淆）：
+    返回 (value, type, present, read_ok)：
+      present=True            → 值存在（read_ok 恒为 True）
+      present=False, read_ok=True  → 键可访问但该值不存在（正常空，删除语义）
+      present=False, read_ok=False → 键无法打开（权限不足/重映射盲区：
+                                    检测应跳过避免误报，恢复应警告无法确认）
+    普通 reg_read_value 把"键不存在"与"打开失败"都折叠为 (None, None)，
+    在基准快照中无法区分"本来就该空"和"读不到"。"""
+    try:
+        key = winreg.OpenKey(root, path, 0, KEY_READ_64)
+    except FileNotFoundError:
+        return None, None, False, True
+    except OSError:
+        return None, None, False, False
+    try:
+        val, typ = winreg.QueryValueEx(key, name)
+        return val, typ, True, True
+    except OSError:
+        return None, None, False, True
+    finally:
+        winreg.CloseKey(key)
+
+
+# ============================================================
+# 交互用户只读验证子进程（TI 降权二次检测）
+# ============================================================
+_VERIFY_THROTTLE = {}        # ext -> 上次派发时间戳（秒）
+_VERIFY_THROTTLE_SEC = 3.0   # 同一扩展名 3 秒内不重复派发
+
+def _spawn_interactive_process(cmdline, cwd=None, timeout=10.0):
+    """以当前交互登录用户的 token 创建进程（TI/SYSTEM 权限下降权到用户），
+    捕获其 stdout。返回 (exitcode, stdout_text)；失败返回 None。
+    用途：让"用户视角"的独立进程做只读二次检测——TI 进程读 HKCU 走
+    重映射句柄、HKCR 走合并视图，与交互用户实际所见存在视角差异；
+    以用户 token 启动的子进程读到的才是用户真正看到的关联状态。"""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        userenv = ctypes.WinDLL("userenv", use_last_error=True)
+
+        class SECURITY_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("nLength", wintypes.DWORD),
+                        ("lpSecurityDescriptor", wintypes.LPVOID),
+                        ("bInheritHandle", wintypes.BOOL)]
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+                ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+                ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+                ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+                ("hStdInput", wintypes.HANDLE), ("hStdOutput", wintypes.HANDLE),
+                ("hStdError", wintypes.HANDLE),
+            ]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                        ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+        # === 必须显式声明 argtypes/restype ===
+        # ctypes 未声明时按默认 c_int（32位）传参，64 位系统上 HANDLE（8字节）
+        # 会被高位截断，API 必然失败/崩溃（静态语法检查发现不了，真机才暴露）。
+        _PH = ctypes.POINTER(wintypes.HANDLE)
+        _PSA = ctypes.POINTER(SECURITY_ATTRIBUTES)
+        _PSI = ctypes.POINTER(STARTUPINFOW)
+        _PPI = ctypes.POINTER(PROCESS_INFORMATION)
+        _PDW = ctypes.POINTER(wintypes.DWORD)
+
+        user32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+        user32.WTSGetActiveConsoleSessionId.argtypes = []
+        wtsapi32.WTSQueryUserToken.restype = wintypes.BOOL
+        wtsapi32.WTSQueryUserToken.argtypes = [wintypes.DWORD, _PH]
+        userenv.CreateEnvironmentBlock.restype = wintypes.BOOL
+        userenv.CreateEnvironmentBlock.argtypes = [ctypes.POINTER(wintypes.LPVOID),
+                                                   wintypes.HANDLE, wintypes.BOOL]
+        userenv.DestroyEnvironmentBlock.restype = wintypes.BOOL
+        userenv.DestroyEnvironmentBlock.argtypes = [wintypes.LPVOID]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+        kernel32.CreatePipe.argtypes = [_PH, _PH, _PSA, wintypes.DWORD]
+        kernel32.SetHandleInformation.restype = wintypes.BOOL
+        kernel32.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, _PDW]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                      _PDW, wintypes.LPVOID]
+        advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+        advapi32.CreateProcessAsUserW.argtypes = [
+            wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.LPVOID,
+            wintypes.LPVOID, wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.LPCWSTR, _PSI, _PPI]
+
+        STARTF_USESTDHANDLES = 0x00000100
+        CREATE_UNICODE_ENVIRONMENT = 0x00000400
+        CREATE_NO_WINDOW = 0x08000000
+        HANDLE_FLAG_INHERIT = 0x1
+        WAIT_TIMEOUT = 0x00000102
+
+        # 1) 交互会话 → 用户 token（需 SE_TCB，TI/SYSTEM 具备）
+        session_id = user32.WTSGetActiveConsoleSessionId()
+        if session_id == 0xFFFFFFFF:
+            return None
+        h_token = wintypes.HANDLE()
+        if not wtsapi32.WTSQueryUserToken(session_id, ctypes.byref(h_token)):
+            return None
+        # 2) 用户环境块
+        env_block = wintypes.LPVOID()
+        env_ok = bool(userenv.CreateEnvironmentBlock(ctypes.byref(env_block), h_token, False))
+        # 3) 匿名管道（子进程 stdout）
+        sa = SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+        sa.bInheritHandle = True
+        h_read = wintypes.HANDLE()
+        h_write = wintypes.HANDLE()
+        if not kernel32.CreatePipe(ctypes.byref(h_read), ctypes.byref(h_write), ctypes.byref(sa), 0):
+            kernel32.CloseHandle(h_token)
+            if env_ok:
+                userenv.DestroyEnvironmentBlock(env_block)
+            return None
+        kernel32.SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0)  # 读端不继承
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        si.dwFlags = STARTF_USESTDHANDLES
+        si.hStdOutput = h_write
+        si.hStdError = h_write
+        pi = PROCESS_INFORMATION()
+        # lpCommandLine 必须传可写 buffer：CreateProcessW 系列（Unicode 版）
+        # 允许修改该字符串，ctypes 直接传 Python str 会生成只读 buffer，
+        # 可能导致进程创建失败（Access violation）。用 create_unicode_buffer 包装。
+        cmd_buf = ctypes.create_unicode_buffer(cmdline)
+        ok = advapi32.CreateProcessAsUserW(
+            h_token, None, cmd_buf, None, None, True,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            env_block if env_ok else None, cwd, ctypes.byref(si), ctypes.byref(pi))
+        kernel32.CloseHandle(h_write)
+        if not ok:
+            kernel32.CloseHandle(h_read)
+            kernel32.CloseHandle(h_token)
+            if env_ok:
+                userenv.DestroyEnvironmentBlock(env_block)
+            return None
+        # 4) 等待子进程结束（超时终止）
+        wr = kernel32.WaitForSingleObject(pi.hProcess, int(timeout * 1000))
+        if wr == WAIT_TIMEOUT:
+            kernel32.TerminateProcess(pi.hProcess, 1)
+        # 5) 读管道剩余输出
+        out = b""
+        buf = ctypes.create_string_buffer(8192)
+        while True:
+            n = wintypes.DWORD(0)
+            if not kernel32.ReadFile(h_read, buf, 8192, ctypes.byref(n), None):
+                break
+            if n.value == 0:
+                break
+            out += buf.raw[:n.value]
+        exit_code = wintypes.DWORD(0)
+        kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(exit_code))
+        # 6) 清理
+        kernel32.CloseHandle(h_read)
+        kernel32.CloseHandle(pi.hThread)
+        kernel32.CloseHandle(pi.hProcess)
+        kernel32.CloseHandle(h_token)
+        if env_ok:
+            userenv.DestroyEnvironmentBlock(env_block)
+        return int(exit_code.value), out.decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+
+
+def interactive_verify_ext(ext):
+    """派发独立进程（交互用户权限）对扩展名 7 位置做只读二次检测。
+    返回 (ok, report)：report 为 dict（key -> {value,type,present,read_ok}）
+    或 None（派发失败/超时）。3 秒节流避免持续篡改时高频派发。"""
+    global _VERIFY_THROTTLE
+    now = time.time()
+    if now - _VERIFY_THROTTLE.get(ext, 0) < _VERIFY_THROTTLE_SEC:
+        return None
+    _VERIFY_THROTTLE[ext] = now
+    try:
+        exe = sys.executable
+        cmd = f'"{exe}" --verify-ext "{ext}"'
+        cwd = os.path.dirname(exe) if getattr(sys, "frozen", False) else None
+        res = _spawn_interactive_process(cmd, cwd=cwd)
+        if not res:
+            return None
+        code, text = res
+        if code != 0 or not text:
+            return None
+        return True, json.loads(text)
+    except Exception:
+        return None
 
 
 def reg_write_value(root, path, name, value, typ):
@@ -1106,6 +1339,680 @@ def _generate_default_program_names():
         ("Shimo", "石墨文档"), ("石墨文档", "石墨文档"), ("Youdao", "有道"),
         ("有道", "有道"), ("YoudaoDict", "有道词典"), ("NeteaseMail", "网易邮箱"),
         ("MailMaster", "网易邮箱大师"), ("Foxmail", "Foxmail"),
+        # ===== Adobe 全家桶 (60) =====
+        ("Photoshop", "Adobe Photoshop"), ("PhotoshopCC", "Adobe Photoshop"), ("Ps", "Photoshop"),
+        ("Illustrator", "Adobe Illustrator"), ("Ai", "Illustrator"), ("InDesign", "Adobe InDesign"),
+        ("Premiere", "Adobe Premiere"), ("PremierePro", "Adobe Premiere Pro"), ("Pr", "Premiere Pro"),
+        ("AfterEffects", "Adobe After Effects"), ("AfterFX", "After Effects"), ("Ae", "After Effects"),
+        ("Lightroom", "Adobe Lightroom"), ("LightroomClassic", "Lightroom Classic"), ("Lr", "Lightroom"),
+        ("CameraRaw", "Camera Raw"), ("Bridge", "Adobe Bridge"), ("Audition", "Adobe Audition"),
+        ("Animate", "Adobe Animate"), ("Flash", "Adobe Flash Player"), ("Dreamweaver", "Dreamweaver"),
+        ("Acrobat", "Adobe Acrobat"), ("AcrobatReader", "Adobe Acrobat Reader"), ("AcroRd32", "Adobe Reader"),
+        ("InCopy", "Adobe InCopy"), ("Substance", "Adobe Substance"), ("Dimension", "Adobe Dimension"),
+        ("Fresco", "Adobe Fresco"), ("PremiereRush", "Adobe Premiere Rush"), ("XD", "Adobe XD"),
+        ("Firefly", "Adobe Firefly"), ("CharacterAnimator", "Character Animator"), ("MediaEncoder", "Media Encoder"),
+        ("Prelude", "Adobe Prelude"), ("SpeedGrade", "Adobe SpeedGrade"), ("MediaServer", "Adobe Media Server"),
+        ("AdobeUpdate", "Adobe 更新"), ("CreativeCloud", "Adobe Creative Cloud"), ("AdobeCreativeCloud", "Adobe Creative Cloud"),
+        ("AdobeAIR", "Adobe AIR"), ("Shockwave", "Shockwave Player"), ("AdobeFlashPlayer", "Flash Player"),
+        ("AdobeReaderDC", "Acrobat Reader DC"), ("PhotoshopElements", "Photoshop Elements"), ("PremiereElements", "Premiere Elements"),
+        ("AuditionCC", "Audition CC"), ("AnimateCC", "Animate CC"), ("Fuse", "Adobe Fuse"),
+        ("Spark", "Adobe Spark"), ("Aero", "Adobe Aero"), ("Capture", "Adobe Capture"),
+        ("Scout", "Adobe Scout"), ("ExtendScript", "ExtendScript"), ("ExtensionManager", "Adobe Extension Manager"),
+        ("DownloadManager", "Adobe Download Manager"), ("ApplicationManager", "Adobe Application Manager"),
+        ("CSS", "Adobe CSS"), ("AdobeDigitalPublishing", "Digital Publishing"), ("Behance", "Behance"),
+        # ===== Microsoft 全家桶 (70) =====
+        ("WinWord", "Microsoft Word"), ("Word.Application", "Microsoft Word"), ("WordPad", "写字板"),
+        ("Excel.Application", "Microsoft Excel"), ("Excel", "Microsoft Excel"), ("PowerPoint.Application", "PowerPoint"),
+        ("PowerPoint", "Microsoft PowerPoint"), ("Outlook.Application", "Microsoft Outlook"), ("Outlook", "Outlook"),
+        ("OneNote", "OneNote"), ("OneNote.Application", "OneNote"), ("Access.Application", "Microsoft Access"),
+        ("Access", "Microsoft Access"), ("Publisher.Application", "Microsoft Publisher"), ("Publisher", "Publisher"),
+        ("Visio.Application", "Microsoft Visio"), ("Visio", "Microsoft Visio"), ("Project.Application", "Microsoft Project"),
+        ("MSProject", "Microsoft Project"), ("Lync", "Skype for Business"), ("SkypeForBusiness", "Skype for Business"),
+        ("Teams", "Microsoft Teams"), ("MS-Teams", "Microsoft Teams"), ("OfficeClickToRun", "Office Click-to-Run"),
+        ("OICE", "Office"), ("MSOffice", "Microsoft Office"), ("Office16", "Microsoft Office 2016"),
+        ("Wordpad", "写字板"), ("WindowsMediaPlayer", "Windows Media Player"), ("wmplayer", "Windows Media Player"),
+        ("MSPaint", "画图"), ("mspaint", "画图"), ("Paint3D", "画图3D"),
+        ("MicrosoftEdge", "Microsoft Edge"), ("msedge", "Microsoft Edge"), ("EdgeView2", "Edge"),
+        ("InternetExplorer", "Internet Explorer"), ("iexplore", "Internet Explorer"), ("IEXPLORE", "Internet Explorer"),
+        ("WindowsExplorer", "资源管理器"), ("explorer", "资源管理器"), ("FileExplorer", "文件资源管理器"),
+        ("WinRAR", "WinRAR"), ("7-Zip", "7-Zip"), ("7zFM", "7-Zip"),
+        ("NotepadApplication", "记事本"), ("NotePad", "记事本"), ("WindowsTerminal", "Windows Terminal"),
+        ("PowerShell", "PowerShell"), ("powershell", "PowerShell"), ("Cmd", "命令提示符"),
+        ("cmd", "命令提示符"), ("ControlPanel", "控制面板"), ("MSConfig", "系统配置"),
+        ("Regedit", "注册表编辑器"), ("regedit", "注册表编辑器"), ("TaskManager", "任务管理器"),
+        ("Taskmgr", "任务管理器"), ("Calc", "计算器"), ("Calculator", "计算器"),
+        ("SnippingTool", "截图工具"), ("截图工具", "截图工具"), ("Clipchamp", "Clipchamp"),
+        ("WindowsPhotos", "照片"), ("Microsoft.Photos", "照片"), ("WindowsCamera", "相机"),
+        ("Groove", "Groove音乐"), ("WindowsMail", "邮件"), ("MicrosoftToDo", "微软待办"),
+        ("StickyNotes", "便笺"), ("WindowsMaps", "地图"), ("Solitaire", "纸牌"),
+        # ===== JetBrains 全家桶 (30) =====
+        ("IntelliJ", "IntelliJ IDEA"), ("IntelliJIDEA", "IntelliJ IDEA"), ("IDEA", "IntelliJ IDEA"),
+        ("PyCharm", "PyCharm"), ("pycharm", "PyCharm"), ("WebStorm", "WebStorm"),
+        ("PhpStorm", "PhpStorm"), ("GoLand", "GoLand"), ("RubyMine", "RubyMine"),
+        ("CLion", "CLion"), ("DataGrip", "DataGrip"), ("Rider", "Rider"),
+        ("AppCode", "AppCode"), ("ReSharper", "ReSharper"), ("dotCover", "dotCover"),
+        ("dotTrace", "dotTrace"), ("dotMemory", "dotMemory"), ("TeamCity", "TeamCity"),
+        ("YouTrack", "YouTrack"), ("Space", "JetBrains Space"), ("Fleet", "JetBrains Fleet"),
+        ("Aqua", "JetBrains Aqua"), ("Gateway", "JetBrains Gateway"), ("JetBrainsToolbox", "JetBrains Toolbox"),
+        ("Toolbox", "JetBrains Toolbox"), ("androidstudio", "Android Studio"), ("AndroidStudio", "Android Studio"),
+        ("Xcode", "Xcode"), ("xcode", "Xcode"), ("SwiftPlaygrounds", "Swift Playgrounds"),
+        # ===== Google 应用 (40) =====
+        ("GoogleChrome", "Google Chrome"), ("chrome", "Google Chrome"), ("Chrome", "Google Chrome"),
+        ("GoogleDrive", "Google Drive"), ("GDrive", "Google Drive"), ("GooglePhotos", "Google 相册"),
+        ("GoogleDocs", "Google Docs"), ("GoogleSheets", "Google Sheets"), ("GoogleSlides", "Google Slides"),
+        ("GoogleMeet", "Google Meet"), ("GoogleCalendar", "Google 日历"), ("GoogleMaps", "Google 地图"),
+        ("GoogleEarthPro", "Google 地球"), ("GoogleTranslate", "Google 翻译"), ("GoogleKeep", "Google Keep"),
+        ("GooglePlayGames", "Google Play Games"), ("GoogleUpdate", "Google 更新"), ("GoogleUpdater", "Google 更新"),
+        ("GoogleDriveFileStream", "Google Drive 桌面版"), ("GoogleBackupAndSync", "Google 备份与同步"),
+        ("GoogleJapaneseInput", "谷歌日文输入法"), ("GooglePinyin", "谷歌拼音"), ("GoogleJapaneseIME", "谷歌日文输入法"),
+        ("GoogleHangouts", "Hangouts"), ("Gmail", "Gmail"), ("Youtube", "YouTube"),
+        ("YouTube", "YouTube"), ("GoogleChromeEnterprise", "Chrome 企业版"), ("GoogleEarthPlugin", "Google Earth 插件"),
+        ("AndroidFileTransfer", "Android 文件传输"), ("GoogleFusionTables", "Fusion Tables"),
+        ("GoogleAppLauncher", "Google 应用启动器"), ("GoogleDriveSync", "Google Drive 同步"),
+        ("GoogleVoice", "Google Voice"), ("GoogleContacts", "Google 通讯录"), ("GoogleTasks", "Google Tasks"),
+        ("GoogleMessages", "Google Messages"), ("GoogleClassroom", "Google Classroom"), ("GoogleJamboard", "Google Jamboard"),
+        # ===== Apple 应用 (35) =====
+        ("iTunes", "iTunes"), ("AppleMusic", "Apple Music"), ("AppleTV", "Apple TV"),
+        ("iCloud", "iCloud"), ("iCloudDrive", "iCloud 云盘"), ("iCloudPhotos", "iCloud 照片"),
+        ("iCloudBackup", "iCloud 备份"), ("iCloudMail", "iCloud 邮件"), ("iCloudKeychain", "iCloud 钥匙串"),
+        ("iBooks", "iBooks"), ("AppleBooks", "Apple Books"), ("GarageBand", "GarageBand"),
+        ("LogicPro", "Logic Pro"), ("FinalCut", "Final Cut Pro"), ("FinalCutPro", "Final Cut Pro"),
+        ("Motion", "Apple Motion"), ("Compressor", "Apple Compressor"), ("MainStage", "MainStage"),
+        ("Safari", "Safari"), ("safari", "Safari"), ("iMovie", "iMovie"),
+        ("Pages", "Apple Pages"), ("Numbers", "Apple Numbers"), ("Keynote", "Apple Keynote"),
+        ("AppleConfigurator", "Apple Configurator"), ("AppleSoftwareUpdate", "Apple 软件更新"), ("AppleMobileDevice", "Apple 移动设备"),
+        ("Bonjour", "Bonjour"), ("iTunesHelper", "iTunes 助手"), ("AirPort", "AirPort"),
+        ("QuickTimePlayer", "QuickTime Player"), ("Photos", "Apple 照片"), ("Mail", "Apple 邮件"),
+        ("Calendar", "Apple 日历"), ("Notes", "Apple 备忘录"),
+        # ===== 数据库/服务器工具 (50) =====
+        ("MySQL", "MySQL"), ("mysql", "MySQL"), ("MySQLWorkbench", "MySQL Workbench"),
+        ("MariaDB", "MariaDB"), ("PostgreSQL", "PostgreSQL"), ("pgAdmin", "pgAdmin"),
+        ("SQLServer", "Microsoft SQL Server"), ("MSSQL", "SQL Server"), ("SqlServerManagement", "SSMS"),
+        ("SQLite", "SQLite"), ("SQLiteStudio", "SQLiteStudio"), ("DBBrowser", "DB Browser for SQLite"),
+        ("Oracle", "Oracle"), ("OracleDatabase", "Oracle 数据库"), ("SQLDeveloper", "Oracle SQL Developer"),
+        ("MongoDB", "MongoDB"), ("mongodb", "MongoDB"), ("MongoCompass", "MongoDB Compass"),
+        ("Redis", "Redis"), ("redis", "Redis"), ("Memcached", "Memcached"),
+        ("Cassandra", "Cassandra"), ("ElasticSearch", "Elasticsearch"), ("Kibana", "Kibana"),
+        ("ClickHouse", "ClickHouse"), ("InfluxDB", "InfluxDB"), ("Neo4j", "Neo4j"),
+        ("Firebird", "Firebird"), ("H2Database", "H2"), ("Derby", "Apache Derby"),
+        ("Nginx", "Nginx"), ("nginx", "Nginx"), ("Apache", "Apache HTTP Server"),
+        ("httpd", "Apache"), ("IIS", "Internet Information Services"), ("Tomcat", "Apache Tomcat"),
+        ("Jetty", "Jetty"), ("WildFly", "WildFly"), ("Node", "Node.js"),
+        ("nodejs", "Node.js"), ("DockerDesktop", "Docker Desktop"), ("Kubernetes", "Kubernetes"),
+        ("kubectl", "kubectl"), ("Minikube", "Minikube"), ("Vagrant", "Vagrant"),
+        ("Postman", "Postman"), ("postman", "Postman"), ("Insomnia", "Insomnia"),
+        ("Navicat", "Navicat"), ("navicat", "Navicat"), ("DBeaver", "DBeaver"),
+        # ===== 开发工具 (80) =====
+        ("Git", "Git"), ("git", "Git"), ("GitHubDesktop", "GitHub Desktop"),
+        ("GitHub", "GitHub"), ("GitLab", "GitLab"), ("GitKraken", "GitKraken"),
+        ("SourceTree", "SourceTree"), ("TortoiseGit", "TortoiseGit"), ("TortoiseSVN", "TortoiseSVN"),
+        ("SVN", "Subversion"), ("Subversion", "Subversion"), ("Mercurial", "Mercurial"),
+        ("Fork", "Fork"), ("Sourcetree", "SourceTree"), ("Gitee", "Gitee"), ("码云", "Gitee"),
+        ("VisualStudio", "Visual Studio"), ("VisualStudioCode", "Visual Studio Code"), ("vscode", "VS Code"),
+        ("VSCodium", "VSCodium"), ("Codeblocks", "Code::Blocks"), ("CodeBlocks", "Code::Blocks"),
+        ("Eclipse", "Eclipse"), ("eclipse", "Eclipse"), ("NetBeans", "NetBeans"),
+        ("Dev-Cpp", "Dev-C++"), ("DevCpp", "Dev-C++"), ("CodeLite", "CodeLite"),
+        ("QtCreator", "Qt Creator"), ("qtcreator", "Qt Creator"), ("Qt", "Qt"),
+        ("CMake", "CMake"), ("cmake", "CMake"), ("Make", "GNU Make"),
+        ("GCC", "GCC"), ("MinGW", "MinGW"), ("MSYS2", "MSYS2"),
+        ("Cygwin", "Cygwin"), ("WSL2", "WSL"), ("WSL", "WSL"),
+        ("Python", "Python"), ("python", "Python"), ("Anaconda", "Anaconda"),
+        ("conda", "Conda"), ("Miniconda", "Miniconda"), ("Jupyter", "Jupyter"),
+        ("jupyter", "Jupyter"), ("Spyder", "Spyder"), ("RStudio", "RStudio"),
+        ("R-Studio", "R"), ("RProject", "R"), ("Matlab", "MATLAB"),
+        ("MATLAB", "MATLAB"), ("Octave", "GNU Octave"), ("Scilab", "Scilab"),
+        ("Wolfram", "Wolfram Mathematica"), ("Mathematica", "Mathematica"), ("Maple", "Maple"),
+        ("Stata", "Stata"), ("SPSS", "IBM SPSS"), ("spss", "SPSS"),
+        ("SAS", "SAS"), ("Minitab", "Minitab"), ("OriginLab", "Origin"),
+        ("origin", "Origin"), ("Gnuplot", "gnuplot"), ("GraphPad", "GraphPad Prism"),
+        ("LaTeX", "LaTeX"), ("TeXworks", "TeXworks"), ("TexStudio", "TeXstudio"),
+        ("MiKTeX", "MiKTeX"), ("TeXLive", "TeX Live"), ("Proteus", "Proteus"),
+        ("Keil", "Keil"), ("KeilMDK", "Keil MDK"), ("IAR", "IAR Embedded Workbench"),
+        ("Altium", "Altium Designer"), ("AltiumDesigner", "Altium Designer"), ("KiCad", "KiCad"),
+        ("EasyEDA", "立创EDA"), ("立创EDA", "立创EDA"), ("LTspice", "LTspice"),
+        ("Multisim", "Multisim"), ("LabVIEW", "LabVIEW"), ("HBuilder", "HBuilder"),
+        ("HBuilderX", "HBuilderX"), ("微信开发者工具", "微信开发者工具"), ("wechatdevtools", "微信开发者工具"),
+        ("NetSupport", "NetSupport"), ("BeyondCompare", "Beyond Compare"), ("BeyondCompare4", "Beyond Compare"),
+        ("WinMerge", "WinMerge"), ("Meld", "Meld"), ("diff", "Diff"),
+        # ===== 浏览器/网络 (60) =====
+        ("Firefox", "Mozilla Firefox"), ("firefox", "Mozilla Firefox"), ("MozillaFirefox", "Mozilla Firefox"),
+        ("Waterfox", "Waterfox"), ("Palemoon", "Pale Moon"), ("PaleMoon", "Pale Moon"),
+        ("Opera", "Opera"), ("opera", "Opera"), ("OperaGX", "Opera GX"),
+        ("Vivaldi", "Vivaldi"), ("Brave", "Brave"), ("brave", "Brave"),
+        ("TorBrowser", "Tor Browser"), ("Tor", "Tor"), ("Maxthon", "傲游浏览器"),
+        ("傲游", "傲游浏览器"), ("SogouExplorer", "搜狗浏览器"), ("搜狗浏览器", "搜狗浏览器"),
+        ("QQBrowser", "QQ浏览器"), ("QQ浏览器", "QQ浏览器"), ("TencentBrowser", "QQ浏览器"),
+        ("360Chrome", "360安全浏览器"), ("360安全浏览器", "360安全浏览器"), ("360SE", "360安全浏览器"),
+        ("360", "360"), ("LBBROWSER", "猎豹浏览器"), ("猎豹", "猎豹浏览器"),
+        ("Cheetah", "猎豹浏览器"), ("Liebao", "猎豹浏览器"), ("2345Explorer", "2345加速浏览器"),
+        ("2345", "2345"), ("115Browser", "115浏览器"), ("XBrowser", "X浏览器"),
+        ("Via", "Via浏览器"), ("YandexBrowser", "Yandex 浏览器"), ("Yandex", "Yandex"),
+        ("SamsungInternet", "三星浏览器"), ("DuckDuckGo", "DuckDuckGo"), ("Whale", "Whale 浏览器"),
+        ("CentBrowser", "CentBrowser"), ("ChromePlus", "ChromePlus"), ("SRWareIron", "Iron"),
+        ("ComodoDragon", "Comodo Dragon"), ("AvastSecureBrowser", "Avast Secure Browser"),
+        ("AVGBrowser", "AVG Browser"), ("AVG", "AVG"), ("NortonSecure", "Norton Secure"),
+        ("FirefoxDeveloper", "Firefox Developer Edition"), ("FirefoxNightly", "Firefox Nightly"),
+        ("FirefoxESR", "Firefox ESR"), ("ChromeCanary", "Chrome Canary"), ("ChromeDev", "Chrome Dev"),
+        ("ChromeBeta", "Chrome Beta"), ("EdgeCanary", "Edge Canary"), ("EdgeBeta", "Edge Beta"),
+        ("Flock", "Flock"), ("RockMelt", "RockMelt"), ("SeaMonkey", "SeaMonkey"),
+        ("Konqueror", "Konqueror"), ("Lynx", "Lynx"), ("Epiphany", "Epiphany"),
+        ("NetCaptor", "NetCaptor"), ("GreenBrowser", "GreenBrowser"), ("360极速浏览器", "360极速浏览器"),
+        ("360ChromeX", "360极速浏览器X"), ("搜狗高速浏览器", "搜狗高速浏览器"), ("QQ浏览器极速版", "QQ浏览器"),
+        # ===== 输入法 (40) =====
+        ("SogouPinyin", "搜狗输入法"), ("搜狗拼音", "搜狗输入法"), ("SogouInput", "搜狗输入法"),
+        ("搜狗五笔", "搜狗五笔"), ("SgInput", "搜狗输入法"), ("QQPinyin", "QQ拼音输入法"),
+        ("QQ输入法", "QQ输入法"), ("QQWubi", "QQ五笔"), ("QQ五笔", "QQ五笔"),
+        ("BaiduPinyin", "百度输入法"), ("百度输入法", "百度输入法"), ("BaiduIme", "百度输入法"),
+        ("BaiduType", "百度输入法"), ("MicrosoftPinyin", "微软拼音"), ("微软拼音", "微软拼音"),
+        ("MicrosoftWubi", "微软五笔"), ("微软五笔", "微软五笔"), ("iFlyIME", "讯飞输入法"),
+        ("讯飞输入法", "讯飞输入法"), ("讯飞语音", "讯飞语音"), ("iFlytek", "科大讯飞"),
+        ("手心输入法", "手心输入法"), ("ShouXin", "手心输入法"), ("XunfeiIME", "讯飞输入法"),
+        ("华宇拼音", "华宇拼音"), ("紫光输入法", "紫光输入法"), ("unispim", "紫光输入法"),
+        ("GooglePinyinInput", "谷歌拼音"), ("谷歌拼音", "谷歌拼音"), ("谷歌输入法", "谷歌输入法"),
+        ("BingInput", "必应输入法"), ("必应输入法", "必应输入法"), ("Rime", "小狼毫输入法"),
+        ("小狼毫", "小狼毫输入法"), ("Weasel", "小狼毫"), ("QQWubiInput", "QQ五笔"),
+        ("速成输入法", "速成输入法"), ("仓颉输入法", "仓颉输入法"), ("郑码输入法", "郑码"),
+        ("五笔输入法", "五笔输入法"), ("极点五笔", "极点五笔"), ("万能五笔", "万能五笔"),
+        # ===== 安全/杀毒 (70) =====
+        ("360Safe", "360安全卫士"), ("360安全卫士", "360安全卫士"), ("360", "360安全卫士"),
+        ("360Tray", "360安全卫士"), ("360sd", "360杀毒"), ("360杀毒", "360杀毒"),
+        ("360TotalSecurity", "360国际版"), ("360InternetSecurity", "360国际版"),
+        ("QQPCMgr", "腾讯电脑管家"), ("腾讯电脑管家", "腾讯电脑管家"), ("电脑管家", "腾讯电脑管家"),
+        ("QQPCMgrSetup", "腾讯电脑管家"), ("Huorong", "火绒安全"), ("火绒", "火绒安全"),
+        ("HipsTray", "火绒安全"), ("火绒剑", "火绒剑"), ("Wsys", "火绒"),
+        ("Kaspersky", "卡巴斯基"), ("卡巴斯基", "卡巴斯基"), ("KIS", "卡巴斯基"),
+        ("KasperskyAntiVirus", "卡巴斯基反病毒"), ("avast", "Avast"), ("Avast", "Avast"),
+        ("AvastAntivirus", "Avast"), ("AVG", "AVG"), ("avgtray", "AVG"),
+        ("Norton", "诺顿"), ("诺顿", "诺顿"), ("NortonSecurity", "Norton Security"),
+        ("Symantec", "赛门铁克"), ("赛门铁克", "赛门铁克"), ("NIS", "Norton Internet Security"),
+        ("McAfee", "迈克菲"), ("迈克菲", "迈克菲"), ("McAfeeAntivirus", "McAfee"),
+        ("ESET", "ESET"), ("ESETNOD32", "ESET NOD32"), ("NOD32", "NOD32"),
+        ("Bitdefender", "比特梵德"), ("BitDefender", "Bitdefender"), ("GData", "G Data"),
+        ("Avira", "小红伞"), ("小红伞", "小红伞"), ("AviraAntivirus", "Avira"),
+        ("TrendMicro", "趋势科技"), ("趋势科技", "趋势科技"), ("Panda", "熊猫卫士"),
+        ("PandaAntivirus", "Panda"), ("F-Secure", "F-Secure"), ("FSecure", "F-Secure"),
+        ("Malwarebytes", "Malwarebytes"), ("malwarebytes", "Malwarebytes"), ("Webroot", "Webroot"),
+        ("Comodo", "Comodo"), ("ComodoInternetSecurity", "Comodo"), ("Defender", "Windows Defender"),
+        ("WindowsDefender", "Windows Defender"), ("MpCmdRun", "Windows Defender"), ("DefenderUI", "Defender"),
+        ("ZoneAlarm", "ZoneAlarm"), ("Spybot", "Spybot"), ("AdAware", "Ad-Aware"),
+        ("SuperAntiSpyware", "SuperAntiSpyware"), ("HijackThis", "HijackThis"), ("CCleaner", "CCleaner"),
+        ("ccleaner", "CCleaner"), ("Piriform", "Piriform"), ("GlaryUtilities", "Glary Utilities"),
+        ("WiseCleaner", "Wise 清理"), ("Wise", "Wise"), ("DismPlus", "Dism++"),
+        ("DISMPlus", "Dism++"), ("Dism", "Dism"), ("NTLite", "NTLite"),
+        ("MSMG", "MSMG Toolkit"), ("Hiren", "Hiren's BootCD"),
+        # ===== 压缩工具 (35) =====
+        ("BandiZip", "Bandizip"), ("Bandizip", "Bandizip"), ("360压缩", "360压缩"),
+        ("360zip", "360压缩"), ("好压", "好压"), ("2345好压", "好压"),
+        ("HaoZip", "好压"), ("快压", "快压"), ("KuaiZip", "快压"),
+        ("快解压", "快解压"), ("WinZip", "WinZip"), ("winzip", "WinZip"),
+        ("PeaZip", "PeaZip"), ("peazip", "PeaZip"), ("IZArc", "IZArc"),
+        ("7z", "7-Zip"), ("ZIP", "ZIP"), ("WinMount", "WinMount"),
+        ("DaemonTools", "Daemon Tools"), ("DaemonToolsLite", "Daemon Tools Lite"), ("Alcohol", "Alcohol 120%"),
+        ("UltraISO", "UltraISO"), ("ultraiso", "UltraISO"), ("PowerISO", "PowerISO"),
+        ("PowerIso", "PowerISO"), ("MagicISO", "MagicISO"), ("AnyToISO", "AnyToISO"),
+        ("ISOBurner", "ISO Burner"), ("ImgBurn", "ImgBurn"), ("InfraRecorder", "InfraRecorder"),
+        ("Nero", "Nero"), ("nero", "Nero"), ("Ashampoo", "Ashampoo"),
+        ("WinCDEmu", "WinCDEmu"), ("VirtualCloneDrive", "Virtual CloneDrive"),
+        # ===== 音视频播放 (60) =====
+        ("MPC-HC", "MPC-HC"), ("mpc-hc", "MPC-HC"), ("MPC-BE", "MPC-BE"),
+        ("mpc-be", "MPC-BE"), ("PotPlayerMini", "PotPlayer"), ("SMPlayer", "SMPlayer"),
+        ("KMPlayer64", "KMPlayer"), ("KMPlayer32", "KMPlayer"), ("DaumPotPlayer", "PotPlayer"),
+        ("HoneyView", "HoneyView"), ("XnView", "XnView"), ("IrfanView", "IrfanView"),
+        ("ACDSee", "ACDSee"), ("acdsee", "ACDSee"), ("ACDSeePhotoStudio", "ACDSee"),
+        ("FastStone", "FastStone Image Viewer"), ("FastStoneViewer", "FastStone"), ("Honeycam", "Honeycam"),
+        ("Bandicam", "Bandicam"), ("bandicam", "Bandicam"), ("OBS", "OBS Studio"),
+        ("OBSStudio", "OBS Studio"), ("obs", "OBS"), ("ScreenRecorder", "屏幕录制"),
+        ("XSplit", "XSplit"), ("Dxtory", "Dxtory"), ("Fraps", "Fraps"),
+        ("fraps", "Fraps"), ("VLCPlayer", "VLC"), ("Videolan", "VideoLAN"),
+        ("Kodi", "Kodi"), ("kodi", "Kodi"), ("Plex", "Plex"),
+        ("Emby", "Emby"), ("Jellyfin", "Jellyfin"), ("PowerDVD", "PowerDVD"),
+        ("TotalMedia", "TotalMedia"), ("WinDVD", "WinDVD"), ("GOMPlayer", "GOM Player"),
+        ("GOM", "GOM Player"), ("Shotcut", "Shotcut"), ("shotcut", "Shotcut"),
+        ("OpenShot", "OpenShot"), ("openshot", "OpenShot"), ("DaVinciResolve", "DaVinci Resolve"),
+        ("DaVinci", "达芬奇"), ("Resolve", "达芬奇"), ("HitFilm", "HitFilm"),
+        ("Lightworks", "Lightworks"), ("Blender", "Blender"), ("blender", "Blender"),
+        ("Cinema4D", "Cinema 4D"), ("C4D", "Cinema 4D"), ("Maya", "Autodesk Maya"),
+        ("3dsMax", "3ds Max"), ("3DSMAX", "3ds Max"), ("Autodesk", "Autodesk"),
+        ("SketchUp", "SketchUp"), ("sketchup", "SketchUp"), ("ZBrush", "ZBrush"),
+        ("Rhino", "Rhino"), ("Rhino3D", "Rhino"), ("SolidWorks", "SolidWorks"),
+        # ===== 音频制作/播放 (50) =====
+        ("Audacity", "Audacity"), ("audacity", "Audacity"), ("Audition", "Adobe Audition"),
+        ("FLStudio", "FL Studio"), ("FLStudio20", "FL Studio"), ("Cubase", "Cubase"),
+        ("Nuendo", "Nuendo"), ("ProTools", "Pro Tools"), ("Protools", "Pro Tools"),
+        ("LogicProX", "Logic Pro X"), ("Ableton", "Ableton Live"), ("AbletonLive", "Ableton Live"),
+        ("Reason", "Reason"), ("StudioOne", "Studio One"), ("StudioOne5", "Studio One"),
+        ("Cakewalk", "Cakewalk"), ("Sonar", "Sonar"), ("Bitwig", "Bitwig Studio"),
+        ("Reaper", "REAPER"), ("reaper", "REAPER"), ("Musescore", "MuseScore"),
+        ("MuseScore", "MuseScore"), ("LMMS", "LMMS"), ("GarageBandWin", "GarageBand"),
+        ("CoolEdit", "Cool Edit Pro"), ("CoolEditPro", "Cool Edit Pro"), ("GoldWave", "GoldWave"),
+        ("Goldwave", "GoldWave"), ("WavePad", "WavePad"), ("SoundForge", "Sound Forge"),
+        ("Vegas", "Vegas Pro"), ("VegasPro", "Vegas Pro"), ("Camtasia", "Camtasia"),
+        ("camtasia", "Camtasia"), ("Snagit", "Snagit"), ("snagit", "Snagit"),
+        ("Bandicam", "Bandicam"), ("AudacityPortable", "Audacity"), ("NeroWaveEditor", "Nero WaveEditor"),
+        ("WaveLab", "WaveLab"), ("RX", "iZotope RX"), ("Ozone", "iZotope Ozone"),
+        ("iZotope", "iZotope"), ("Melodyne", "Melodyne"), ("AutoTune", "Auto-Tune"),
+        ("Vocaloid", "Vocaloid"), ("UTAU", "UTAU"), ("CeVIO", "CeVIO"),
+        ("Synthesia", "Synthesia"), ("PianoTeq", "PianoTeq"), ("Podium", "Podium"),
+        # ===== 图片处理/设计 (70) =====
+        ("美图秀秀", "美图秀秀"), ("Meitu", "美图秀秀"), ("MeituXiuXiu", "美图秀秀"),
+        ("美图看看", "美图看看"), ("美拍", "美拍"), ("美图秀秀批处理", "美图秀秀"),
+        ("光影魔术手", "光影魔术手"), ("NeoImaging", "光影魔术手"), ("可牛影像", "可牛影像"),
+        ("Kenuo", "可牛影像"), ("美图相机", "美图相机"), ("美颜相机", "美颜相机"),
+        ("轻颜相机", "轻颜相机"), ("醒图", "醒图"), ("醒图App", "醒图"),
+        ("Snapseed", "Snapseed"), ("snapseed", "Snapseed"), ("VSCO", "VSCO"),
+        ("vsco", "VSCO"), ("PicsArt", "PicsArt"), ("picsart", "PicsArt"),
+        ("Canva", "Canva"), ("canva", "Canva"), ("Figma", "Figma"),
+        ("figma", "Figma"), ("Sketch", "Sketch"), ("Affinity", "Affinity"),
+        ("AffinityPhoto", "Affinity Photo"), ("AffinityDesigner", "Affinity Designer"), ("AffinityPublisher", "Affinity Publisher"),
+        ("CorelDRAW", "CorelDRAW"), ("CorelDraw", "CorelDRAW"), ("coreldraw", "CorelDRAW"),
+        ("CorelPainter", "Corel Painter"), ("CorelPaintShop", "PaintShop Pro"), ("PhotoImpact", "PhotoImpact"),
+        ("GIMP", "GIMP"), ("gimp", "GIMP"), ("Inkscape", "Inkscape"),
+        ("inkscape", "Inkscape"), ("Krita", "Krita"), ("krita", "Krita"),
+        ("Paint.NET", "Paint.NET"), ("PaintDotNet", "Paint.NET"), ("paint.net", "Paint.NET"),
+        ("Photopea", "Photopea"), ("Pixelmator", "Pixelmator"), ("PixelmatorPro", "Pixelmator Pro"),
+        ("Darktable", "darktable"), ("darktable", "darktable"), ("RawTherapee", "RawTherapee"),
+        ("digiKam", "digiKam"), ("Luminar", "Luminar"), ("LuminarAI", "Luminar AI"),
+        ("ON1", "ON1 Photo"), ("DxO", "DxO PhotoLab"), ("DxOPhotolab", "DxO PhotoLab"),
+        ("CaptureOne", "Capture One"), ("CaptureOnePro", "Capture One"), ("NikonNX", "Nikon NX"),
+        ("CanonDPP", "Canon Digital Photo Professional"), ("SonyImaging", "Sony Imaging"),
+        ("Picasa", "Picasa"), ("picasa", "Picasa"), ("HelloFoto", "HelloFoto"),
+        ("秒剪", "秒剪"), ("Lens", "Lens"), ("Thumbnails", "Thumbnails"),
+        # ===== 办公效率 (60) =====
+        ("WPS", "WPS Office"), ("wps", "WPS Office"), ("WPSOffice", "WPS Office"),
+        ("WPS表格", "WPS表格"), ("WPS文字", "WPS文字"), ("WPS演示", "WPS演示"),
+        ("WPSPDF", "WPS PDF"), ("金山文档", "金山文档"), ("金山办公", "金山办公"),
+        ("Kingsoft", "金山"), ("KingsoftOffice", "金山办公"), ("ET", "WPS表格"),
+        ("XLSX", "WPS表格"), ("PDFXEdit", "PDF-XChange Editor"), ("PDFXChange", "PDF-XChange"),
+        ("PDFCreator", "PDFCreator"), ("PDFFactory", "PDFfactory"), ("Foxit", "福昕PDF"),
+        ("FoxitReader", "福昕阅读器"), ("福昕", "福昕"), ("福昕阅读器", "福昕阅读器"),
+        ("福昕PDF编辑器", "福昕PDF编辑器"), ("SumatraPDF", "SumatraPDF"), ("sumatrapdf", "SumatraPDF"),
+        ("PDFelement", "万兴PDF"), ("万兴PDF", "万兴PDF"), ("WondersharePDF", "万兴PDF"),
+        ("NitroPDF", "Nitro PDF"), ("NitroPro", "Nitro Pro"), ("SodaPDF", "Soda PDF"),
+        ("Bluebeam", "Bluebeam Revu"), ("PDF24", "PDF24"), ("PDF24Creator", "PDF24 Creator"),
+        ("AdobeAcrobatDC", "Acrobat DC"), ("EasyPDF", "EasyPDF"), ("PDFShuffler", "PDF Shuffler"),
+        ("Notion", "Notion"), ("notion", "Notion"), ("Obsidian", "Obsidian"),
+        ("obsidian", "Obsidian"), ("Typora", "Typora"), ("typora", "Typora"),
+        ("MarkdownPad", "MarkdownPad"), ("MarkText", "Mark Text"), ("Joplin", "Joplin"),
+        ("joplin", "Joplin"), ("RoamResearch", "Roam Research"), ("Logseq", "Logseq"),
+        ("语雀", "语雀"), ("Yuque", "语雀"), ("飞书", "飞书"),
+        ("Feishu", "飞书"), ("Lark", "Lark"), ("钉钉", "钉钉"),
+        ("DingTalk", "钉钉"), ("dingtalk", "钉钉"), ("企业微信", "企业微信"),
+        ("WeCom", "企业微信"), ("Wework", "企业微信"), ("TIM", "TIM"),
+        ("tim", "TIM"), ("Slack", "Slack"), ("slack", "Slack"),
+        ("Discord", "Discord"), ("discord", "Discord"), ("Telegram", "Telegram"),
+        ("telegram", "Telegram"), ("Signal", "Signal"), ("WhatsApp", "WhatsApp"),
+        # ===== 下载工具 (40) =====
+        ("IDMan", "Internet Download Manager"), ("IDM", "Internet Download Manager"),
+        ("InternetDownloadManager", "Internet Download Manager"), ("迅雷下载", "迅雷"),
+        ("迅雷看看", "迅雷看看"), ("旋风下载", "QQ旋风"), ("QQDownload", "QQ旋风"),
+        ("ThunderNetwork", "迅雷"), ("Xunlei7", "迅雷7"), ("Xunlei8", "迅雷8"),
+        ("ThunderMini", "迅雷精简版"), ("迅雷极速版", "迅雷极速版"), ("高速下载", "迅雷"),
+        ("FDM", "Free Download Manager"), ("FreeDownloadManager", "Free Download Manager"),
+        ("EagleGet", "EagleGet"), ("OrbitDownloader", "Orbit"), ("Orbit", "Orbit"),
+        ("NetTransport", "网络传送带"), ("FlashGet", "快车"), ("快车", "快车"),
+        ("Jijian", "极简下载"), ("Persepolis", "Persepolis"), ("aria2", "aria2"),
+        ("Aria2", "aria2"), ("Motrix", "Motrix"), ("motrix", "Motrix"),
+        ("uGet", "uGet"), ("XDM", "Xtreme Download Manager"), ("XtremeDownload", "Xtreme Download Manager"),
+        ("JDownloader", "JDownloader"), ("jdownloader", "JDownloader"), ("BitComet", "BitComet"),
+        ("bitcomet", "BitComet"), ("qBittorrent", "qBittorrent"), ("qbittorrent", "qBittorrent"),
+        ("uTorrent", "uTorrent"), ("utorrent", "uTorrent"), ("Transmission", "Transmission"),
+        ("transmission", "Transmission"), ("Deluge", "Deluge"), ("Tixati", "Tixati"),
+        ("FDM5", "Free Download Manager"), ("觅影", "觅影下载器"),
+        # ===== 社交/即时通讯 (45) =====
+        ("WeChat", "微信"), ("wechat", "微信"), ("Weixin", "微信"),
+        ("微信", "微信"), ("WeChatWork", "企业微信"), ("QQ", "QQ"),
+        ("qq", "QQ"), ("QQProtect", "QQ安全防护"), ("QQExternal", "QQ"),
+        ("腾讯QQ", "QQ"), ("轻聊版QQ", "QQ轻聊版"), ("TIM2", "TIM"),
+        ("MSN", "MSN"), ("msn", "MSN"), ("Skype", "Skype"),
+        ("skype", "Skype"), ("SkypeForWindows", "Skype"), ("ICQ", "ICQ"),
+        ("icq", "ICQ"), ("YahooMessenger", "雅虎通"), ("雅虎通", "雅虎通"),
+        ("AIM", "AIM"), ("飞信", "飞信"), ("Fetion", "飞信"),
+        ("飞鸽传书", "飞鸽传书"), ("Feige", "飞鸽传书"), ("YY语音", "YY语音"),
+        ("YY", "YY"), ("多玩YY", "YY"), ("TT语音", "TT语音"),
+        ("TT语音平台", "TT语音"), ("歪歪语音", "YY语音"), ("映客", "映客直播"),
+        ("花椒直播", "花椒直播"), ("一直播", "一直播"), ("斗鱼", "斗鱼直播"),
+        ("Douyu", "斗鱼"), ("虎牙", "虎牙直播"), ("Huya", "虎牙"),
+        ("B站直播", "哔哩哔哩直播"), ("战旗TV", "战旗"), ("熊猫TV", "熊猫直播"),
+        ("龙珠直播", "龙珠直播"), ("触手TV", "触手直播"), ("KK直播", "KK直播"),
+        ("陌陌", "陌陌"), ("Momo", "陌陌"), ("Soul", "Soul"),
+        ("soul", "Soul"), ("探探", "探探"), ("积目", "积目"),
+        # ===== 电商/购物 (45) =====
+        ("淘宝", "淘宝"), ("Taobao", "淘宝"), ("天猫", "天猫"),
+        ("Tmall", "天猫"), ("京东", "京东"), ("JD", "京东"),
+        ("Jingdong", "京东"), ("拼多多", "拼多多"), ("Pinduoduo", "拼多多"),
+        ("PDD", "拼多多"), ("唯品会", "唯品会"), ("Vipshop", "唯品会"),
+        ("苏宁易购", "苏宁易购"), ("Suning", "苏宁"), ("国美", "国美"),
+        ("国美在线", "国美在线"), ("闲鱼", "闲鱼"), ("Xianyu", "闲鱼"),
+        ("转转", "转转"), ("孔夫子旧书网", "孔夫子"), ("当当", "当当"),
+        ("dangdang", "当当"), ("1号店", "1号店"), ("Yihaodian", "1号店"),
+        ("网易严选", "网易严选"), ("严选", "网易严选"), ("网易考拉", "网易考拉"),
+        ("考拉海购", "考拉海购"), ("蘑菇街", "蘑菇街"), ("美丽说", "美丽说"),
+        ("聚美优品", "聚美优品"), ("小红书购物", "小红书"), ("什么值得买", "什么值得买"),
+        ("smzdm", "什么值得买"), ("值得买", "什么值得买"), ("Shopee", "Shopee"),
+        ("Lazada", "Lazada"), ("Amazon", "亚马逊"), ("AmazonShopping", "亚马逊"),
+        ("eBay", "eBay"), ("ebay", "eBay"), ("Wish", "Wish"),
+        ("AliExpress", "速卖通"), ("速卖通", "速卖通"), ("跨境通", "跨境通"),
+        # ===== 金融/证券/银行 (50) =====
+        ("支付宝", "支付宝"), ("Alipay", "支付宝"), ("支付宝安全控件", "支付宝"),
+        ("微信支付", "微信支付"), ("招商银行", "招商银行"), ("招行", "招商银行"),
+        ("CMB", "招商银行"), ("工商银行", "工商银行"), ("ICBC", "工商银行"),
+        ("中国银行", "中国银行"), ("BOC", "中国银行"), ("建设银行", "建设银行"),
+        ("CCB", "建设银行"), ("农业银行", "农业银行"), ("ABC", "农业银行"),
+        ("交通银行", "交通银行"), ("Bocom", "交通银行"), ("邮储银行", "邮储银行"),
+        ("民生银行", "民生银行"), ("浦发银行", "浦发银行"), ("兴业银行", "兴业银行"),
+        ("中信银行", "中信银行"), ("光大银行", "光大银行"), ("平安银行", "平安银行"),
+        ("同花顺", "同花顺"), ("THS", "同花顺"), ("东方财富", "东方财富"),
+        ("Eastmoney", "东方财富"), ("大智慧", "大智慧"), ("GWDX", "大智慧"),
+        ("通达信", "通达信"), ("Tdx", "通达信"), ("华泰证券", "华泰证券"),
+        ("广发证券", "广发证券"), ("国泰君安", "国泰君安"), ("海通证券", "海通证券"),
+        ("招商证券", "招商证券"), ("银河证券", "银河证券"), ("申万宏源", "申万宏源"),
+        ("中信证券", "中信证券"), ("中金公司", "中金公司"), ("富途牛牛", "富途牛牛"),
+        ("Futu", "富途牛牛"), ("老虎证券", "老虎证券"), ("雪球", "雪球"),
+        ("Xueqiu", "雪球"), ("蛋卷基金", "蛋卷基金"), ("天天基金", "天天基金"),
+        ("蚂蚁财富", "蚂蚁财富"), ("京东金融", "京东金融"), ("度小满", "度小满金融"),
+        # ===== 教育/学习 (55) =====
+        ("网易有道词典", "有道词典"), ("有道翻译", "有道翻译"), ("有道云笔记", "有道云笔记"),
+        ("百度翻译", "百度翻译"), ("百度文库", "百度文库"), ("百度网盘", "百度网盘"),
+        ("金山词霸", "金山词霸"), ("PowerWord", "金山词霸"), ("必应词典", "必应词典"),
+        ("欧路词典", "欧路词典"), ("Eudic", "欧路词典"), ("Mdict", "Mdict"),
+        ("GoldenDict", "GoldenDict"), ("Anki", "Anki"), ("anki", "Anki"),
+        ("Quizlet", "Quizlet"), ("Coursera", "Coursera"), ("edX", "edX"),
+        ("Udemy", "Udemy"), ("Duolingo", "多邻国"), ("多邻国", "多邻国"),
+        ("百词斩", "百词斩"), ("扇贝单词", "扇贝单词"), ("墨墨背单词", "墨墨背单词"),
+        ("不背单词", "不背单词"), ("知米背单词", "知米背单词"), ("沪江", "沪江"),
+        ("学而思", "学而思"), ("作业帮", "作业帮"), ("猿辅导", "猿辅导"),
+        ("掌门1对1", "掌门1对1"), ("VIPKID", "VIPKID"), ("流利说", "英语流利说"),
+        ("英语流利说", "英语流利说"), ("可可英语", "可可英语"), ("喜马拉雅", "喜马拉雅"),
+        ("Ximalaya", "喜马拉雅"), ("蜻蜓FM", "蜻蜓FM"), ("荔枝FM", "荔枝FM"),
+        ("得到", "得到"), ("知乎大学", "知乎"), ("中国大学MOOC", "中国大学MOOC"),
+        ("学堂在线", "学堂在线"), ("知网", "知网"), ("CNKI", "知网"),
+        ("万方数据", "万方数据"), ("维普", "维普"), ("中国知网", "知网"),
+        ("谷歌学术", "谷歌学术"), ("GoogleScholar", "谷歌学术"), ("Zotero", "Zotero"),
+        ("zotero", "Zotero"), ("EndNote", "EndNote"), ("endnote", "EndNote"),
+        ("NoteExpress", "NoteExpress"), ("Mendeley", "Mendeley"),
+        # ===== 出行/地图/生活 (45) =====
+        ("高德地图", "高德地图"), ("Amap", "高德地图"), ("AutoNavi", "高德地图"),
+        ("百度地图", "百度地图"), ("BaiduMap", "百度地图"), ("腾讯地图", "腾讯地图"),
+        ("TencentMap", "腾讯地图"), ("GoogleMap", "谷歌地图"), ("滴滴出行", "滴滴出行"),
+        ("Didi", "滴滴出行"), ("DiDi", "滴滴出行"), ("滴滴司机", "滴滴司机"),
+        ("曹操出行", "曹操出行"), ("T3出行", "T3出行"), ("首汽约车", "首汽约车"),
+        ("哈啰出行", "哈啰出行"), ("哈啰单车", "哈啰单车"), ("青桔单车", "青桔单车"),
+        ("美团", "美团"), ("Meituan", "美团"), ("美团外卖", "美团外卖"),
+        ("饿了么", "饿了么"), ("Eleme", "饿了么"), ("口碑", "口碑"),
+        ("大众点评", "大众点评"), ("Dianping", "大众点评"), ("携程旅行", "携程旅行"),
+        ("Ctrip", "携程"), ("去哪儿", "去哪儿"), ("Qunar", "去哪儿"),
+        ("飞猪", "飞猪"), ("Fliggy", "飞猪"), ("同程旅行", "同程旅行"),
+        ("途牛", "途牛"), ("马蜂窝", "马蜂窝"), ("Airbnb", "Airbnb"),
+        ("Booking", "Booking.com"), ("12306", "铁路12306"), ("铁路12306", "铁路12306"),
+        ("智行火车票", "智行火车票"), ("航旅纵横", "航旅纵横"), ("航班管家", "航班管家"),
+        ("顺丰速运", "顺丰速运"), ("SF", "顺丰"), ("圆通", "圆通快递"),
+        ("中通快递", "中通快递"), ("韵达", "韵达快递"), ("菜鸟裹裹", "菜鸟裹裹"),
+        # ===== 系统工具/优化 (60) =====
+        ("CCleaner", "CCleaner"), ("IObit", "IObit"), ("AdvancedSystemCare", "Advanced SystemCare"),
+        ("ASC", "Advanced SystemCare"), ("IObitUninstaller", "IObit Uninstaller"), ("Uninstaller", "卸载工具"),
+        ("RevoUninstaller", "Revo Uninstaller"), ("GeekUninstaller", "Geek Uninstaller"),
+        ("geek", "Geek"), ("TotalUninstaller", "Total Uninstaller"), ("YourUninstaller", "Your Uninstaller"),
+        ("魔方优化大师", "魔方优化大师"), ("魔方", "魔方优化大师"), ("优化大师", "Windows优化大师"),
+        ("Windows优化大师", "Windows优化大师"), ("鲁大师", "鲁大师"), ("Ludashi", "鲁大师"),
+        ("大师", "鲁大师"), ("驱动精灵", "驱动精灵"), ("DriverGenius", "驱动精灵"),
+        ("驱动人生", "驱动人生"), ("DriverLife", "驱动人生"), ("驱动总裁", "驱动总裁"),
+        ("360驱动大师", "360驱动大师"), ("驱动大师", "驱动大师"), ("腾讯驱动", "腾讯电脑管家驱动"),
+        ("显卡驱动", "显卡驱动"), ("NVIDIA", "NVIDIA"), ("nvidia", "NVIDIA"),
+        ("NVIDIA控制面板", "NVIDIA控制面板"), ("GeForce", "GeForce Experience"), ("GeForceExperience", "GeForce Experience"),
+        ("AMD", "AMD"), ("amd", "AMD"), ("AMDSoftware", "AMD Software"),
+        ("Adrenalin", "AMD Adrenalin"), ("IntelGraphics", "Intel 显卡"), ("Intel", "Intel"),
+        ("intel", "Intel"), ("IntelDriver", "Intel 驱动"), ("Razer", "雷蛇"),
+        ("RazerSynapse", "雷蛇驱动"), ("罗技", "罗技"), ("Logitech", "Logitech"),
+        ("LogitechGHub", "罗技 G HUB"), ("罗技驱动", "罗技"), ("赛睿", "赛睿"),
+        ("SteelSeries", "SteelSeries"), ("海盗船", "海盗船"), ("Corsair", "Corsair"),
+        ("外星人", "外星人"), ("Alienware", "Alienware"), ("华硕", "华硕"),
+        ("ASUS", "华硕"), ("微星", "微星"), ("MSI", "MSI"),
+        ("技嘉", "技嘉"), ("Gigabyte", "技嘉"), ("七彩虹", "七彩虹"),
+        ("影驰", "影驰"), ("索泰", "索泰"), ("映泰", "映泰"),
+        ("铭瑄", "铭瑄"), ("昂达", "昂达"), ("精粤", "精粤"),
+        # ===== 硬件检测/监控 (35) =====
+        ("HWiNFO", "HWiNFO"), ("hwinfo", "HWiNFO"), ("CPU-Z", "CPU-Z"),
+        ("cpuz", "CPU-Z"), ("CPUZ", "CPU-Z"), ("GPU-Z", "GPU-Z"),
+        ("gpuz", "GPU-Z"), ("GPUZ", "GPU-Z"), ("AIDA64", "AIDA64"),
+        ("aida64", "AIDA64"), ("EVEREST", "EVEREST"), ("Everest", "EVEREST"),
+        ("CoreTemp", "Core Temp"), ("CoreTemp64", "Core Temp"), ("HWMonitor", "HWMonitor"),
+        ("hwmonitor", "HWMonitor"), ("OpenHardwareMonitor", "OpenHardwareMonitor"), ("Speccy", "Speccy"),
+        ("speccy", "Speccy"), ("CrystalDiskInfo", "CrystalDiskInfo"), ("CrystalDiskMark", "CrystalDiskMark"),
+        ("CrystalDisk", "CrystalDisk"), ("SSD-Z", "SSD-Z"), ("DiskGenius", "DiskGenius"),
+        ("diskgenius", "DiskGenius"), ("傲梅分区助手", "傲梅分区助手"), ("AOMEI", "傲梅"),
+        ("AOMEIPartition", "傲梅分区助手"), ("分区助手", "分区助手"), ("MiniTool", "MiniTool"),
+        ("MiniToolPartition", "MiniTool 分区"), ("EaseUS", "易我"), ("易我分区大师", "易我分区大师"),
+        ("WizTree", "WizTree"), ("TreeSize", "TreeSize"), ("SpaceSniffer", "SpaceSniffer"),
+        ("WinDirStat", "WinDirStat"), ("FolderSize", "FolderSize"), ("BeyondCompare", "Beyond Compare"),
+        # ===== 网络工具/代理 (45) =====
+        ("Wireshark", "Wireshark"), ("wireshark", "Wireshark"), ("Ethereal", "Ethereal"),
+        ("Fiddler", "Fiddler"), ("fiddler", "Fiddler"), ("Charles", "Charles"),
+        ("charles", "Charles"), ("BurpSuite", "Burp Suite"), ("burp", "Burp Suite"),
+        ("Nmap", "Nmap"), ("nmap", "Nmap"), ("Zenmap", "Zenmap"),
+        ("Netcat", "Netcat"), ("nc", "Netcat"), ("Tcpdump", "tcpdump"),
+        ("tcpdump", "tcpdump"), ("Ping", "Ping"), ("ping", "Ping"),
+        ("Traceroute", "Traceroute"), ("tracert", "Tracert"), ("Netstat", "Netstat"),
+        ("netstat", "Netstat"), ("ipconfig", "Ipconfig"), ("Nslookup", "Nslookup"),
+        ("nslookup", "Nslookup"), ("Speedtest", "Speedtest"), ("SpeedtestByOokla", "Speedtest"),
+        ("Ookla", "Speedtest"), ("iperf", "iperf"), ("Iperf", "iperf"),
+        ("MTR", "MTR"), ("WinMTR", "WinMTR"), ("PuTTY", "PuTTY"),
+        ("putty", "PuTTY"), ("KiTTY", "KiTTY"), ("SecureCRT", "SecureCRT"),
+        ("SecureFX", "SecureFX"), ("Xshell", "Xshell"), ("xshell", "Xshell"),
+        ("Xftp", "Xftp"), ("xftp", "Xftp"), ("FinalShell", "FinalShell"),
+        ("finalshell", "FinalShell"), ("MobaXterm", "MobaXterm"), ("mobaxterm", "MobaXterm"),
+        ("Termius", "Termius"), ("Bitvise", "Bitvise SSH"), ("WinSCP", "WinSCP"),
+        ("winscp", "WinSCP"), ("FileZilla", "FileZilla"), ("filezilla", "FileZilla"),
+        ("Clash", "Clash"), ("clash", "Clash"), ("ClashForWindows", "Clash for Windows"),
+        ("V2Ray", "V2Ray"), ("v2ray", "V2Ray"), ("v2rayN", "v2rayN"),
+        ("Shadowsocks", "Shadowsocks"), ("shadowsocks", "Shadowsocks"), ("SSR", "ShadowsocksR"),
+        # ===== 游戏 (70) =====
+        ("原神", "原神"), ("Genshin", "原神"), ("GenshinImpact", "原神"),
+        ("崩坏3", "崩坏3"), ("崩坏星穹铁道", "崩坏星穹铁道"), ("星穹铁道", "崩坏星穹铁道"),
+        ("HonkaiStarRail", "崩坏星穹铁道"), ("崩坏学园2", "崩坏学园2"), ("绝区零", "绝区零"),
+        ("ZenlessZoneZero", "绝区零"), ("王者荣耀", "王者荣耀"), ("HonorOfKings", "王者荣耀"),
+        ("和平精英", "和平精英"), ("PUBG", "绝地求生"), ("绝地求生", "绝地求生"),
+        ("PUBGM", "和平精英"), ("英雄联盟", "英雄联盟"), ("LOL", "英雄联盟"),
+        ("LeagueOfLegends", "英雄联盟"), ("云顶之弈", "云顶之弈"), ("TFT", "云顶之弈"),
+        ("穿越火线", "穿越火线"), ("CF", "穿越火线"), ("CSGO", "CS:GO"),
+        ("CS2", "CS2"), ("反恐精英", "反恐精英"), ("DOTA2", "DOTA2"),
+        ("Dota2", "DOTA2"), ("刀塔2", "DOTA2"), ("守望先锋", "守望先锋"),
+        ("Overwatch", "守望先锋"), ("炉石传说", "炉石传说"), ("Hearthstone", "炉石传说"),
+        ("魔兽世界", "魔兽世界"), ("WorldOfWarcraft", "魔兽世界"), ("WOW", "魔兽世界"),
+        ("星际争霸", "星际争霸"), ("StarCraft", "星际争霸"), ("暗黑破坏神", "暗黑破坏神"),
+        ("Diablo", "暗黑破坏神"), ("暗黑4", "暗黑破坏神4"), ("使命召唤", "使命召唤"),
+        ("CallOfDuty", "使命召唤"), ("COD", "使命召唤"), ("战地", "战地"),
+        ("Battlefield", "战地"), ("APEX", "Apex英雄"), ("ApexLegends", "Apex英雄"),
+        ("Apex英雄", "Apex英雄"), ("永劫无间", "永劫无间"), ("Naraka", "永劫无间"),
+        ("金铲铲之战", "金铲铲之战"), ("金铲铲", "金铲铲之战"), ("三国杀", "三国杀"),
+        ("三国志", "三国志"), ("真三国无双", "真三国无双"), ("仙剑奇侠传", "仙剑奇侠传"),
+        ("轩辕剑", "轩辕剑"), ("古剑奇谭", "古剑奇谭"), ("剑网3", "剑网3"),
+        ("天涯明月刀", "天涯明月刀"), ("天刀", "天涯明月刀"), ("逆水寒", "逆水寒"),
+        ("梦幻西游", "梦幻西游"), ("梦幻", "梦幻西游"), ("大话西游", "大话西游"),
+        ("问道", "问道"), ("征途", "征途"), ("传奇", "传奇"),
+        ("热血传奇", "热血传奇"), ("传奇世界", "传奇世界"), ("奇迹MU", "奇迹MU"),
+        ("诛仙", "诛仙"), ("完美世界", "完美世界"), ("天龙八部", "天龙八部"),
+        ("龙之谷", "龙之谷"), ("地下城", "地下城与勇士"), ("DNF地下城", "地下城与勇士"),
+        ("QQ飞车", "QQ飞车"), ("飞车", "QQ飞车"), ("QQ炫舞", "QQ炫舞"),
+        ("炫舞", "QQ炫舞"), ("QQ堂", "QQ堂"), ("泡泡堂", "泡泡堂"),
+        ("跑跑卡丁车", "跑跑卡丁车"), ("卡丁车", "跑跑卡丁车"), ("实况足球", "实况足球"),
+        ("FIFA", "FIFA"), ("NBA2K", "NBA 2K"), ("NBA2KOnline", "NBA2KOL"),
+        ("极品飞车", "极品飞车"), ("NeedForSpeed", "极品飞车"), ("GTA", "GTA"),
+        ("GrandTheftAuto", "GTA"), ("荒野大镖客", "荒野大镖客"), ("RedDead", "荒野大镖客"),
+        ("赛博朋克2077", "赛博朋克2077"), ("Cyberpunk", "赛博朋克2077"), ("艾尔登法环", "艾尔登法环"),
+        ("EldenRing", "艾尔登法环"), ("塞尔达", "塞尔达传说"), ("超级玛丽", "超级玛丽"),
+        ("魂斗罗", "魂斗罗"), ("街霸", "街头霸王"), ("拳皇", "拳皇"),
+        ("拳皇97", "拳皇97"), ("模拟人生", "模拟人生"), ("Sims", "模拟人生"),
+        ("我的世界", "我的世界"), ("Minecraft", "我的世界"), ("MC", "我的世界"),
+        # ===== 视频会议/直播 (35) =====
+        ("腾讯会议", "腾讯会议"), ("TencentMeeting", "腾讯会议"), ("Wemeet", "腾讯会议"),
+        ("Zoom", "Zoom"), ("zoom", "Zoom"), ("ZoomMeeting", "Zoom"),
+        ("钉钉会议", "钉钉会议"), ("飞书会议", "飞书会议"), ("企业微信会议", "企业微信会议"),
+        ("Webex", "Webex"), ("CiscoWebex", "Webex"), ("WebexMeetings", "Webex"),
+        ("GoToMeeting", "GoToMeeting"), ("GotoMeeting", "GoToMeeting"), ("JoinMe", "join.me"),
+        ("AnyMeeting", "AnyMeeting"), ("BlueJeans", "BlueJeans"), ("Lifesize", "Lifesize"),
+        ("StarLeaf", "StarLeaf"), ("华为云会议", "华为云会议"), ("华为Welink", "华为 Welink"),
+        ("Welink", "华为 Welink"), ("小鱼易连", "小鱼易连"), ("好视通", "好视通"),
+        ("随锐瞩目", "瞩目"), ("瞩目", "瞩目"), ("会畅", "会畅云会议"),
+        ("全时云会议", "全时云会议"), ("中目", "中目"), ("微吼", "微吼直播"),
+        ("微吼直播", "微吼"), ("保利威", "保利威"), ("目睹", "目睹直播"),
+        ("B站直播姬", "哔哩哔哩直播姬"), ("直播姬", "直播姬"), ("OBS直播", "OBS Studio"),
+        # ===== 其他工具/杂项 (60) =====
+        ("Everything", "Everything"), ("everything", "Everything"), ("Listary", "Listary"),
+        ("listary", "Listary"), ("Wox", "Wox"), ("wox", "Wox"),
+        ("uTools", "uTools"), ("utools", "uTools"), ("火柴", "火柴"),
+        ("火柴启动器", "火柴"), ("Quicker", "Quicker"), ("quicker", "Quicker"),
+        ("火萤酱", "火萤酱"), ("CLaunch", "CLaunch"), ("Rolan", "Rolan"),
+        ("TranslucentTB", "TranslucentTB"), ("TaskbarX", "TaskbarX"), ("Start11", "Start11"),
+        ("StartAllBack", "StartAllBack"), ("StartAllBackX", "StartAllBack"), ("OpenShell", "Open-Shell"),
+        ("ClassicShell", "Classic Shell"), ("Rainmeter", "Rainmeter"), ("rainmeter", "Rainmeter"),
+        ("WallpaperEngine", "Wallpaper Engine"), ("Wallpaper", "Wallpaper Engine"), ("LiveWallpaper", "动态壁纸"),
+        ("动态壁纸", "动态壁纸"), ("ScreenSaver", "屏幕保护"), ("iScreen", "iScreen截图"),
+        ("Snipaste", "Snipaste"), ("snipaste", "Snipaste"), ("PixPin", "PixPin"),
+        ("pixpin", "PixPin"), ("FSCapture", "FastStone Capture"), ("FSC", "FastStone Capture"),
+        ("WeChatCapture", "微信截图"), ("QQ截图", "QQ截图"), ("ScreenToGif", "ScreenToGif"),
+        ("screentogif", "ScreenToGif"), ("GifCam", "GifCam"), ("LICEcap", "LICEcap"),
+        ("licecap", "LICEcap"), ("Ocam", "oCam"), ("ocam", "oCam"),
+        ("Bandicam", "Bandicam"), ("EV录屏", "EV录屏"), ("EVcapture", "EV录屏"),
+        ("爱剪辑", "爱剪辑"), ("快剪辑", "快剪辑"), ("会声会影", "会声会影"),
+        ("CorelVideoStudio", "会声会影"), ("VegasPro", "Vegas Pro"), ("绘声绘影", "会声会影"),
+        ("剪映专业版", "剪映专业版"), ("必剪", "必剪"), ("Bcut", "必剪"),
+        ("秒剪", "秒剪"), ("万兴喵影", "万兴喵影"), ("喵影工厂", "万兴喵影"),
+        ("蜜蜂剪辑", "蜜蜂剪辑"), ("PinnacleStudio", "Pinnacle Studio"), ("CyberLink", "讯连科技"),
+        ("PowerDirector", "威力导演"), ("威力导演", "威力导演"), ("VideoStudio", "会声会影"),
+        # ===== 专业软件 (60) =====
+        ("ANSYS", "ANSYS"), ("ansys", "ANSYS"), ("AnsysWorkbench", "ANSYS Workbench"),
+        ("COMSOL", "COMSOL"), ("comsol", "COMSOL"), ("Abaqus", "Abaqus"),
+        ("abaqus", "Abaqus"), ("LS-DYNA", "LS-DYNA"), ("LSDYNA", "LS-DYNA"),
+        ("HyperMesh", "HyperMesh"), ("Altair", "Altair"), ("Adams", "Adams"),
+        ("Simulink", "Simulink"), ("simulink", "Simulink"), ("SimulinkModel", "Simulink"),
+        ("CATIA", "CATIA"), ("catia", "CATIA"), ("SolidEdge", "Solid Edge"),
+        ("Creo", "PTC Creo"), ("creo", "PTC Creo"), ("ProENGINEER", "Pro/ENGINEER"),
+        ("ProE", "Pro/ENGINEER"), ("UG", "UG NX"), ("NX", "UG NX"),
+        ("Unigraphics", "UG NX"), ("Inventor", "Autodesk Inventor"), ("autodesk inventor", "Autodesk Inventor"),
+        ("Fusion360", "Fusion 360"), ("Fusion360App", "Fusion 360"), ("AutoCAD", "AutoCAD"),
+        ("autocad", "AutoCAD"), ("AutoCADLT", "AutoCAD LT"), ("Cadence", "Cadence"),
+        ("CadenceOrCAD", "OrCAD"), ("OrCAD", "OrCAD"), ("PADS", "PADS"),
+        ("Allegro", "Allegro"), ("PCB", "PCB设计"), ("Gerber", "Gerber"),
+        ("FreeCAD", "FreeCAD"), ("freecad", "FreeCAD"), ("LibreCAD", "LibreCAD"),
+        ("OpenSCAD", "OpenSCAD"), ("TinkerCAD", "Tinkercad"), ("Blender3D", "Blender"),
+        ("Houdini", "Houdini"), ("houdini", "Houdini"), ("Nuke", "Nuke"),
+        ("nuke", "Nuke"), ("FusionStudio", "Blackmagic Fusion"), ("Blackmagic", "Blackmagic"),
+        ("DaVinciResolveStudio", "DaVinci Resolve Studio"), ("ResolveStudio", "达芬奇"),
+        ("V-Ray", "V-Ray"), ("VRay", "V-Ray"), ("Corona", "Corona Renderer"),
+        ("Octane", "OctaneRender"), ("Lumion", "Lumion"), ("lumion", "Lumion"),
+        ("Enscape", "Enscape"), ("enscape", "Enscape"), ("Twinmotion", "Twinmotion"),
+        ("TwinmotionApp", "Twinmotion"), ("Rhino7", "Rhino 7"), ("Grasshopper", "Grasshopper"),
+        # ===== 云盘/同步/备份 (40) =====
+        ("OneDrive", "OneDrive"), ("onedrive", "OneDrive"), ("OneDriveSetup", "OneDrive"),
+        ("Dropbox", "Dropbox"), ("dropbox", "Dropbox"), ("DropboxSync", "Dropbox"),
+        ("Mega", "MEGA"), ("mega", "MEGA"), ("MEGAcloud", "MEGA"),
+        ("Box", "Box"), ("box", "Box"), ("BoxSync", "Box Sync"),
+        ("pCloud", "pCloud"), ("pcloud", "pCloud"), ("Sync", "Sync.com"),
+        ("Tresorit", "Tresorit"), ("SpiderOak", "SpiderOak"), ("Nextcloud", "Nextcloud"),
+        ("nextcloud", "Nextcloud"), ("ownCloud", "ownCloud"), ("Seafile", "Seafile"),
+        ("seafile", "Seafile"), ("坚果云", "坚果云"), ("Nutstore", "坚果云"),
+        ("奶牛快传", "奶牛快传"), ("奶牛云", "奶牛快传"), ("文叔叔", "文叔叔"),
+        ("蓝奏云", "蓝奏云"), ("蓝奏", "蓝奏云"), ("Lanzou", "蓝奏云"),
+        ("城通网盘", "城通网盘"), ("城通", "城通网盘"), ("亿方云", "亿方云"),
+        ("比特云", "比特云"), ("360云盘", "360云盘"), ("360云", "360云盘"),
+        ("腾讯微云", "腾讯微云"), ("微云", "腾讯微云"), ("Weiyun", "腾讯微云"),
+        ("百度企业网盘", "百度企业网盘"), ("如流", "如流"), ("金山快盘", "金山快盘"),
+        ("快盘", "金山快盘"), ("DropboxPaper", "Dropbox Paper"),
+        # ===== 游戏模拟器 (30) =====
+        ("RetroArch", "RetroArch"), ("retroarch", "RetroArch"), ("Dolphin", "Dolphin模拟器"),
+        ("dolphin", "Dolphin模拟器"), ("PCSX2", "PCSX2"), ("pcsx2", "PCSX2"),
+        ("PPSSPP", "PPSSPP"), ("ppsspp", "PPSSPP"), ("Citra", "Citra"),
+        ("citra", "Citra"), ("Cemu", "Cemu"), ("cemu", "Cemu"),
+        ("Yuzu", "Yuzu"), ("yuzu", "Yuzu"), ("Ryujinx", "Ryujinx"),
+        ("ryujinx", "Ryujinx"), ("Xenia", "Xenia"), ("xenia", "Xenia"),
+        ("RPCS3", "RPCS3"), ("rpcs3", "RPCS3"), ("MAME", "MAME"),
+        ("mame", "MAME"), ("ePSXe", "ePSXe"), ("epsxe", "ePSXe"),
+        ("VBA", "VisualBoyAdvance"), ("VisualBoyAdvance", "VisualBoyAdvance"), ("mGBA", "mGBA"),
+        ("mgba", "mGBA"), ("NoGBA", "No$GBA"), ("Project64", "Project64"),
+        # ===== 办公套件其他 (30) =====
+        ("LibreOffice", "LibreOffice"), ("libreoffice", "LibreOffice"), ("LibreOfficeWriter", "LibreOffice Writer"),
+        ("LibreOfficeCalc", "LibreOffice Calc"), ("LibreOfficeImpress", "LibreOffice Impress"), ("OpenOffice", "Apache OpenOffice"),
+        ("openoffice", "OpenOffice"), ("StarOffice", "StarOffice"), ("SoftMaker", "SoftMaker Office"),
+        ("SoftMakerOffice", "SoftMaker Office"), ("FreeOffice", "FreeOffice"), ("OnlyOffice", "ONLYOFFICE"),
+        ("ONLYOFFICE", "ONLYOFFICE"), ("onlyoffice", "ONLYOFFICE"), ("永中Office", "永中Office"),
+        ("永中", "永中Office"), ("水中Office", "水中Office"), ("RedOffice", "RedOffice"),
+        ("中标普华", "中标普华"), ("中标Office", "中标Office"), ("金山WPS国际版", "WPS国际版"),
+        ("WPS国际版", "WPS国际版"), ("PolarisOffice", "Polaris Office"), ("HancomOffice", "Hancom Office"),
+        ("Hancom", "Hancom"), ("ThinkFree", "ThinkFree Office"), ("Roxio", "Roxio"),
+        ("Zoho", "Zoho"), ("zoho", "Zoho"), ("ZohoDocs", "Zoho Docs"),
+        # ===== 其他/备份软件 (40) =====
+        ("EaseUSData", "易我数据恢复"), ("Recuva", "Recuva"), ("recuva", "Recuva"),
+        ("DiskDigger", "DiskDigger"), ("PhotoRec", "PhotoRec"), ("TestDisk", "TestDisk"),
+        ("testdisk", "TestDisk"), ("R-Studio", "R-Studio"), ("RStudioData", "R-Studio"),
+        ("DMDE", "DMDE"), ("dmde", "DMDE"), ("WinHex", "WinHex"),
+        ("winhex", "WinHex"), ("HxD", "HxD"), ("hxd", "HxD"),
+        ("UltraEdit64", "UltraEdit"), ("Notepad3", "Notepad3"), ("notepad3", "Notepad3"),
+        ("Notepad2", "Notepad2"), ("notepad2", "Notepad2"), ("CudaText", "CudaText"),
+        ("cudatext", "CudaText"), ("Vim", "Vim"), ("vim", "Vim"),
+        ("GVim", "GVim"), ("gvim", "GVim"), ("Neovim", "Neovim"),
+        ("neovim", "Neovim"), ("Emacs", "Emacs"), ("emacs", "Emacs"),
+        ("Spacemacs", "Spacemacs"), ("DoomEmacs", "Doom Emacs"), ("VSCodiumPortable", "VSCodium"),
+        ("TinyTask", "TinyTask"), ("AutoHotkey", "AutoHotkey"), ("autohotkey", "AutoHotkey"),
+        ("AHK", "AutoHotkey"), ("AutoIt", "AutoIt"), ("autoit", "AutoIt"),
+        ("PythonPortable", "Python"), ("WinPython", "WinPython"), ("PyCharmPortable", "PyCharm"),
+        ("NirCmd", "NirCmd"), ("nircmd", "NirCmd"), ("NirSoft", "NirSoft"),
+        # ===== 系统增强/优化补充 (40) =====
+        ("RAMMap", "RAMMap"), ("VMMap", "VMMap"), ("ProcessExplorer", "Process Explorer"),
+        ("ProcessExplorer64", "Process Explorer"), ("procexp", "Process Explorer"), ("Handle", "Handle"),
+        ("handle", "Handle"), ("Procmon", "Process Monitor"), ("procmon", "Process Monitor"),
+        ("Autoruns64", "Autoruns"), ("TaskManagerDeLuxe", "Task Manager DeLuxe"), ("ProcessLasso", "Process Lasso"),
+        ("processlasso", "Process Lasso"), ("SystemMechanic", "System Mechanic"), ("iObitAdvanced", "IObit Advanced"),
+        ("DriverBooster", "Driver Booster"), ("driverbooster", "Driver Booster"), ("SmartDefrag", "Smart Defrag"),
+        ("smartdefrag", "Smart Defrag"), ("IObitMalware", "IObit Malware Fighter"), ("MalwareFighter", "IObit Malware Fighter"),
+        ("Glarysoft", "Glarysoft"), ("GlaryUtilities", "Glary Utilities"), ("Auslogics", "Auslogics"),
+        ("AuslogicsDisk", "Auslogics Disk Defrag"), ("AuslogicsBoostSpeed", "Auslogics BoostSpeed"), ("AshampooWinOptimizer", "Ashampoo WinOptimizer"),
+        ("TuneUp", "TuneUp Utilities"), ("TuneUpUtilities", "TuneUp Utilities"), ("AVGPC", "AVG PC TuneUp"),
+        ("PCTuneUp", "PC TuneUp"), ("NortonUtilities", "Norton Utilities"), ("CCEnhancer", "CCEnhancer"),
+        ("WinUtilities", "WinUtilities"), ("SystemCare", "Advanced SystemCare"), ("StartupDelayer", "Startup Delayer"),
+        ("StartupManager", "启动项管理"), ("BootRacer", "BootRacer"), ("Soluto", "Soluto"),
+        ("ShutUp10", "ShutUp10"), ("O&OShutUp10", "O&O ShutUp10"), ("WPD", "WPD"),
+        ("PrivacyEraser", "Privacy Eraser"), ("BleachBit", "BleachBit"), ("bleachbit", "BleachBit"),
+        # ===== 开发者工具/脚本 (40) =====
+        ("NppExec", "NppExec"), ("PythonWin", "Python Win"), ("IDLE", "IDLE"),
+        ("idle", "IDLE"), ("Thonny", "Thonny"), ("thonny", "Thonny"),
+        ("MuEditor", "Mu Editor"), ("mu", "Mu Editor"), ("WingIDE", "Wing IDE"),
+        ("wingide", "Wing IDE"), ("EricPython", "Eric"), ("PyDev", "PyDev"),
+        ("VimGtk", "GVim"), ("SublimeMerge", "Sublime Merge"), ("SublimeText", "Sublime Text"),
+        ("sublime_text", "Sublime Text"), ("Atom", "Atom"), ("atom", "Atom"),
+        ("AtomEditor", "Atom"), ("Brackets", "Brackets"), ("brackets", "Brackets"),
+        ("LiteIDE", "LiteIDE"), ("LiteIDE", "LiteIDE"), ("GoIDE", "Go IDE"),
+        ("Zed", "Zed"), ("zed", "Zed"), ("Lapce", "Lapce"),
+        ("lapce", "Lapce"), ("CodeEdit", "CodeEdit"), ("BBEdit", "BBEdit"),
+        ("TextMate", "TextMate"), ("Coda", "Coda"), ("KomodoEdit", "Komodo Edit"),
+        ("komodo", "Komodo"), ("Geany", "Geany"), ("geany", "Geany"),
+        ("SciTE", "SciTE"), ("scite", "SciTE"), ("NotepadPlusPlus", "Notepad++"),
+        ("NotepadPlus", "Notepad++"), ("notepad_plus", "Notepad++"), ("npp", "Notepad++"),
+        ("JEdit", "jEdit"), ("jedit", "jEdit"), ("gedit", "gedit"),
+        ("gedit", "gedit"), ("KWrite", "KWrite"), ("Kate", "Kate"),
+        ("kate", "Kate"), ("TextEditor", "文本编辑器"), ("VimText", "Vim"),
+        # ===== 补充 (55) =====
+        ("SuperCopier", "SuperCopier"), ("TeraCopy", "TeraCopy"), ("teracopy", "TeraCopy"),
+        ("FastCopy", "FastCopy"), ("fastcopy", "FastCopy"), ("CopyHandler", "复制增强"),
+        ("TotalCommander", "Total Commander"), ("TotalCmd", "Total Commander"), ("totalcmd", "Total Commander"),
+        ("DoubleCommander", "Double Commander"), ("doublecmd", "Double Commander"), ("MultiCommander", "Multi Commander"),
+        ("FreeCommander", "FreeCommander"), ("Xplorer2", "xplorer²"), ("XYplorer", "XYplorer"),
+        ("xyplorer", "XYplorer"), ("Q-Dir", "Q-Dir"), ("Qdir", "Q-Dir"),
+        ("Files", "Files"), ("FilesApp", "Files"), ("OneCommander", "One Commander"),
+        ("onecommander", "One Commander"), ("Clover", "Clover资源管理器"), ("CloverExplorer", "Clover"),
+        ("QTTabBar", "QTTabBar"), ("qttabbar", "QTTabBar"), ("ExplorerPatcher", "ExplorerPatcher"),
+        ("explorerpatcher", "ExplorerPatcher"), ("Translucent", "TranslucentTB"), ("StartIsBack", "StartIsBack"),
+        ("startisback", "StartIsBack"), ("StartMenu8", "Start Menu 8"), ("7Stacks", "7Stacks"),
+        ("Fences", "Fences"), ("fences", "Fences"), ("DeskGo", "腾讯桌面整理"),
+        ("桌面整理", "腾讯桌面整理"), ("腾讯桌面", "腾讯桌面整理"), ("Moo0", "Moo0文件粉碎"),
+        ("文件粉碎", "文件粉碎"), ("Eraser", "Eraser"), ("eraser", "Eraser"),
+        ("SecureDelete", "安全删除"), ("CCleanerPortable", "CCleaner"), ("KCleaner", "KCleaner"),
+        ("DiskCleanup", "磁盘清理"), ("cleanmgr", "磁盘清理"), ("StorageSense", "存储感知"),
+        ("PiriformDefraggler", "Defraggler"), ("Defraggler", "Defraggler"), ("MyDefrag", "MyDefrag"),
+        ("DefragglerPortable", "Defraggler"), ("UltraDefrag", "UltraDefrag"), ("IObitDefrag", "IObit 磁盘碎片整理"),
+        ("Vopt", "Vopt"), ("Contig", "Contig"), ("AuslogicsDefrag", "Auslogics Defrag"),
+        ("Clonezilla", "Clonezilla"), ("clonezilla", "Clonezilla"), ("Acronis", "Acronis"),
+        ("AcronisTrueImage", "Acronis True Image"), ("Macrium", "Macrium Reflect"), ("MacriumReflect", "Macrium Reflect"),
+        ("AOMEIBackupper", "傲梅轻松备份"), ("轻松备份", "傲梅轻松备份"), ("TodoBackup", "EaseUS Todo Backup"),
     ]
     return names
 
@@ -1427,13 +2334,26 @@ def snapshot_extension(ext):
     paths = get_extension_paths(ext, prog_id)
     snap = {}
     for key, (root, path, name) in paths.items():
-        val, typ = reg_read_value(root, path, name)
+        if root is HKCR and HKCU_REMAPPED:
+            # TI 下 HKCR 不含用户 HKCU\Software\Classes 覆盖；必须与
+            # check_extension 的合并视图（read_hkcr_effective）口径一致，
+            # 否则快照 hkcr_ext 只记 HKLM 部分、检测却比对合并视图，
+            # 用户级覆盖的扩展名会被误报为"被篡改"
+            val, typ = read_hkcr_effective(path, name)
+            present = val is not None
+            read_ok = True
+        else:
+            # probe：区分"值存在 / 键在但无值 / 读取失败(盲区)"三种状态，
+            # 快照显式记录 present 与 read_ok，避免空值与读取失败混淆
+            val, typ, present, read_ok = reg_probe_value(root, path, name)
         snap[key] = {
-            "root": ROOT_NAME_MAP.get(root, "?"),
+            "root": _key_root_name(key) or ROOT_NAME_MAP.get(root, "?"),
             "path": path,
             "name": name,
             "value": val,
             "type": typ,
+            "present": present,
+            "read_ok": read_ok,
             "prog_id": prog_id if key in ("hkcr_command", "hkcu_command", "hklm_command") else None,
         }
 
@@ -1446,6 +2366,8 @@ def snapshot_extension(ext):
                 "name": "",
                 "value": None,
                 "type": None,
+                "present": False,
+                "read_ok": True,
                 "prog_id": None,
             }
     return snap
@@ -2092,14 +3014,54 @@ class ProtectionEngine:
 
     def handle_uc_hash_expiry(self, ext):
         """
-        UserChoice Hash 过期处理：
-        将基准中 UserChoice 设为 None（接受系统默认关联），确保 HKCR/.ext 正确。
+        UserChoice Hash 过期降级恢复（无 Hash 恢复）：
+        Windows 会校验并删除无效 Hash 的 UserChoice 键，此时恢复 UserChoice
+        永远不可能成功（Hash 算法随系统版本变化）。降级策略保证打开方式可控：
+        1) 写 HKCR\\.ext 默认值 = 基准 ext（TI 下=HKLM 部分），并删除用户
+           HKCU\\Software\\Classes\\.ext 默认值覆盖，让 HKCR 默认真实生效
+        2) OpenWithProgids 加入基准 ProgId（保持"打开方式"可选列表完整）
+        3) 删除 UserChoice 键（如有残留，避免半失效状态）
+        4) 基准 UserChoice 置 None（接受无 UserChoice 状态）
         返回 True 表示已处理。
         """
         with self._lock:
             bl = self.baseline.baseline.get(ext)
             if not bl:
                 return False
+            # 1) 无 Hash 恢复：HKCR ext 默认 = 基准值
+            bl_ext = bl.get("hkcr_ext", {})
+            bl_ext_val = bl_ext.get("value")
+            if bl_ext_val:
+                try:
+                    reg_write_value(HKCR, ext, "", bl_ext_val,
+                                    bl_ext.get("type", winreg.REG_SZ))
+                except Exception:
+                    pass
+                # TI 下 HKCR 不含用户 HKCU\\Software\\Classes 覆盖：
+                # 删除用户级默认值覆盖，让 HKCR 默认真实生效
+                try:
+                    reg_delete_value(HKCU, "Software\\Classes\\" + ext, "")
+                except Exception:
+                    pass
+            # 2) OpenWithProgids 补基准 ProgId（保持"打开方式"可选列表）
+            bl_prog = None
+            for k in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext"):
+                it = bl.get(k)
+                if it and it.get("value"):
+                    bl_prog = it["value"]
+                    break
+            if bl_prog:
+                try:
+                    reg_write_value(HKCU, f"Software\\Classes\\{ext}\\OpenWithProgids",
+                                    bl_prog, "", winreg.REG_SZ)
+                except Exception:
+                    pass
+            # 3) 删除 UserChoice 键（如有残留）
+            try:
+                force_delete_userchoice(ext)
+            except Exception:
+                pass
+            # 4) 基准 UserChoice 置 None（接受无 UserChoice 状态）
             changed = False
             for key in ("userchoice_progid", "userchoice_hash"):
                 item = bl.get(key)
@@ -2109,7 +3071,8 @@ class ProtectionEngine:
                     changed = True
             if changed:
                 self.baseline.save()
-                log_event(ext, "UserChoice", "Hash过期", "已自动回退到系统默认关联(HKCR)")
+                log_event(ext, "UserChoice", "Hash过期降级",
+                          f"无Hash恢复: HKCR默认={bl_ext_val} OpenWith={bl_prog}")
         # 确保 HKCR/.ext 默认值正确（系统回退关联）
         hkcr_val = read_hkcr_effective(ext, "")[0]
         if hkcr_val:
@@ -2151,6 +3114,11 @@ class ProtectionEngine:
             if key == "new_progid_command" or not isinstance(bl_item, dict):
                 continue
 
+            if not bl_item.get("read_ok", True):
+                # 快照时该位置读取失败（权限不足/重映射盲区，root='?' 或 read_ok=False），
+                # 基准值本身不可信：跳过检测，避免把"读不到"误报为"被篡改"
+                continue
+
             if uc_is_system_default and key in ("userchoice_progid", "userchoice_hash"):
                 continue
 
@@ -2167,9 +3135,13 @@ class ProtectionEngine:
             else:
                 if root_name is None:
                     continue
-                root = ROOT_MAP.get(str(root_name))
+                root = _get_root(str(root_name))
                 if root is None:
-                    continue
+                    # 兼容旧快照 root='?'（HKCU 位置）：按 key 名推导根，
+                    # 否则 hkcu_ext/hkcu_command 等用户级位置永远不检测
+                    root = _get_root(_key_root_name(key))
+                    if root is None:
+                        continue
                 path = bl_item.get("path", "")
                 if not path:
                     continue
@@ -2190,7 +3162,13 @@ class ProtectionEngine:
             bl_val = bl_item.get("value")
             bl_type = bl_item.get("type")
             if cur_val is None:
-                # 当前无关联（该软件未安装/已卸载）= 正常状态，不视为不一致
+                # UserChoice 键丢失必须报不一致：基准有 UserChoice 值而键当前不存在，
+                # 说明恢复流程"删除→重建"后键未建回、或写入的 Hash 被 Windows 校验删除、
+                # 或键被外部删除。若此处跳过，恢复会被"假验证通过"掩盖——实际关联已
+                # 回退系统默认，用户看到"恢复/同意不生效"。其他键当前无值视为
+                # 软件卸载等正常状态，不报，避免卸载误报死循环。
+                if key in ("userchoice_progid", "userchoice_hash") and bl_val is not None:
+                    mismatches.append((key, bl_val, None, None))
                 continue
             if not self._values_equal(bl_val, cur_val, bl_type, cur_type):
                 mismatches.append((key, bl_val, cur_val, cur_type))
@@ -2209,7 +3187,7 @@ class ProtectionEngine:
                 ("HKCR", f"{cur_prog_id}\\shell\\open\\command"),
                 ("HKLM", f"SOFTWARE\\Classes\\{cur_prog_id}\\shell\\open\\command"),
             ):
-                root = ROOT_MAP.get(root_name)
+                root = _get_root(root_name)
                 if root is None:
                     continue
                 if root_name == "HKCR" and HKCU_REMAPPED:
@@ -2261,7 +3239,31 @@ class ProtectionEngine:
         userchoice_recovered = False
         uc_path = f"{USERCHOICE_BASE}\\{ext}\\UserChoice"
 
-        for key, bl_val, cur_val, cur_type in mismatches:
+        # === 按链验收：恢复必须覆盖基准全部保护位置，而非仅 mismatches ===
+        # check_extension 对"基准有值而当前键缺失"的非 UserChoice 位置采取豁免
+        # （视为软件卸载/正常状态），这些位置的丢失不会进入 mismatches；若只恢复
+        # mismatches，ProgId 被改（如 qwe→ewq）时 command 等位置可能漏恢复——
+        # 用户看到"已恢复"但打开关联实际缺失（恢复/同意不生效的另一来源）。
+        # 因此：当 mismatches 含任何 ProgId 载体位置（userchoice_progid /
+        # hkcr_ext / hkcu_ext / hklm_ext）时，强制补齐恢复全部 command 位置；
+        # 卸载场景（无 ProgId 载体变化）仍走豁免，不复活已卸载关联。
+        has_progid_change = any(
+            k in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext")
+            for k, _, _, _ in mismatches)
+        recover_set = {m[0] for m in mismatches}
+        if has_progid_change:
+            # ProgId 载体被改：补齐 ext 3 位置 + command 3 位置。
+            # ext 位置必须一起恢复：UserChoice 恢复若被 Windows 拒绝（Hash 无效）
+            # 会删除 UserChoice 键回退到 ext 默认，若 ext 未恢复则回退到被篡改值。
+            recover_set.update(("hkcr_ext", "hkcu_ext", "hklm_ext",
+                                "hkcr_command", "hkcu_command", "hklm_command"))
+
+        _RECOVER_ORDER = {
+            "hkcr_ext": 0, "hkcu_ext": 1, "hklm_ext": 2,
+            "userchoice_progid": 3, "userchoice_hash": 4,
+            "hkcr_command": 5, "hkcu_command": 6, "hklm_command": 7,
+        }
+        for key in sorted(recover_set, key=lambda k: _RECOVER_ORDER.get(k, 9)):
             if key == "new_progid_command":
                 details.append("新ProgId命令:已随ProgId恢复失效")
                 continue
@@ -2271,6 +3273,11 @@ class ProtectionEngine:
                     userchoice_recovered = True
                     bl_progid = bl.get("userchoice_progid", {})
                     bl_hash = bl.get("userchoice_hash", {})
+                    if not (bl_progid.get("read_ok", True) and bl_hash.get("read_ok", True)):
+                        # 基准 UserChoice 读取失败（盲区）：不能盲目写入可能错误的基准值
+                        fail += 2
+                        details.append("UserChoice:基准读取失败(盲区)，无法确认基准值，跳过恢复")
+                        continue
                     has_progid = bl_progid.get("value") is not None
                     has_hash = bl_hash.get("value") is not None
 
@@ -2285,18 +3292,44 @@ class ProtectionEngine:
                     else:
                         uc_ok = True
                         uc_parts = []
-                        del_ok, del_method = force_delete_userchoice(ext)
-                        if not del_ok:
-                            uc_parts.append(f"删除失败({del_method}),尝试直接写入")
+                        # 先写后删（减少中间态暴露）：直接打开/创建 UserChoice 键写入
+                        # ProgId + 重算 Hash 并读回验证；仅当 Windows 校验拒绝（Hash
+                        # 无效被删键）时才删除键回退 ext 默认。（原实现先删键再重建，
+                        # 删除瞬间系统回退 ext 默认——可能是被篡改值，短暂暴露）
                         try:
                             kh = winreg.CreateKeyEx(HKCU, uc_path, 0, KEY_ALL_ACCESS_64)
                             if has_progid:
                                 winreg.SetValueEx(kh, "ProgId", 0, bl_progid["type"], bl_progid["value"])
                                 uc_parts.append("ProgId已恢复")
-                            if has_hash and bl_hash.get("value") is not None:
+                            # Hash 必须以当前时间戳重算：写回基准旧 Hash 会被 Windows 校验删除
+                            # （UserChoice Hash 与 ext+SID+ProgId+FILETIME+UserExperience 绑定）
+                            new_hash = None
+                            if has_progid and bl_progid.get("value"):
+                                new_hash = compute_userchoice_hash(ext, bl_progid["value"])
+                            if new_hash:
+                                winreg.SetValueEx(kh, "Hash", 0, winreg.REG_SZ, new_hash)
+                                uc_parts.append("Hash已重算")
+                            elif has_hash and bl_hash.get("value") is not None:
                                 winreg.SetValueEx(kh, "Hash", 0, bl_hash["type"], bl_hash["value"])
-                                uc_parts.append("Hash已恢复")
+                                uc_parts.append("Hash已恢复(旧值,可能被系统重置)")
                             winreg.CloseKey(kh)
+                            # 写入后立即读回验证：Windows 校验 UserChoice Hash 无效时
+                            # 会删除整个键或 Hash 值——写入"成功"但实际未生效（12:15:13
+                            # 实锤：ProgId已恢复/Hash已重算 但验证失败、键随后被删）。
+                            # 检测到未生效 → 删除键回退 ext 默认（ext 位置已随
+                            # has_progid_change 加入 recover_set 恢复为基准）。
+                            try:
+                                v_progid, _ = reg_read_value(HKCU, uc_path, "ProgId")
+                                v_hash, _ = reg_read_value(HKCU, uc_path, "Hash")
+                                if has_progid and (v_progid != bl_progid["value"] or not v_hash):
+                                    raise OSError("UserChoice写入被Windows校验拒绝(Hash无效)")
+                            except OSError:
+                                uc_ok = False
+                                uc_parts.append("写入被拒,键已删除回退HKCR")
+                                try:
+                                    force_delete_userchoice(ext)
+                                except Exception:
+                                    pass
                         except OSError as e:
                             uc_ok = False
                             uc_parts.append(f"写入失败:{e}")
@@ -2315,12 +3348,22 @@ class ProtectionEngine:
                 details.append(f"{key}:基准项缺失")
                 continue
 
-            root_name = bl_item.get("root") or "?"
-            root = ROOT_MAP.get(str(root_name))
-            if root is None:
+            if not bl_item.get("read_ok", True):
+                # 快照时该位置读取失败（权限/重映射盲区）：不知道基准值应是什么，
+                # 不能盲目写入（可能覆盖真实状态），跳过并明确警告
                 fail += 1
-                details.append(f"{self.ITEM_LABELS.get(key, key)}:root无效({root_name})")
+                details.append(f"{self.ITEM_LABELS.get(key, key)}:基准读取失败(盲区)，无法确认基准值，跳过恢复")
                 continue
+
+            root_name = bl_item.get("root") or "?"
+            root = _get_root(str(root_name))
+            if root is None:
+                # 兼容旧快照 root='?'（HKCU 位置）：按 key 名推导
+                root = _get_root(_key_root_name(key))
+                if root is None:
+                    fail += 1
+                    details.append(f"{self.ITEM_LABELS.get(key, key)}:root无效({root_name})")
+                    continue
 
             path = bl_item.get("path", "")
             name = bl_item.get("name", "")
@@ -2357,6 +3400,40 @@ class ProtectionEngine:
                 else:
                     fail += 1
                     details.append(f"{self.ITEM_LABELS.get(key, key)}:恢复失败(权限不足?)")
+
+        # === 残留 ProgId 清理 ===
+        # 恢复后若当前 ProgId 仍与基准不一致（如 qwe→ewq 场景下 ewq 的
+        # shell\open\command 键残留），删除残留 command 键，保证验收口径
+        # "7 个位置全部恢复为基准所记录"。
+        try:
+            bl_progid_for_clean = None
+            for k in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext"):
+                item = bl.get(k)
+                if item and item.get("value"):
+                    bl_progid_for_clean = item["value"]
+                    break
+            cur_progid_after = get_prog_id(ext)
+            if (cur_progid_after and bl_progid_for_clean
+                    and str(cur_progid_after).lower() != str(bl_progid_for_clean).lower()):
+                for root_name, reg_path in (
+                    ("HKCR", f"{cur_progid_after}\\shell\\open\\command"),
+                    ("HKCU", f"Software\\Classes\\{cur_progid_after}\\shell\\open\\command"),
+                    ("HKLM", f"SOFTWARE\\Classes\\{cur_progid_after}\\shell\\open\\command"),
+                ):
+                    root = _get_root(root_name)
+                    if root is None:
+                        continue
+                    try:
+                        if reg_delete_value(root, reg_path, ""):
+                            success += 1
+                            details.append(f"残留ProgId命令:已删除({root_name})")
+                        else:
+                            fail += 1
+                            details.append(f"残留ProgId命令:删除失败({root_name})")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         return success, fail, details
 
@@ -2548,7 +3625,7 @@ class ProtectionEngine:
                 root_name = item.get("root")
                 if root_name is None:
                     continue
-                root = ROOT_MAP.get(str(root_name))
+                root = _get_root(str(root_name))
                 if root is None:
                     continue
                 name = item.get("name", "")
@@ -3186,6 +4263,10 @@ class MonitorThread(threading.Thread):
         self.app = popup_callback.__self__ if hasattr(popup_callback, "__self__") else None  # MainWindow 实例引用
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        # #4 事件驱动监控：预初始化（通知线程启动失败时主循环退化为纯轮询）
+        self._reg_change_evt = threading.Event()
+        self._notify_stop = threading.Event()
+        self._notify_threads = []
         self._last_deep_scan = time.time()
         self._last_hkcu_check = 0
         self._grace_until = time.time() + self.GRACE_PERIOD_SECONDS
@@ -3231,6 +4312,12 @@ class MonitorThread(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+        # #4 事件驱动监控：同时停止注册表通知线程（同步阻塞会被 0.1s 间隔打断退出）
+        try:
+            self._notify_stop.set()
+            self._reg_change_evt.set()
+        except Exception:
+            pass
 
     def pause(self):
         self._pause_event.set()
@@ -3238,8 +4325,67 @@ class MonitorThread(threading.Thread):
     def resume(self):
         self._pause_event.clear()
 
+    def _start_reg_notify(self):
+        """#4 事件驱动监控：RegNotifyChangeKeyValue 实时监控关联关键子树，
+        变化时唤醒主循环立即扫描，替代纯 2 秒轮询（降低篡改检测延迟与
+        全量扫描开销）。监控根：
+          HKCU/Software/Classes（用户级 ext 关联）
+          HKCU/.../Explorer/FileExts（UserChoice ProgId/Hash）
+          HKLM/SOFTWARE/Classes（系统级关联）
+        任一子树变化 -> self._reg_change_evt.set() -> 主循环提前醒来扫描。"""
+        try:
+            self._notify_stop = threading.Event()
+            self._reg_change_evt = threading.Event()
+            self._notify_threads = []
+            roots = [
+                (HKCU, "Software\\Classes"),
+                (HKCU, "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts"),
+                (HKLM, "SOFTWARE\\Classes"),
+            ]
+            for _root, _sub in roots:
+                try:
+                    _t = threading.Thread(target=self._reg_notify_worker,
+                                          args=(_root, _sub), daemon=True)
+                    _t.start()
+                    self._notify_threads.append(_t)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _reg_notify_worker(self, root, sub):
+        """单个子树的阻塞式注册表通知循环：键变化 → 设置唤醒事件"""
+        while not self._notify_stop.is_set():
+            try:
+                hkey = winreg.CreateKeyEx(root, sub, 0, KEY_READ | KEY_NOTIFY)
+            except Exception:
+                # 子树不可打开（无此键/权限不足）：等待后重试，不崩溃
+                self._notify_stop.wait(3)
+                continue
+            try:
+                # 同步阻塞直到子树变化（同步模式比异步事件句柄可靠）
+                ret = _RegNotifyChangeKeyValue(int(hkey), True, REG_NOTIFY_FILTER, None, False)
+                if ret != 0:
+                    self._notify_stop.wait(0.5)
+                    continue
+            finally:
+                try:
+                    winreg.CloseKey(hkey)
+                except Exception:
+                    pass
+            if self._notify_stop.is_set():
+                break
+            # 通知到变化：唤醒主循环；稍等防忙循环（变化密集时主循环自行节流）
+            self._reg_change_evt.set()
+            self._notify_stop.wait(0.1)
+
     def run(self):
         logger.info("监控线程启动")
+        # #4 事件驱动监控：启动注册表通知线程（失败自动退化为纯轮询）
+        try:
+            self._start_reg_notify()
+        except Exception:
+            pass
         while not self._stop_event.is_set():
             self.last_cycle_ts = time.time()  # 心跳：每轮周期更新
             mode = self.baseline.config.get("operation_mode", "normal")
@@ -3279,7 +4425,21 @@ class MonitorThread(threading.Thread):
             # 持续篡改模式或高频观察期：缩短轮询间隔到0.5秒
             need_fast = self._persistent_mode or self.persistent_tracker.has_high_freq_exts()
             interval = 0.5 if need_fast else POLL_INTERVAL
-            time.sleep(interval)
+            if need_fast:
+                # 快速模式：纯轮询（持续篡改对抗需要密集采样）
+                time.sleep(interval)
+            elif self._notify_threads:
+                # 事件驱动：注册表变化立即唤醒（RegNotifyChangeKeyValue 实时通知），
+                # 无变化时按 POLL_INTERVAL 兜底轮询（防通知线程异常漏报）。
+                # 事件风暴节流：变化后至少再等 0.3s 合并连续写入，避免
+                # 持续篡改对抗/程序自身恢复写注册表时触发扫描风暴
+                self._reg_change_evt.wait(interval)
+                if self._reg_change_evt.is_set():
+                    self._reg_change_evt.clear()
+                    time.sleep(0.3)
+            else:
+                # 通知线程未启动（如 HKCR 权限异常）：退化为纯轮询
+                time.sleep(interval)
 
         # 退出时解锁所有锁定的键
         self._unlock_all()
@@ -3494,6 +4654,33 @@ class MonitorThread(threading.Thread):
                 verified = True
                 break
 
+        # === 独立进程二次检测（交互用户视角终验）===
+        # TI 下读 HKCU 为重映射句柄、HKCR 为合并视图，与用户实际所见存在
+        # 视角差异。派发一个以交互用户 token 运行的只读子进程（--verify-ext）
+        # 重新读取 7 位置，确认"恢复"在用户视角真实生效。
+        # 失败/超时不阻断主流程（已有本进程读回验证兜底），仅记录证据。
+        try:
+            _vok, _vrep = interactive_verify_ext(ext)
+            if _vrep and isinstance(_vrep, dict):
+                _vitems = _vrep.get("items", {})
+                _vuc = _vitems.get("userchoice_progid", {}) or {}
+                _vuc_v = _vuc.get("value")
+                _vuc_ok = _vuc.get("read_ok", True)
+                _vexp = None
+                if verified:
+                    _vbl0 = self.engine.baseline.baseline.get(ext, {}) or {}
+                    _vexp = (_vbl0.get("userchoice_progid", {}) or {}).get("value")
+                _vverdict = "通过" if (_vuc_ok and _vexp is not None and _vuc_v == _vexp) else "未通过"
+                if _vexp is None and _vuc_v is None and _vuc_ok:
+                    _vverdict = "通过(均无UserChoice)"
+                log_event(ext, "恢复", "二次检测",
+                          f"用户视角UserChoice={_vuc_v} 期望={_vexp} 结果={_vverdict}")
+            else:
+                log_event(ext, "恢复", "二次检测",
+                          "独立进程派发失败/超时(已由本地读回验证兜底)")
+        except Exception:
+            pass
+
         return total_success, total_fail, all_details, verified
 
     def _handle_change(self, ext, mismatches):
@@ -3581,7 +4768,7 @@ class MonitorThread(threading.Thread):
                     name, _ = identify_tamperer(cur_progid)
                     if name:
                         tamperer = f" [{name}]"
-                self.log_callback(f"⚠ 批量篡改: {batch_label} 涉及{len(batch_exts)}个扩展名，BH{level}{tamperer}", "warn")
+                self.log_callback(f"⚠ 检测到批量篡改：{tamperer}一次修改了 {len(batch_exts)} 个扩展名的打开方式（第{level}级防护），已升级防护", "warn")
                 log_event("ALL", "批量篡改", "检测到", f"分组={cur_progid}, 扩展名数={len(batch_exts)}, BH{level}" + (f" 篡改者={name}" if name else ""))
                 # 进程打击：虚拟分组ID不用于匹配进程，只打击黑名单
                 enforce_progid = None if cur_progid.startswith("__") else cur_progid
@@ -3627,7 +4814,7 @@ class MonitorThread(threading.Thread):
                 name, _ = identify_tamperer(cur_progid)
                 if name:
                     tamperer = f" [{name}]"
-            self.log_callback(f"⚠ {ext} {reason}，BH{level}{tamperer}", "warn")
+            self.log_callback(f"⚠ {ext} 被反复修改（{reason}{tamperer}），已触发第{level}级防护并临时锁定——如属你的正常操作，请点「停止保护」调整后再「备份当前基准」", "warn")
             log_event(ext, "持续篡改", "检测到", f"BH{level}({reason})" + (f" 篡改者={name}" if name else ""))
             # 先恢复被篡改的值
             s, f, dets, verified = self._recover_with_verify(ext, mismatches, max_retries=3)
@@ -3652,7 +4839,7 @@ class MonitorThread(threading.Thread):
                         rel_locked.append(f"{rel_ext}({r_ok}/{r_total})")
             lock_status = f"{ok_cnt}/{total}位置" if ok_cnt > 0 else f"失败({dets})"
             rel_info = f" 关联锁定: {', '.join(rel_locked)}" if rel_locked else ""
-            self.log_callback(f"  {ext} 全位置强锁定{lock_status}{rel_info}", "info")
+            self.log_callback(f"  {ext} 全位置强锁定{lock_status}{rel_info}（已临时锁定该扩展名的打开方式，防止继续被改；「异常修复」可解除）", "info")
             log_event(ext, "全位置强锁定", lock_status + rel_info, dets)
             self.persistent_tracker.mark_locked(ext)
             # 进程打击：Untrusted降权（虚拟分组ID不用于匹配进程）
@@ -3729,7 +4916,7 @@ class MonitorThread(threading.Thread):
         if verified:
             self.engine.reset_uc_failure(ext)
             log_event(ext, "恢复", "成功", "默认保护基准(已验证)")
-            self.log_callback(f"{ext} 已恢复到基准(已验证) BH1")
+            self.log_callback(f"{ext} 已恢复到基准（已验证）")
             self.engine.set_cooldown(ext)
         elif only_uc and self.engine.record_uc_failure(ext):
             self.engine.handle_uc_hash_expiry(ext)
@@ -3773,6 +4960,131 @@ def _get_uc_registry_path(ext):
         if sid:
             return f"Registry::HKEY_USERS\\{sid}\\{uc_path}"
     return f"HKCU:\\{uc_path}"
+
+def _md5_bcrypt(data_bytes):
+    """用 Windows bcrypt.dll 计算 MD5（16 字节）。失败返回 None。"""
+    try:
+        bcrypt = ctypes.WinDLL('bcrypt.dll', use_last_error=True)
+        alg = ctypes.c_void_p()
+        if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(alg), ctypes.c_wchar_p("MD5"), None, 0) != 0:
+            return None
+        try:
+            hash_len = ctypes.c_ulong(16)
+            hash_buf = ctypes.create_string_buffer(16)
+            data_len = ctypes.c_ulong(len(data_bytes))
+            if bcrypt.BCryptHash(alg, None, 0, data_bytes, data_len, hash_buf, hash_len) != 0:
+                return None
+            return hash_buf.raw
+        finally:
+            bcrypt.BCryptCloseAlgorithmProvider(alg, 0)
+    except Exception:
+        return None
+
+
+def _uc_wordswap(v):
+    return ((v >> 16) | (v << 16)) & 0xFFFFFFFF
+
+
+def _compute_userchoice_hash_core(ext, sid, progid, ft_100ns):
+    """UserChoice Hash 核心算法（Mozilla WindowsUserChoice.cpp 移植，经社区逆向验证）。
+
+    输入字符串（全小写）：
+      ext + sid + progid + "%08lx"(FILETIME高32位) + "%08lx"(FILETIME低32位)
+      + "User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}"
+    编码 utf16le（含 null 终止符）→ MD5 → CS64 置乱 → 8 字节 → Base64。
+
+    注意：不是 SHA256。写回旧 Hash/错误算法会被 Windows 校验删除整个 UserChoice 键，
+    导致保护"看起来没用"（双击仍打开被篡改后的程序）。
+    """
+    try:
+        if not ext or not sid or not progid:
+            return None
+        user_exp = "User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}"
+        dw_high = (ft_100ns >> 32) & 0xFFFFFFFF
+        dw_low = ft_100ns & 0xFFFFFFFF
+        s = f"{ext}{sid}{progid}{dw_high:08x}{dw_low:08x}{user_exp}".lower()
+        data = s.encode("utf-16le") + b"\x00\x00"
+        byte_count = len(data)
+        block_count = byte_count // 8
+        if block_count == 0:
+            return None
+        md5 = _md5_bcrypt(data)
+        if not md5:
+            return None
+        import struct
+        md5dw = struct.unpack("<4I", md5)
+        c0s = (
+            (md5dw[0] | 1, 0xCF98B111, 0x87085B9F, 0x12CEB96D, 0x257E1D83),
+            (md5dw[1] | 1, 0xA27416F5, 0xD38396FF, 0x7C932B89, 0xBFA49F69),
+        )
+        c1s = (
+            (md5dw[0] | 1, 0xEF0569FB, 0x689B6B9F, 0x79F8A395, 0xC3EFEA97),
+            (md5dw[1] | 1, 0xC31713DB, 0xDDCD1F0F, 0x59C3AF2D, 0x35BD1EC9),
+        )
+        h0 = h1 = h0_acc = h1_acc = 0
+        for i in range(block_count):
+            for j in range(2):
+                off = (i * 2 + j) * 4
+                inp = struct.unpack_from("<I", data, off)[0]
+                c0 = c0s[j]
+                c1 = c1s[j]
+                h0 = (h0 + inp) & 0xFFFFFFFF
+                h0 = (_uc_wordswap(h0) * c0[0]) & 0xFFFFFFFF
+                h0 = (_uc_wordswap(h0) * c0[1]) & 0xFFFFFFFF
+                h0 = (_uc_wordswap(h0) * c0[2]) & 0xFFFFFFFF
+                h0 = (_uc_wordswap(h0) * c0[3]) & 0xFFFFFFFF
+                h0 = (_uc_wordswap(h0) * c0[4]) & 0xFFFFFFFF
+                h0_acc = (h0_acc + h0) & 0xFFFFFFFF
+                h1 = (h1 + inp) & 0xFFFFFFFF
+                h1 = (_uc_wordswap(h1) * c1[1] + h1 * c1[0]) & 0xFFFFFFFF
+                h1 = ((h1 >> 16) * c1[2] + h1 * c1[3]) & 0xFFFFFFFF
+                h1 = (_uc_wordswap(h1) * c1[4] + h1) & 0xFFFFFFFF
+                h1_acc = (h1_acc + h1) & 0xFFFFFFFF
+        out = struct.pack("<II", h0 ^ h1, h0_acc ^ h1_acc)
+        return base64.b64encode(out).decode()
+    except Exception:
+        return None
+
+
+def _now_uc_filetime():
+    """当前 UTC 时间转 FILETIME 100ns（秒级清零：wSecond=0/wMilliseconds=0）。
+    必须用 UTC：UserChoice 的 Hash 校验基于 UTC FILETIME（1601-01-01T00:00:00Z 起算），
+    若用本地时间（如 UTC+8），算出的 Hash 与 Windows 校验值差 8 小时 → 被判定无效
+    → 整个 UserChoice 键被删除 → 恢复/同意"不生效"（12:15:13 实锤）。
+    返回 (ft_high, ft_low) 32 位对。"""
+    try:
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None, microsecond=0, second=0)
+        delta = now - _dt.datetime(1601, 1, 1)
+        ft100 = int(delta.total_seconds() * 10_000_000)
+        return (ft100 >> 32) & 0xFFFFFFFF, ft100 & 0xFFFFFFFF, ft100
+    except Exception:
+        return None, None, None
+
+
+def compute_userchoice_hash(ext, progid):
+    """重新计算 UserChoice Hash（FveHash 算法，Mozilla 移植版）。
+
+    Windows 的 UserChoice 校验：Hash = Base64(CS64(MD5(UTF16LE(
+    ext + SID + ProgId + FILETIME(秒清零) + UserExperience字符串)))).
+    恢复时若写回基准中的旧 Hash 或采用错误算法，Windows 会将其视为无效并
+    删除整个 UserChoice 键（导致保护"看起来没用"）。
+    写入时必须用当前时间戳重算。返回新 Hash 字符串；失败返回 None。
+    """
+    try:
+        if not progid:
+            return None
+        guid = None
+        sid = get_interactive_user_sid()
+        if not sid:
+            return None
+        high, low, ft100 = _now_uc_filetime()
+        if ft100 is None:
+            return None
+        return _compute_userchoice_hash_core(ext, sid, progid, ft100)
+    except Exception:
+        return None
+
 
 def force_delete_userchoice(ext):
     """强制删除UserChoice键，尝试10种方法。返回 (success, method)"""
@@ -4534,6 +5846,11 @@ class ProcessEnforcer:
         self._redlist = set()         # 红名单（永久标记，暂不执行）
         self._blacklist_history = {}  # 进程路径 -> 累计被拉黑次数
         self._suspect_count = {}      # 进程路径 -> 关联篡改次数
+        # #1 进程打击默认降级：非黑名单进程（仅ProgId关联/可疑）不执行
+        # 冻结/强终止等高强度动作，默认只降权（untrusted），避免误伤正常程序。
+        # 黑名单进程（用户确认或多次关联自动拉黑）仍按原动作执行。
+        # 设置页「进程打击强度」可切回 strict（原行为）。
+        self._strike_level = "gentle"
         self._blacklist_file = blacklist_file
         self._history_file = history_file or (blacklist_file.replace(".json", "_history.json") if blacklist_file else None)
         # 加载黑名单
@@ -4819,19 +6136,32 @@ class ProcessEnforcer:
                                 "svchost.exe", "explorer.exe"):
                 continue
             newly_blacklisted, is_red = self.record_suspect(path)
-            if action == "lower":
+            # #1 进程打击默认降级：非黑名单进程（仅ProgId关联/可疑）的高强度
+            # 动作（挂起/强终止/全冻结）自动降级为 Untrusted 降权，避免误杀
+            # 正常程序；黑名单进程（用户确认/多次关联自动拉黑）仍按原动作执行。
+            effective_action = action
+            if (self._strike_level != "strict"
+                    and action in ("terminate", "suspend", "freeze")
+                    and path not in self._blacklist
+                    and name.lower() not in self._blacklist):
+                effective_action = "untrusted"
+                degraded = True
+            else:
+                degraded = False
+            if effective_action == "lower":
                 ok = self.lower_priority(pid)
                 results.append((name, "降权", ok, reason))
-            elif action == "suspend":
+            elif effective_action == "suspend":
                 ok = self.suspend_process(pid)
                 results.append((name, "挂起", ok, reason))
-            elif action == "terminate":
+            elif effective_action == "terminate":
                 ok = self.terminate_process(pid)
                 results.append((name, "终止", ok, reason))
-            elif action == "untrusted":
+            elif effective_action == "untrusted":
                 ok, msg = lower_process_integrity(pid, "untrusted")
-                results.append((name, "Untrusted降权", ok, f"{reason}({msg})"))
-            elif action == "freeze":
+                _tag = "（原动作已降级为降权）" if degraded else ""
+                results.append((name, "Untrusted降权", ok, f"{reason}({msg}){_tag}"))
+            elif effective_action == "freeze":
                 ok, msg = suspend_process(pid)
                 results.append((name, "全冻结", ok, f"{reason}({msg})"))
             if newly_blacklisted:
@@ -4868,6 +6198,8 @@ class MainWindow:
         self._popup_last_reason = None    # 上一个弹窗关闭原因："consent"/"timeout"
         self._popup_timeout_reset_after = None  # 2s短超时恢复到正常配置的计时器
         self._pending_ask = set()  # 先询问模式：正在等待用户决定的扩展名集合（防重复弹窗）
+        self._popup_count = {}  # ext -> 连续弹窗未同意次数（弹窗骚扰上限）
+        self.POPUP_LIMIT = 5  # 同扩展名连续弹窗（用户均未同意）达此值后自动转静默阻止
         self._deep_scan_running = False  # 手动深层扫描运行中标志（防并行重复扫描）
         self.ti_elevated = ti_elevated  # TrustedInstaller 提权状态
         self.ti_status = ti_status
@@ -4897,6 +6229,12 @@ class MainWindow:
             _bl_p = os.path.join(USERDATA_DIR, "process_blacklist.json")
             _hist_p = os.path.join(USERDATA_DIR, "process_blacklist_history.json")
             self.process_enforcer = ProcessEnforcer(_bl_p, _hist_p)
+            # #1 进程打击强度从配置同步（默认 gentle：非黑名单进程只降权不强杀）
+            try:
+                _strike_lvl = (self.baseline_mgr.config or {}).get("process_strike_level", "gentle")
+                self.process_enforcer._strike_level = _strike_lvl if _strike_lvl in ("gentle", "strict") else "gentle"
+            except Exception:
+                pass
         except Exception:
             self.process_enforcer = None
         self._build_ui()
@@ -5059,11 +6397,11 @@ class MainWindow:
 
         self._nav_buttons = {}
         self._nav_sel = None
-        # 导航：状态 / 扩展名 / 防护记录 / 异常修复 / 默认应用 / 配置与备份 / 设置 / 关于（日志页保留但不再出现在导航，从设置页进入）
-        for key, text in [("home", "状态"), ("exts", "扩展名"),
+        # 导航：状态 / 扩展名·默认应用 / 防护记录 / 异常修复 / 设置·配置与备份 / 关于
+        # （默认应用与配置备份已分别并入扩展名页、设置页；日志页从设置页进入）
+        for key, text in [("home", "状态"), ("exts", "扩展名·默认应用"),
                           ("history", "防护记录"), ("tools", "异常修复"),
-                          ("defapps", "默认应用"), ("config", "配置与备份"),
-                          ("settings", "设置"), ("about", "关于")]:
+                          ("settings", "设置·配置与备份"), ("about", "关于")]:
             item = self._make_nav_item(nav, key, text)
             item.pack(fill="x", padx=8, pady=2)
 
@@ -5086,13 +6424,21 @@ class MainWindow:
         self._scroll_canvases = []
         self._scroll_bound = False
         self._build_page_home(content)
-        self._build_page_exts(content)
+        # 扩展名页（上：锁定框）内嵌默认应用（下）
+        _exts_body = self._build_page_exts(content)
+        try:
+            self._build_page_defapps(_exts_body, embed=True)
+        except Exception:
+            pass
         self._build_page_history(content)
         self._build_page_tools(content)
-        self._build_page_defapps(content)
-        self._build_page_config(content)
         self._build_page_log(content)
-        self._build_page_settings(content)
+        # 设置页内嵌配置与备份
+        _settings_body = self._build_page_settings(content)
+        try:
+            self._build_page_config(_settings_body, embed=True)
+        except Exception:
+            pass
         self._build_page_about(content)
         # 所有页面构建完成后，统一收集可滚动小项并绑定“单击激活”滚轮逻辑
         # （延迟收集：小项控件在 _mk_scroll_container 之后才创建）
@@ -5594,7 +6940,11 @@ class MainWindow:
             return "break"
         try:
             w.bind("<MouseWheel>", _wheel)
-            w.bind("<Button-1>", lambda _e: self._wheel_active.add(w), add="+")
+            # 唯一激活：点击某小项时，其他已激活小项全部解除。
+            # （原实现用 add() 叠加，点击多个小项后它们同时保持激活，
+            #  用户感知为"点击大界面/别处后小界面滚轮没结束"；
+            #  改为 set 替换后，任意时刻只有最后点击的小项响应滚轮。）
+            w.bind("<Button-1>", lambda _e, _w=w: self._wheel_active.clear() or self._wheel_active.add(_w), add="+")
         except Exception:
             pass
 
@@ -5672,8 +7022,37 @@ class MainWindow:
         # 全局可滑动：整页内容放入滚动容器（窗口最大化后内容仍可完整访问）
         body = self._mk_scroll_container(page)
 
-        # 卡片1：保护状态（状态行 + 启动/停止 + 进程自我保护合并排布，可自动换行）
-        card, cb = self._mk_card(body, "保护状态", "实时监控 7 项注册表位置，阻止第三方软件篡改默认打开方式")
+        # 水平两栏：左侧=保护输出（可滚动），右侧=保护状态+启动/停止按钮
+        # （原布局按钮在输出框上方，窗口高度不足时被推出视口需下滑才可见；
+        #  用户建议：将按钮放到输出框右侧，打开状态页即可直接操作）
+        mid_row = tk.Frame(body, bg=self.C["bg"])
+        mid_row.pack(fill="both", expand=True, pady=(0, 12))
+
+        # 左栏：主界面输出窗口（实时输出保护事件与状态）
+        out_card = tk.Frame(mid_row, bg=self.C["card"],
+                            highlightbackground=self.C["card_border"],
+                            highlightthickness=1, bd=0)
+        out_card.pack(side="left", fill="both", expand=True)
+        tk.Label(out_card, text="保护输出", font=("微软雅黑", 11, "bold"),
+                 fg=self.C["text"], bg=self.C["card"], anchor="w"
+                 ).pack(fill="x", padx=16, pady=(12, 4))
+        self.status_output = scrolledtext.ScrolledText(out_card, font=("Consolas", 9),
+                                                       wrap="word", state="disabled",
+                                                       bg="#1A1A1A", fg="#D4D4D4",
+                                                       insertbackground="#D4D4D4",
+                                                       relief="flat", bd=0, height=26,
+                                                       highlightbackground=self.C["card_border"],
+                                                       highlightthickness=1)
+        self.status_output.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        for tag, color in (("info", "#D4D4D4"), ("warn", "#FCE100"),
+                           ("error", "#FF99A4"), ("success", "#6CCB5F")):
+            self.status_output.tag_config(tag, foreground=color)
+
+        # 右栏：保护状态（状态行 + 启动/停止 + 进程自我保护 + 实时提示）
+        side = tk.Frame(mid_row, bg=self.C["bg"], width=320)
+        side.pack(side="right", fill="y", padx=(12, 0))
+        side.pack_propagate(False)
+        card, cb = self._mk_card(side, "保护状态", "实时监控 7 项注册表位置，阻止第三方软件篡改默认打开方式")
         self.status_label = tk.Label(cb, text="● 状态：未初始化",
                                      font=("微软雅黑", 14, "bold"),
                                      fg=self.C["text2"], bg=self.C["card"], anchor="w")
@@ -5701,26 +7080,6 @@ class MainWindow:
                                     anchor="w", justify="left")
         self._home_hints.pack(fill="x", pady=(6, 0))
         self._refresh_home_hints()
-
-        # 卡片2：主界面输出窗口（原版风格，实时输出保护事件与状态）
-        out_card = tk.Frame(body, bg=self.C["card"],
-                            highlightbackground=self.C["card_border"],
-                            highlightthickness=1, bd=0)
-        out_card.pack(fill="x", pady=(0, 12))
-        tk.Label(out_card, text="保护输出", font=("微软雅黑", 11, "bold"),
-                 fg=self.C["text"], bg=self.C["card"], anchor="w"
-                 ).pack(fill="x", padx=16, pady=(12, 4))
-        self.status_output = scrolledtext.ScrolledText(out_card, font=("Consolas", 9),
-                                                       wrap="word", state="disabled",
-                                                       bg="#1A1A1A", fg="#D4D4D4",
-                                                       insertbackground="#D4D4D4",
-                                                       relief="flat", bd=0, height=26,
-                                                       highlightbackground=self.C["card_border"],
-                                                       highlightthickness=1)
-        self.status_output.pack(fill="x", padx=16, pady=(0, 14))
-        for tag, color in (("info", "#D4D4D4"), ("warn", "#FCE100"),
-                           ("error", "#FF99A4"), ("success", "#6CCB5F")):
-            self.status_output.tag_config(tag, foreground=color)
 
         # 底部信息栏：权限摘要 + 常用操作（按钮自动换行适配窗口缩放）
         bar = tk.Frame(body, bg=self.C["card"],
@@ -5856,6 +7215,7 @@ class MainWindow:
         self._lock_ext_status.pack(fill="x", pady=(0, 4))
         self._lock_row_map = {}
         self._refresh_locked_ext_list()
+        return body
 
     def _lock_ext_normalize(self):
         """扩展名规范化：自动补 . 前缀 + 统一小写"""
@@ -6456,11 +7816,67 @@ class MainWindow:
             ("历史版本管理", self._show_history),
             ("锁定模式 / 解除锁定", self._repair_global_lock),
             ("重置启动宽限期", self._repair_reset_grace),
+            ("用户视角检查", self._manual_verify_view),
         ])
 
         bottom = tk.Frame(content, bg=self.C["bg"])
         bottom.pack(fill="x", pady=(8, 4))
         make_button(bottom, "一键全部修复（20 项全部执行）", _wrap_jump(self._repair_all), height=2).pack(fill="x", pady=2)
+
+    def _manual_verify_view(self):
+        """用户视角检查：派发独立进程（交互用户权限）读取指定扩展名 7 位置
+        真实状态，与程序本进程视角对比，显示差异。
+        用于自查"程序看到的和系统实际看到的是否一致"（TI 重映射/HKCR 合并
+        视图与用户视角可能不同；恢复/同意后也用它确认真正生效）。"""
+        try:
+            import tkinter.simpledialog as _sd
+        except Exception:
+            _sd = None
+        if _sd is None:
+            self._append_log("用户视角检查：无法加载输入对话框", "error")
+            return
+        ext = _sd.askstring(APP_NAME, "输入要检查的扩展名（如 .jpeg）", parent=self.root)
+        if not ext:
+            return
+        ext = ext.strip().lower()
+        if not ext.startswith("."):
+            ext = "." + ext
+        self._append_log(f"正在执行用户视角检查: {ext} ...", "info")
+
+        def _do():
+            try:
+                _rep = interactive_verify_ext(ext)
+                if not _rep:
+                    self.root.after(0, lambda: self._append_log(
+                        f"{ext} 用户视角检查失败（独立进程未返回，可能无交互会话或未提权）", "error"))
+                    return
+                _ok, _data = _rep
+                _items = (_data or {}).get("items", {})
+                # 程序本进程视角（TI/普通权限）
+                _local = {}
+                try:
+                    _paths = get_extension_paths(ext, get_prog_id(ext))
+                    for _k, (_r, _p, _n) in _paths.items():
+                        _v, _t, _pr, _ro = reg_probe_value(_r, _p, _n)
+                        _local[_k] = _v
+                except Exception:
+                    pass
+                _lines = [f"[{ext}] 用户视角 vs 程序视角："]
+                for _k in ("userchoice_progid", "hkcr_ext", "hkcu_ext", "hklm_ext",
+                           "hkcr_command", "hkcu_command", "hklm_command"):
+                    _uv = (_items.get(_k) or {}).get("value")
+                    _lv = _local.get(_k)
+                    _same = (_uv == _lv) or (_uv is None and _lv is None)
+                    _lines.append(f"  {_k}: 用户视角={_uv} | 程序视角={_lv} | {'相同' if _same else '不同'}")
+                _msg = "\n".join(_lines)
+                self.root.after(0, lambda: self._append_log(_msg, "info"))
+                try:
+                    self.root.after(0, lambda: messagebox.showinfo(APP_NAME, _msg))
+                except Exception:
+                    pass
+            except Exception as _e:
+                self.root.after(0, lambda: self._append_log(f"{ext} 用户视角检查异常: {_e}", "error"))
+        threading.Thread(target=_do, daemon=True).start()
 
     def _lighten(self, hex_color, amount=0.18):
         try:
@@ -6605,6 +8021,8 @@ class MainWindow:
         sec4, body4 = self._mk_card(content, "白名单")
         tk.Label(body4, text="白名单扩展名（任意程序对该扩展名的操作自动允许）",
                  font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x")
+        tk.Label(body4, text="弹窗点「永久关闭」的扩展名会出现在这里；选中后点「删除选中」即可恢复保护",
+                 font=("微软雅黑", 8), fg=dark["warn"], bg=dark["card"], anchor="w").pack(fill="x", pady=(0, 2))
         ext_list_frame = tk.Frame(body4, bg=dark["card"])
         ext_list_frame.pack(fill="x", pady=4)
         ext_listbox = tk.Listbox(ext_list_frame, font=("微软雅黑", 9), height=5,
@@ -6674,8 +8092,37 @@ class MainWindow:
         sec4b, body4b = self._mk_card(content, "进程黑名单")
         tk.Label(body4b, text="黑名单中的进程被识别为篡改者时将遭到强终止（进程名 / 路径）",
                  font=("微软雅黑", 9, "bold"), fg=dark["text2"], bg=dark["card"], anchor="w").pack(fill="x")
+        # #1 进程打击强度开关（gentle=非黑名单进程只降权不强杀，strict=原行为）
+        try:
+            _strike_var = tk.StringVar(value=cfg.get("process_strike_level", "gentle"))
+            _strike_row = tk.Frame(body4b, bg=dark["card"])
+            _strike_row.pack(fill="x", pady=(4, 0))
+            tk.Label(_strike_row, text="进程打击强度", font=("微软雅黑", 9),
+                     fg=dark["text2"], bg=dark["card"]).pack(side="left")
+            def _set_strike(_v=None):
+                _lv = _strike_var.get()
+                try:
+                    cfg["process_strike_level"] = _lv
+                    if self.process_enforcer is not None:
+                        self.process_enforcer._strike_level = _lv
+                    self._append_log(f"进程打击强度已设为 {'严格（黑名单外也强杀）' if _lv == 'strict' else '温和（非黑名单进程只降权）'}", "info")
+                except Exception:
+                    pass
+            tk.Radiobutton(_strike_row, text="温和（默认）", variable=_strike_var, value="gentle",
+                           command=_set_strike, font=("微软雅黑", 9), bg=dark["card"],
+                           fg=dark["text2"], selectcolor=dark["card"],
+                           activebackground=dark["card"], activeforeground=dark["text"],
+                           highlightthickness=0).pack(side="left", padx=(16, 4))
+            tk.Radiobutton(_strike_row, text="严格", variable=_strike_var, value="strict",
+                           command=_set_strike, font=("微软雅黑", 9), bg=dark["card"],
+                           fg=dark["text2"], selectcolor=dark["card"],
+                           activebackground=dark["card"], activeforeground=dark["text"],
+                           highlightthickness=0).pack(side="left", padx=4)
+            tk.Label(body4b, text="温和：未拉黑进程（仅关联可疑）只降权不冻结/强杀；严格：按原逻辑全部执行",
+                     font=("微软雅黑", 8), fg=dark["text3"], bg=dark["card"], anchor="w", justify="left").pack(fill="x", pady=(0, 2))
+        except Exception:
+            pass
         bl_list_frame = tk.Frame(body4b, bg=dark["card"])
-        bl_list_frame.pack(fill="x", pady=4)
         self._bl_listbox = tk.Listbox(bl_list_frame, font=("微软雅黑", 9), height=5,
                                       bg=dark["btn"], fg=dark["text"],
                                       selectbackground=dark["nav_sel"], relief="flat",
@@ -6784,6 +8231,7 @@ class MainWindow:
 
         tk.Label(save_row, text="* 设置修改后自动保存；运行权限更改需重启生效", font=("微软雅黑", 8),
                  fg=dark["text3"], bg=dark["bg"]).pack(side="right")
+        return content
 
     # ---------- 页面：关于（新增大菜单：程序信息/保护级别/识别库/许可） ----------
     def _build_page_about(self, parent):
@@ -6849,17 +8297,12 @@ class MainWindow:
 
         # ===== 节3：软件识别库 =====
         sec3, body3 = self._mk_card(content, "软件识别库")
-        _lib_count = 0
+        # 条数 = 内置库（已含用户扩展）总数，而非仅 userdata/program_names.json
+        # 文件条数——旧文件是首次运行时生成的 533 条快照，会误导用户以为库没扩充
         try:
-            _lib_path = os.path.join(self.baseline_mgr.data_dir, "program_names.json")
-            if os.path.exists(_lib_path):
-                with open(_lib_path, "r", encoding="utf-8") as _f:
-                    _lib_data = json.load(_f)
-                    # 结构兼容：嵌套 list [[进程名, 显示名],...] 或 dict {进程名: 显示名}
-                    if isinstance(_lib_data, (dict, list)):
-                        _lib_count = len(_lib_data)
+            _lib_count = len(_KNOWN_PROGID_MAP)
         except Exception:
-            pass
+            _lib_count = 0
         tk.Label(body3, text=f"内置识别库：{_lib_count} 条程序名称记录",
                  font=("微软雅黑", 9, "bold"), fg=self.C["text2"],
                  bg=self.C["card"], anchor="w").pack(fill="x")
@@ -6970,6 +8413,8 @@ class MainWindow:
         # 自动开启保护
         if self.baseline_mgr.is_initialized():
             self.root.after(500, self._start_protection)
+        # 初始按钮状态按监控真实状态刷新（未启动时"停止保护"灰置，启动后可用）
+        self._update_protect_buttons()
 
     def _show_setup(self):
         self._append_log("首次运行，需要校准基准...", "warn")
@@ -7105,6 +8550,30 @@ class MainWindow:
         except Exception:
             pass
 
+    def _update_protect_buttons(self):
+        """按监控线程真实存活状态刷新「启动保护/停止保护」按钮。
+        所有监控状态变化点（手动启动/停止/看门狗重启/自动启动）都必须调用，
+        否则自动启动或看门狗重启路径下「停止保护」按钮保持灰置不可用
+        （用户反馈：状态菜单里看不到停止保护按钮）。"""
+        # 线程安全：看门狗等后台线程可能调用（_restart_monitor 在看门狗循环里），
+        # 与 _append_log 一致，非主线程一律调度到主线程执行
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.root.after(0, self._update_protect_buttons)
+            except Exception:
+                pass
+            return
+        try:
+            running = self.monitor is not None and self.monitor.is_alive()
+            self.btn_start.config(state="disabled" if running else "normal")
+            self.btn_stop.config(state="normal" if running else "disabled")
+            if running:
+                self.status_label.config(text="● 状态：保护中", fg="#2ecc71")
+            elif self.baseline_mgr.is_initialized():
+                self.status_label.config(text="● 状态：已停止", fg="#e74c3c")
+        except Exception:
+            pass
+
     def _start_protection(self):
         if not self.baseline_mgr.is_initialized():
             messagebox.showwarning(APP_NAME, "请先创建基准！")
@@ -7120,9 +8589,7 @@ class MainWindow:
         )
         self.monitor.start()
         self.engine.paused = False
-        self.status_label.config(text="● 状态：保护中", fg="#2ecc71")
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
+        self._update_protect_buttons()
         self._append_log("实时保护已启动。", "success")
         self._refresh_home_hints()
 
@@ -7135,9 +8602,7 @@ class MainWindow:
             except Exception:
                 pass
             self.monitor = None
-        self.status_label.config(text="● 状态：已停止", fg="#e74c3c")
-        self.btn_start.config(state="normal")
-        self.btn_stop.config(state="disabled")
+        self._update_protect_buttons()
         self._append_log("实时保护已停止。", "warn")
         self._refresh_home_hints()
 
@@ -7206,6 +8671,7 @@ class MainWindow:
                 root=self.root
             )
             self.monitor.start()
+            self._update_protect_buttons()
             self._append_log(f"监控线程已重启（原因：{reason}）", "warn")
             log_event("SYSTEM", "监控", "重启", f"原因={reason}")
         except Exception as e:
@@ -7296,18 +8762,41 @@ class MainWindow:
         self.root.after(3500, _force_exit)
 
     def _backup_current(self):
-        """以当前状态备份为新基准，支持对比选择部分更新"""
+        """以当前状态备份为新基准，支持对比选择部分更新。
+        扫描放后台线程：1284 扩展名 × 7 位置全量差异扫描约需数秒，
+        主线程执行会冻结 UI 且无任何完成反馈（用户只看到"正在扫描"卡住）。"""
         if not self.baseline_mgr.is_initialized():
             messagebox.showwarning(APP_NAME, "请先创建基准！")
             return
-        # 先扫描差异
-        self._append_log("正在扫描当前状态与基准的差异...", "info")
-        inconsistencies, new_exts = self.engine.deep_scan()
-        if not inconsistencies and not new_exts:
-            messagebox.showinfo(APP_NAME, "当前状态与基准完全一致，无需更新。")
+        if getattr(self, "_backup_scan_running", False):
+            self._append_log("备份扫描正在进行中，请稍候...", "warn")
             return
-        # 弹出对比选择窗口
-        self._show_backup_selector(inconsistencies, new_exts)
+        self._backup_scan_running = True
+        self._append_log("正在扫描当前状态与基准的差异（后台进行，请稍候）...", "info")
+
+        def _scan():
+            try:
+                inconsistencies, new_exts = self.engine.deep_scan()
+                self.root.after(0, lambda: self._backup_scan_done(inconsistencies, new_exts))
+            except Exception as e:
+                self.root.after(0, lambda: self._append_log(f"备份扫描异常: {e}", "error"))
+            finally:
+                self._backup_scan_running = False
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _backup_scan_done(self, inconsistencies, new_exts):
+        """备份扫描完成回调：输出明确成功/失败结果"""
+        try:
+            if not inconsistencies and not new_exts:
+                self._append_log("扫描完成：当前状态与基准完全一致，无需更新。", "success")
+                messagebox.showinfo(APP_NAME, "当前状态与基准完全一致，无需更新。")
+                return
+            self._append_log(
+                f"扫描完成：发现 {len(inconsistencies)} 个扩展名有差异、"
+                f"{len(new_exts)} 个新扩展名，弹出选择窗口可勾选更新。", "success")
+            self._show_backup_selector(inconsistencies, new_exts)
+        except Exception as e:
+            self._append_log(f"备份扫描结果处理失败: {e}", "error")
 
     def _show_backup_selector(self, inconsistencies, new_exts):
         """基准对比选择窗口：用户勾选要更新的扩展名"""
@@ -8710,14 +10199,18 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror(APP_NAME, f"导出失败: {e}")
 
-    def _build_page_defapps(self, parent):
+    def _build_page_defapps(self, parent, embed=False):
         """页面：默认应用 —— 受保护扩展名 × 当前默认打开程序总览，
-        发现异常关联后可直接锁定/解除锁定（替代原诊断页）"""
-        page = tk.Frame(parent, bg=self.C["bg"])
-        self._pages["defapps"] = page
-        self._mk_page_header(page, "默认应用",
-                             "查看每个扩展名当前由哪款软件打开，异常关联一键锁定")
-        body = self._mk_scroll_container(page)
+        发现异常关联后可直接锁定/解除锁定（替代原诊断页）。
+        embed=True：不建独立页面，把内容追加到传入的滚动容器（与扩展名页合并）"""
+        if not embed:
+            page = tk.Frame(parent, bg=self.C["bg"])
+            self._pages["defapps"] = page
+            self._mk_page_header(page, "默认应用",
+                                 "查看每个扩展名当前由哪款软件打开，异常关联一键锁定")
+            body = self._mk_scroll_container(page)
+        else:
+            body = parent
         # 统计 + 操作卡
         card, cb = self._mk_card(body, "受保护扩展名的默认应用",
             "选择列表任意行，用下方按钮锁定/解除锁定默认打开方式；搜索框可按扩展名过滤")
@@ -9017,7 +10510,7 @@ class MainWindow:
                     ext = vals[0]
             if not ext and self._defapps_row:
                 ext = self._defapps_row[0]
-            self._show_page("exts")
+            self._select_nav("exts")
             if ext:
                 self._lock_ext_var.set(ext)
                 self._lock_ext_refresh_info()
@@ -9062,13 +10555,17 @@ class MainWindow:
     # =====================================================================
     # 页面：配置与备份 —— 一键备份/恢复配置、导出导入黑白名单
     # =====================================================================
-    def _build_page_config(self, parent):
-        """页面：配置与备份 —— 一键备份/恢复配置文件，导出/导入黑白名单"""
-        page = tk.Frame(parent, bg=self.C["bg"])
-        self._pages["config"] = page
-        self._mk_page_header(page, "配置与备份",
-                             "备份/恢复全部配置（基准、锁定、黑白名单），导出导入名单以便迁移")
-        body = self._mk_scroll_container(page)
+    def _build_page_config(self, parent, embed=False):
+        """页面：配置与备份 —— 一键备份/恢复配置文件，导出/导入黑白名单。
+        embed=True：不建独立页面，把内容追加到传入的滚动容器（与设置页合并）"""
+        if not embed:
+            page = tk.Frame(parent, bg=self.C["bg"])
+            self._pages["config"] = page
+            self._mk_page_header(page, "配置与备份",
+                                 "备份/恢复全部配置（基准、锁定、黑白名单），导出导入名单以便迁移")
+            body = self._mk_scroll_container(page)
+        else:
+            body = parent
         dark = self.C
 
         # 节1：一键备份 / 恢复
@@ -9109,13 +10606,8 @@ class MainWindow:
             wl_prog = cfg.get("whitelist_programs", []) or []
             bl_prog = cfg.get("blacklist_programs", []) or []
             baseline = self.baseline_mgr.baseline or {}
-            n_names = 0
-            try:
-                import json as _json
-                with open(PROGRAM_NAMES_FILE, "r", encoding="utf-8") as _f:
-                    n_names = len(_json.load(_f) or {})
-            except Exception:
-                n_names = 0
+            # 识别库条数 = 内置库（含用户扩展）总数，而非旧 program_names.json 快照条数
+            n_names = len(_KNOWN_PROGID_MAP)
             lines = [
                 f"基准规模      : {len(baseline)} 个扩展名（基准时间: {cfg.get('baseline_time', '无')}）",
                 f"单扩展名锁定  : {len(locked)} 个",
@@ -9624,6 +11116,33 @@ class MainWindow:
             try:
                 if ext in self._pending_ask:
                     return
+                # 弹窗骚扰上限：同扩展名连续弹窗（用户均未同意）达阈值后
+                # 自动转静默阻止（后台恢复+记录，不再弹窗打扰）。
+                # 持续篡改对抗场景（外部程序反复改、用户不干预）下避免无限弹窗刷屏
+                try:
+                    if self._popup_count.get(ext, 0) >= self.POPUP_LIMIT:
+                        self._append_log(f"{ext} 弹窗已达上限（{self.POPUP_LIMIT}次未同意），自动转静默阻止", "warn")
+                        log_event(ext, "弹窗", "静默", f"连续{self.POPUP_LIMIT}次未同意,转静默阻止")
+                        # 加入待处理集合：静默恢复期间防止监控轮询重复触发恢复线程
+                        self._pending_ask.add(ext)
+                        if self.monitor is not None:
+                            def _silent_recover(_ext=ext, _mm=mismatches):
+                                try:
+                                    self.monitor._recover_with_verify(_ext, _mm)
+                                finally:
+                                    try:
+                                        self._pending_ask.discard(_ext)
+                                    except Exception:
+                                        pass
+                            threading.Thread(target=_silent_recover, daemon=True).start()
+                        else:
+                            try:
+                                self._pending_ask.discard(ext)
+                            except Exception:
+                                pass
+                        return
+                except Exception:
+                    pass
                 self._pending_ask.add(ext)
             except Exception:
                 pass
@@ -9657,11 +11176,34 @@ class MainWindow:
             self._append_log(f"用户同意 {extension} 的更改，已更新基准并重置篡改计数。", "warn")
             log_event(extension, "更改", "已同意", "用户单次同意")
             self._popup_last_reason = "consent"  # 用户同意→下一个弹窗恢复正常超时
+            # 用户同意：弹窗骚扰计数清零（同一扩展名重新获得弹窗资格）
+            try:
+                self._popup_count.pop(extension, None)
+            except Exception:
+                pass
             self.root.after(10000, lambda: self.engine.allowed_this_cycle.discard(extension))
             # 清除"待询问"标记，允许后续再次检测时重新弹窗
             try:
                 if ask_first and self._pending_ask is not None:
                     self._pending_ask.discard(extension)
+            except Exception:
+                pass
+            # 同意后独立进程二次检测（用户视角确认更改真实生效；后台执行不阻塞 UI）
+            try:
+                def _post_consent_verify(_ext=extension):
+                    _vok, _vrep = interactive_verify_ext(_ext)
+                    if _vrep and isinstance(_vrep, dict):
+                        _vi = _vrep.get("items", {})
+                        _vuc = (_vi.get("userchoice_progid", {}) or {}).get("value")
+                        _vhk = (_vi.get("hkcr_ext", {}) or {}).get("value")
+                        _vbl = self.baseline_mgr.baseline.get(_ext, {}) or {}
+                        _vexp = (_vbl.get("userchoice_progid", {}) or {}).get("value")
+                        _vd = "通过" if (_vexp is not None and _vuc == _vexp) else "未通过"
+                        log_event(_ext, "更改", "二次检测",
+                                  f"用户视角UserChoice={_vuc} 期望={_vexp} HKCR默认={_vhk} 结果={_vd}")
+                    else:
+                        log_event(_ext, "更改", "二次检测", "独立进程派发失败/超时")
+                threading.Thread(target=_post_consent_verify, daemon=True).start()
             except Exception:
                 pass
 
@@ -9680,9 +11222,14 @@ class MainWindow:
             # 不得再恢复——否则"用户都同意了还恢复"（18:38:38同意→18:38:43误恢复实锤）。
             if toast.ask_first and toast.close_reason == "timeout":
                 try:
+                    # 先恢复，恢复完成后再移除"待弹窗"标记：恢复期间监控线程若
+                    # 检测到未恢复状态（仍是被篡改值）会被 _pending_ask 跳过，
+                    # 不会重复累积持续篡改计数。此前先移除标记再恢复，恢复的
+                    # 4.8 秒窗口内监控再次检测到"未恢复"→ record_change 计数+1
+                    # → 达到阈值误判"持续篡改"→ BH3 锁定（日志 12:06:54 实锤）。
+                    s2, f2, d2, v2 = self.monitor._recover_with_verify(toast.ext, toast.mismatches)
                     if self._pending_ask is not None:
                         self._pending_ask.discard(toast.ext)
-                    s2, f2, d2, v2 = self.monitor._recover_with_verify(toast.ext, toast.mismatches)
                     if v2:
                         self._append_log(f"{toast.ext} 弹窗超时未处理，已自动恢复为基准关联。", "warn")
                         log_event(toast.ext, "恢复", "成功", "先询问弹窗超时自动恢复")
@@ -9704,6 +11251,11 @@ class MainWindow:
                 result = "success" if f == 0 else ("partial" if s > 0 else "fail")
                 self.change_history.add_record(toast.ext, toast.tamperer_name, changes_for_history, "auto_blocked", result)
                 self._popup_last_reason = "timeout"
+                # 弹窗骚扰计数：超时未同意 → +1（达到 POPUP_LIMIT 后自动转静默）
+                try:
+                    self._popup_count[toast.ext] = self._popup_count.get(toast.ext, 0) + 1
+                except Exception:
+                    pass
                 if self._popup_timeout_reset_after is not None:
                     try:
                         self.root.after_cancel(self._popup_timeout_reset_after)
@@ -9725,9 +11277,10 @@ class MainWindow:
             # 先询问模式：暂停=静默阻止，立即恢复基准并清除待询问标记
             if toast.ask_first:
                 try:
+                    # 同 on_close 竞态修复：先恢复再移除待弹窗标记
+                    s2, f2, d2, v2 = self.monitor._recover_with_verify(extension, toast.mismatches)
                     if self._pending_ask is not None:
                         self._pending_ask.discard(extension)
-                    s2, f2, d2, v2 = self.monitor._recover_with_verify(extension, toast.mismatches)
                     if v2:
                         self._append_log(f"{extension} 已恢复为基准关联（弹窗暂停1分钟）。", "warn")
                     else:
@@ -9769,7 +11322,7 @@ class MainWindow:
                 except Exception as e:
                     self._append_log(f"解除 {extension} 锁定失败: {e}", "error")
             self.change_history.add_record(extension, tamperer_name, changes_for_history, "forever_ignore", "success")
-            self._append_log(f"已永久关闭 {extension} 的弹窗提醒（加入白名单，不再阻止）", "warn")
+            self._append_log(f"已永久关闭 {extension} 的弹窗提醒（已加入白名单，不再阻止）。如需恢复，请到「异常修复→白名单」删除该扩展名", "warn")
             log_event(extension, "更改", "永久忽略", "用户永久关闭弹窗")
 
         # 单个模式：如果当前有活动弹窗，加入队列不立即显示
@@ -10644,17 +12197,22 @@ def _find_nsudo_exe():
         if root in seen:
             continue
         seen.add(root)
-        for name in NSUDO_CANDIDATES:
-            path = os.path.join(root, name)
-            if os.path.isfile(path):
-                target = os.path.join(RUNTIME_DIR, name)
-                try:
-                    os.makedirs(RUNTIME_DIR, exist_ok=True)
-                    if os.path.abspath(path) != os.path.abspath(target):
-                        shutil.copy2(path, target)
-                except Exception:
-                    pass
-                return target if os.path.exists(target) else path
+        # 同时查找 root 直接目录与 root\runtime 子目录：onedir 发行版中 exe 位于
+        # 子目录（如 OPSTcontroller_Release\OPSTcontroller\）而 runtime 与其父目录
+        # 同级（OPSTcontroller_Release\runtime\），仅查 root 直接目录会漏掉 NSudo，
+        # 导致提权失败、UserChoice 写入被拒、恢复/同意实际不生效。
+        for base_dir in (root, os.path.join(root, "runtime")):
+            for name in NSUDO_CANDIDATES:
+                path = os.path.join(base_dir, name)
+                if os.path.isfile(path):
+                    target = os.path.join(RUNTIME_DIR, name)
+                    try:
+                        os.makedirs(RUNTIME_DIR, exist_ok=True)
+                        if os.path.abspath(path) != os.path.abspath(target):
+                            shutil.copy2(path, target)
+                    except Exception:
+                        pass
+                    return target if os.path.exists(target) else path
     return None
 
 
@@ -10957,6 +12515,45 @@ def main():
             sys.stdout = io.StringIO()
         except Exception:
             pass
+
+    # --verify-ext <ext>：交互用户只读二次检测模式（由 TI 主进程以当前用户
+    # token 降权派发）。以本进程 token 直接读取 7 位置真实状态，JSON 输出到
+    # stdout 后立即退出。必须在提权分支之前返回，绝不再提权。
+    if "--verify-ext" in sys.argv:
+        try:
+            _ve_idx = sys.argv.index("--verify-ext")
+            _ve_ext = sys.argv[_ve_idx + 1] if len(sys.argv) > _ve_idx + 1 else ""
+            if not _ve_ext:
+                _final_exit(2)
+            _ve_ext = _ve_ext.lower().strip()
+            _ve_prog = get_prog_id(_ve_ext)
+            _ve_paths = get_extension_paths(_ve_ext, _ve_prog)
+            _ve_out = {"ext": _ve_ext, "prog_id": _ve_prog, "items": {}}
+
+            def _ve_jsonable(v):
+                # REG_BINARY 等值可能是 bytes，json.dumps 无法直接序列化
+                if isinstance(v, bytes):
+                    return v.decode("latin1")
+                return v
+
+            for _k, (_r, _p, _n) in _ve_paths.items():
+                _v, _t, _pr, _ok = reg_probe_value(_r, _p, _n)
+                _ve_out["items"][_k] = {"value": _ve_jsonable(_v), "type": _t,
+                                        "present": _pr, "read_ok": _ok}
+            _ve_text = json.dumps(_ve_out, ensure_ascii=False)
+            try:
+                # GUI 子系统下直接写 fd 1（继承的管道句柄），绕过 sys.stdout 缓冲
+                os.write(1, _ve_text.encode("utf-8"))
+                os._exit(0)
+            except Exception:
+                print(_ve_text, flush=True)
+                _final_exit(0)
+        except Exception as _ve_e:
+            try:
+                print(f"ERR {_ve_e}", flush=True)
+            except Exception:
+                pass
+            _final_exit(1)
 
     # 处理 --stop 命令：向运行中的实例发送退出信号。
     # 自我保护实例（TI/SYSTEM + Deny ACL）无法被普通令牌终止：
